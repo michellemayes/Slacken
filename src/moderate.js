@@ -66,7 +66,10 @@ export class Moderator {
     if (this.overBudget()) return clean({ reason: 'budget', error: 'daily budget reached' });
 
     const verdict = await this.enqueue({ text: trimmed, sender, channel });
-    this.cache.set(key, verdict);
+    // A failure is not a verdict. Caching one would hold this message, and
+    // every later copy of it, unread for the whole TTL — a week by default —
+    // long after whatever broke had been fixed.
+    if (!verdict.error) this.cache.set(key, verdict);
     if (verdict.hostile) this.stats.softened += 1;
     if (verdict.verbose) this.stats.condensed += 1;
     return verdict;

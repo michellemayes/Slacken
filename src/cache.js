@@ -9,9 +9,14 @@ export class Cache {
   constructor({ ttlHours, maxEntries }) {
     this.ttlMs = ttlHours * 3600 * 1000;
     this.maxEntries = maxEntries;
+    // A zero TTL means "do not cache", not "expire everything the moment it
+    // lands". Read the second way it would keep every entry it was given until
+    // the next flush wrote an empty file over a week of real answers, so a
+    // disabled cache touches neither memory nor disk.
+    this.enabled = this.ttlMs > 0 && maxEntries > 0;
     this.map = new Map();
     this.flushTimer = null;
-    this.load();
+    if (this.enabled) this.load();
   }
 
   static key(model, text) {
@@ -41,6 +46,7 @@ export class Cache {
   }
 
   set(key, value) {
+    if (!this.enabled) return;
     this.map.set(key, { at: Date.now(), value });
     // Map preserves insertion order, so the first keys are the oldest.
     while (this.map.size > this.maxEntries) {
@@ -66,6 +72,7 @@ export class Cache {
   }
 
   flush() {
+    if (!this.enabled) return;
     try {
       fs.mkdirSync(HOME_DIR, { recursive: true });
       fs.writeFileSync(CACHE_PATH, JSON.stringify(Object.fromEntries(this.map)));

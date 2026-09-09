@@ -26,7 +26,8 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
   slacken launch [--force]     Relaunch Slack with the debug port open
   slacken attach [--verbose]   Attach to an already-launched Slack
   slacken test "<message>"     Rewrite one string and print the verdict
-  slacken doctor               Check the pieces this needs
+  slacken doctor [--no-model]  Check the pieces this needs, including one real
+                               model call; --no-model skips that one
   slacken config               Print the config file path and contents
 
   slacken set                  List the settings you can change, and their values
@@ -216,7 +217,68 @@ async function run(store) {
   return 0;
 }
 
-function logEvent(event, config) {
+/*
+ * Everything here fails the same way: not once, but every four seconds, or on
+ * every message, for as long as the cause lasts.
+ *
+ * The menu bar counts those failures and sends you to the log to find out what
+ * they were. So the log has to actually say — and a line repeated two hundred
+ * times says nothing you can read. The first of each distinct message goes out
+ * immediately; identical repeats are counted and summarised at most once a
+ * minute; and recovery is announced, because when it stopped is half of what
+ * you came to the log to find out.
+ */
+export class RepeatLog {
+  constructor({ summariseAfterMs = 60_000, now = () => Date.now() } = {}) {
+    this.summariseAfterMs = summariseAfterMs;
+    this.now = now;
+    this.kinds = new Map();
+  }
+
+  // Returns the line to print, or null to stay quiet.
+  fail(kind, message) {
+    const at = this.now();
+    const prev = this.kinds.get(kind);
+    // A different message is different news, however often the last one came.
+    if (!prev || prev.message !== message) {
+      this.kinds.set(kind, { message, count: 1, since: at, said: at });
+      return message;
+    }
+    prev.count += 1;
+    if (at - prev.said < this.summariseAfterMs) return null;
+    prev.said = at;
+    return `still failing after ${prev.count} tries over ${humanMs(at - prev.since)}: ${message}`;
+  }
+
+  ok(kind) {
+    const prev = this.kinds.get(kind);
+    if (!prev) return null;
+    this.kinds.delete(kind);
+    return `recovered after ${prev.count} failure${prev.count === 1 ? '' : 's'} over ${humanMs(this.now() - prev.since)}`;
+  }
+}
+
+function humanMs(ms) {
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  const mins = Math.round(ms / 60_000);
+  if (mins < 60) return `${mins}m`;
+  return `${Math.round(mins / 6) / 10}h`;
+}
+
+const SHARED_REPORT = new RepeatLog();
+
+// Exported for the tests: what reaches the log is the thing the menu bar's
+// error count sends you to read, so it is worth pinning down.
+export function logEvent(event, config, report = SHARED_REPORT) {
+  const say = (kind, message) => {
+    const line = report.fail(kind, message);
+    if (line) console.warn(`[slacken] ${line}`);
+  };
+  const recovered = (kind, message) => {
+    const line = report.ok(kind);
+    if (line) console.log(`[slacken] ${message} — ${line}`);
+  };
+
   switch (event.type) {
     case 'attached':
       console.log(`[slacken] attached to ${event.title || event.target}`);
@@ -232,11 +294,14 @@ function logEvent(event, config) {
         ? '[slacken] menu bar item gave up after repeated crashes; everything else is unaffected'
         : '[slacken] menu bar item hidden (set menuBar to false to keep it that way)');
       break;
+    case 'poll-ok':
+      recovered('poll', 'Slack is reachable again');
+      break;
     case 'attach-error':
     case 'poll-error':
     case 'moderate-error':
     case 'menubar-error':
-      console.warn(`[slacken] ${event.type}: ${event.message}`);
+      say(event.type === 'poll-error' ? 'poll' : event.type, `${event.type}: ${event.message}`);
       break;
     case 'ignore-channel':
       console.log(event.error
@@ -247,6 +312,16 @@ function logEvent(event, config) {
       break;
     case 'verdict': {
       const v = event.verdict;
+      // The one failure that used to be completely silent. Every message the
+      // model could not judge was counted in the menu bar's "N errors" line
+      // and then dropped, so the log the menu sent you to had nothing in it.
+      if (v.error) {
+        // Keyed on the error alone, not the channel it happened in: one
+        // broken claude is one problem, however many channels it spoils.
+        say('model', `the model could not judge a message: ${v.error}`);
+        break;
+      }
+      recovered('model', 'the model is answering again');
       if (v.flagged) {
         const what = v.hostile && v.verbose ? 'softened + condensed'
           : v.verbose ? 'condensed' : 'softened';
@@ -538,6 +613,31 @@ async function cmdDoctor(args) {
     claudeVersion = err.message;
   }
   checks.push([`${config.claudeBin} on PATH`, Boolean(claudeVersion && /\d/.test(claudeVersion)), claudeVersion]);
+
+  // The check the menu bar's "N errors" line sends you here for. Everything
+  // else can pass while the one call that matters — the flags this daemon
+  // actually invokes claude with, against the model actually configured —
+  // fails on every single message.
+  if (!args['no-model']) {
+    // cacheTtlHours 0 turns the cache off entirely, so this neither answers
+    // from a week-old verdict nor leaves one behind.
+    const moderator = new Moderator({ ...config, cacheTtlHours: 0 });
+    const startedAt = Date.now();
+    let detail;
+    let ok = false;
+    try {
+      const verdict = await moderator.moderate({
+        text: 'Circling back on this — just wanted to check whether the deploy is still going out at 3pm today.',
+        sender: 'slacken doctor',
+        channel: 'slacken doctor',
+      });
+      ok = !verdict.error;
+      detail = verdict.error || `answered in ${Math.round((Date.now() - startedAt) / 100) / 10}s`;
+    } catch (err) {
+      detail = err.message;
+    }
+    checks.push(['model answers', ok, `${config.model} — ${detail}`]);
+  }
 
   if (process.platform === 'darwin' && config.menuBar !== false) {
     let swift = null;

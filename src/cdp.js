@@ -94,17 +94,38 @@ export class CdpSession {
 }
 
 export async function listTargets(port) {
-  const res = await fetch(`http://127.0.0.1:${port}/json/list`, {
-    signal: AbortSignal.timeout(3000),
-  });
+  return devtoolsGet(port, '/json/list');
+}
+
+export async function devtoolsVersion(port) {
+  return devtoolsGet(port, '/json/version');
+}
+
+async function devtoolsGet(port, route) {
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}${route}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+  } catch (err) {
+    throw new Error(devtoolsMessage(err, port));
+  }
   if (!res.ok) throw new Error(`devtools endpoint returned ${res.status}`);
   return res.json();
 }
 
-export async function devtoolsVersion(port) {
-  const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
-    signal: AbortSignal.timeout(3000),
-  });
-  if (!res.ok) throw new Error(`devtools endpoint returned ${res.status}`);
-  return res.json();
+// `fetch` reports every transport failure as "fetch failed" and puts the
+// reason in .cause. The difference matters: Slack having been quit is the
+// ordinary way this fails, and "fetch failed" every four seconds is the one
+// message that does not say so.
+export function devtoolsMessage(err, port) {
+  const code = err?.cause?.code || err?.code;
+  if (code === 'ECONNREFUSED') {
+    return `nothing is listening on 127.0.0.1:${port} — Slack is not running with its debug port open (run: slacken launch)`;
+  }
+  if (err?.name === 'TimeoutError' || code === 'ABORT_ERR' || code === 'ETIMEDOUT') {
+    return `127.0.0.1:${port} accepted the connection but did not answer within 3s`;
+  }
+  const cause = err?.cause?.message;
+  return cause ? `${err.message}: ${cause}` : String(err?.message || err);
 }
