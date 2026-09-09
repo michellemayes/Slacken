@@ -81,6 +81,12 @@
     blocks: '.c-message_kit__blocks, .c-message__message_blocks',
     rich: '.p-rich_text_section',
     sender: '[data-qa="message_sender_name"]',
+    // A reply broadcast back into the channel carries a "replied to a thread:"
+    // line quoting the message it answers. That preview is Slack's chrome and
+    // a copy of someone else's words, so it is neither what we read for triage
+    // nor what a rewrite may stand in for.
+    preamble: '[data-qa="message_broadcast_preamble"], .c-message__broadcast_preamble_container,'
+      + ' .c-message__broadcast_preamble, .c-message__broadcast_preamble_link',
     channel: '[data-qa="channel_name"]',
     self: '[data-qa="user-button"]',
     composer: '[data-qa="message_input"], .ql-editor',
@@ -449,20 +455,44 @@
     return null;
   }
 
+  function inPreamble(el) {
+    return Boolean(el.closest(SEL.preamble));
+  }
+
+  // The content node is where a message body normally lives, but a thread
+  // reply shown in the channel does not always have one, so the list item
+  // itself is the fallback scope rather than a reason to give up: a message we
+  // cannot find a body for is a message we silently never touch.
   function bodyFor(item) {
-    const content = item.querySelector(SEL.content);
-    if (!content) return null;
-    const blocks = content.querySelector(SEL.blocks);
+    const scope = item.querySelector(SEL.content) || item;
+    const blocks = Array.from(scope.querySelectorAll(SEL.blocks)).find((el) => !inPreamble(el));
     if (blocks) return blocks;
     // Older layouts put rich text straight under the content node.
-    const rich = content.querySelector(SEL.rich);
+    const rich = Array.from(scope.querySelectorAll(SEL.rich)).find((el) => !inPreamble(el));
     return rich ? rich.parentElement : null;
   }
 
+  function richSections(body) {
+    return Array.from(body.querySelectorAll(SEL.rich))
+      // The quoted parent of a broadcast reply is rich text too, and it sits
+      // inside the same blocks the reply does.
+      .filter((el) => !inPreamble(el))
+      // A list item's section nests inside another in some layouts. Keeping
+      // both would hand the model the same sentence twice and score its
+      // padding on the duplicate.
+      .filter((el, _i, all) => !all.some((other) => other !== el && other.contains(el)));
+  }
+
   function textFor(body) {
-    const sections = body.querySelectorAll(SEL.rich);
-    const source = sections.length ? Array.from(sections) : [body];
-    return source.map((el) => el.innerText).join('\n').trim();
+    const sections = richSections(body);
+    if (sections.length) return sections.map((el) => el.innerText).join('\n').trim();
+    if (!body.querySelector(SEL.preamble)) return body.innerText.trim();
+    // No rich text to pick from and a preamble in the way: read a copy with
+    // the preamble cut out. Detached, so innerText falls back to textContent,
+    // which is close enough for a path this rare.
+    const copy = body.cloneNode(true);
+    copy.querySelectorAll(SEL.preamble).forEach((el) => el.remove());
+    return copy.innerText?.trim() || copy.textContent.trim();
   }
 
   function hash(str) {
@@ -942,6 +972,67 @@
       // message's place without shifting the page.
       height: CONFIG.holdWhilePending ? body.offsetHeight : 0,
     };
+  }
+
+  function triageLine(text, settings = CONFIG) {
+    return `tone ${heuristicScore(text)} of ${settings.triageThreshold} needed,`
+      + ` padding ${paddingScore(text, settings)} of 1 needed, ${wordCount(text)} words`;
+  }
+
+  /*
+   * Read-only account of what Slacken makes of one row on screen, for
+   * `slacken inspect`. It answers the question the badge cannot: not what
+   * happened to a message, but why nothing did. Nothing here writes to the DOM
+   * or to the caches, so looking never changes the answer.
+   */
+  function diagnose(item) {
+    const sender = senderFor(item);
+    const threadReply = Boolean(item.querySelector(SEL.preamble));
+    // Read where the row is, not where the page is: a thread open beside a
+    // channel is a different conversation with possibly different settings,
+    // and a report that answered for the wrong one would be worse than none.
+    const channel = channelFor(item, null);
+    const settings = settingsFor(channel);
+    const row = { sender, channel, threadReply, state: item.getAttribute(ATTR_STATE) };
+
+    const body = bodyFor(item);
+    if (!body) {
+      // A day divider or a join notice is a row with nothing in it to read,
+      // not a message we failed on. Marked as chrome so the report can drop it
+      // — a row that looks like a message and still has no body is the one
+      // worth showing, because it is a layout this does not know.
+      const looksLikeMessage = Boolean(item.querySelector(`${SEL.content}, ${SEL.blocks}`) || threadReply);
+      return { ...row, chrome: !looksLikeMessage, why: 'no message body found under this row' };
+    }
+
+    const text = textFor(body);
+    row.chars = text.length;
+    row.words = wordCount(text);
+    row.head = text.slice(0, 80).replace(/\s+/g, ' ');
+    if (!text.trim()) return { ...row, why: 'no text to read' };
+
+    const known = verdicts.get(`${hash(text)}|${gateFor(channel)}`);
+    if (known && known.flagged && known.rewrite) return { ...row, why: 'rewritten' };
+    // The CLEAN object itself, rather than a verdict shaped like it, is the
+    // one triage cleared without asking. Saying which of the two happened is
+    // the difference between "the model saw no problem" and "the model never
+    // saw it", and only the second one is a setting you can change.
+    if (known === CLEAN) return { ...row, why: `read as written; ${triageLine(text, settings)}` };
+    if (known) return { ...row, why: 'the model read it and left it as written' };
+    if (matchesAny(CONFIG.ignoreChannels, channel)) return { ...row, why: 'channel is on the ignore list' };
+    if (paused) return { ...row, why: 'paused' };
+    if (row.state === 'pending') return { ...row, why: 'waiting on the model' };
+    if (row.state === 'error') return { ...row, why: 'the model call failed' };
+
+    const me = selfName();
+    if ((me && sender === me) || matchesAny(CONFIG.selfNames, sender)) return { ...row, why: 'written by you' };
+    if (matchesAny(CONFIG.ignoreSenders, sender)) return { ...row, why: 'sender is on the ignore list' };
+    if (!nearViewport(item)) return { ...row, why: 'off screen; it gets looked at when you scroll to it' };
+    if (text.length > settings.maxChars) {
+      return { ...row, why: `too long: ${text.length} chars, over the ${settings.maxChars} limit` };
+    }
+    if (!shouldAsk(text, settings)) return { ...row, why: `left alone; ${triageLine(text, settings)}` };
+    return { ...row, why: 'about to be sent to the model' };
   }
 
   function commit(p) {
@@ -1524,6 +1615,33 @@
     const composer = target.closest?.(SEL.composer);
     if (composer) scheduleDraftCheck(composer);
   }, true);
+
+  // What `slacken inspect` reads. `missed` is the important number: message
+  // bodies on the page that no list item of ours contains, which is what a
+  // Slack layout we do not recognise looks like from here.
+  window.__slackenInspect = () => {
+    const items = Array.from(document.querySelectorAll(SEL.item));
+    const missed = Array.from(document.querySelectorAll(`${SEL.content}, ${SEL.blocks}`))
+      .filter((el) => !items.some((item) => item.contains(el)))
+      // A content node and the blocks inside it are one missed message, not two.
+      .filter((el, _i, all) => !all.some((other) => other !== el && other.contains(el)))
+      .map((el) => (el.innerText || '').slice(0, 60).replace(/\s+/g, ' '));
+    return {
+      channel: channelName(),
+      self: selfName(),
+      paused,
+      counted: items.length,
+      missed: missed.slice(0, 5),
+      missedCount: missed.length,
+      rows: items.map((item) => {
+        try {
+          return diagnose(item);
+        } catch (err) {
+          return { why: `could not be read: ${err.message}` };
+        }
+      }).filter((row) => !row.chrome),
+    };
+  };
 
   // Called by the daemon whenever the pause state changes, and once at
   // injection time via CONFIG.paused.

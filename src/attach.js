@@ -263,6 +263,29 @@ export class Attacher {
     }
   }
 
+  // What every attached window makes of what is on screen right now. Read
+  // straight from the page rather than from anything the daemon remembers,
+  // because the question being asked is about the DOM in front of the reader.
+  async inspect() {
+    const windows = [];
+    for (const [id, session] of this.sessions) {
+      if (!session) continue;
+      try {
+        const { result } = await session.send('Runtime.evaluate', {
+          expression: 'JSON.stringify(window.__slackenInspect ? window.__slackenInspect() : null)',
+          returnByValue: true,
+        });
+        const value = result?.value ? JSON.parse(result.value) : null;
+        windows.push(value
+          ? { target: id, ...value }
+          : { target: id, error: 'the page script is not running in this window' });
+      } catch (err) {
+        windows.push({ target: id, error: err.message });
+      }
+    }
+    return windows;
+  }
+
   async reinjectAll() {
     const source = this.source();
     for (const session of this.sessions.values()) {

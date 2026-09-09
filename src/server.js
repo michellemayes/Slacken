@@ -18,6 +18,7 @@ import { errorHint } from './moderate.js';
  *   POST /toggle     whichever of the two applies — what the menu bar clicks
  *   POST /moderate   rewrite one message, for `slacken test` and poking by hand
  *   POST /channel    change, or clear, the settings for one channel
+ *   GET  /inspect    what each attached window makes of the messages on screen
  *   POST /reinject   reload the page script without restarting the daemon
  *   POST /stop       shut the daemon down, the way Ctrl-C would
  *
@@ -27,7 +28,9 @@ import { errorHint } from './moderate.js';
  * `slacken start` uses to find the first one, and answering that with 401
  * would turn "already running" into "something is wrong".
  */
-export function createServer({ config, moderator, state, store, getStatus, reinject, onStop, token = null }) {
+export function createServer({
+  config, moderator, state, store, getStatus, reinject, inspect, onStop, token = null,
+}) {
   const snapshot = () => ({
     paused: Boolean(state?.paused),
     pausedAt: state?.pausedAt ?? null,
@@ -166,6 +169,14 @@ export function createServer({ config, moderator, state, store, getStatus, reinj
       if (!onStop) return json(res, 501, { error: 'this daemon cannot stop itself' });
       res.on('finish', () => onStop('a stop request'));
       return json(res, 200, { ok: true, stopping: true });
+    }
+
+    // Why a message on screen was left alone, straight from the page. The
+    // answer no other endpoint has, because every other one reports on
+    // messages Slacken acted on.
+    if (req.method === 'GET' && url.pathname === '/inspect') {
+      if (!inspect) return json(res, 501, { error: 'this daemon cannot inspect windows' });
+      return json(res, 200, { windows: await inspect() });
     }
 
     if (req.method === 'POST' && url.pathname === '/reinject') {

@@ -176,6 +176,7 @@ async function withServer(run, { paused = false, stoppable = true, token = null,
     store,
     getStatus: () => ({ attached, drifted }),
     reinject: async () => {},
+    inspect: async () => [{ target: 'w1', channel: '#eng-oncall', rows: [] }],
     onStop: stoppable ? (reason) => stops.push(reason) : undefined,
     token,
   });
@@ -222,6 +223,14 @@ test('/status reports what the daemon is doing', async () => {
     assert.equal(status.triageMode, DEFAULTS.triageMode);
     assert.equal(typeof status.uptimeMs, 'number');
     assert.equal(status.stats.calls, 0);
+  });
+});
+
+test('/inspect reports what each window makes of the messages on it', async () => {
+  await withServer(async ({ get }) => {
+    const res = await get('/inspect');
+    assert.equal(res.windows.length, 1);
+    assert.equal(res.windows[0].channel, '#eng-oncall');
   });
 });
 
