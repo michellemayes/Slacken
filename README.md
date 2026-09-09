@@ -190,6 +190,7 @@ pause, and the settings. Everything else is there when you want it:
 ```sh
 slacken status           # the same lines the menu shows
 slacken pause / resume   # from anywhere, terminal or menu
+slacken restart          # off and on again, however it was started
 slacken stop             # stop the daemon, however it was started
 slacken agent restart    # start it again without logging out
 slacken agent status     # installed? running? what pid?
@@ -230,6 +231,7 @@ relaunches. On exit it prints what the session cost.
 | `status` | What the running daemon has done so far |
 | `inspect` | What Slacken makes of each message on screen, and why |
 | `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
+| `restart` | Stop the daemon and start it again, however it was started |
 | `stop` | Stop the daemon itself, whether you started it or launchd did |
 | `agent install\|uninstall\|restart\|status\|logs` | Manage the login agent |
 
@@ -279,7 +281,8 @@ now*, and *how much of what I just read was not what was written*.
 
 ![The Slacken menu bar item, open, listing what it is watching, a Pause item,
 counts of messages rewritten and model calls made, the running cost, a Settings
-submenu and an item to open the log](docs/images/menu-bar.png)
+submenu, items to open the log and the recent changes, and a Restart
+item](docs/images/menu-bar.png)
 
 The icon dims whenever nothing is being changed — paused, or attached to no
 Slack window — so the state is readable without opening anything, and turns to
@@ -310,6 +313,28 @@ to: the login agent brings the daemon back whenever it exits, and a pause that
 quietly undid itself would leave you reading a rewritten feed you believed you
 had turned off. The menu bar item is what stops that becoming a pause you
 forgot about.
+
+### Restart, without a terminal
+
+**Restart Slacken**, at the bottom of the menu, stops the daemon and brings it
+straight back. It is the one thing you previously had to open a terminal for,
+and it is the fix for more than it sounds like: a `claude` that has moved since
+you logged in, an upgrade sitting on disk that the running process has never
+read, or a daemon that has simply been up for a fortnight.
+
+How it comes back depends on how it was started, and it works that out itself
+rather than guessing. Under the login agent, launchd (or systemd) is asked for
+a fresh one — which rewrites the plist on the way, so a `claude` that moved is
+found again. Started by hand, it hands over to its own replacement, with the
+same arguments and the same terminal to print to. Which of the two it is is
+settled by pid, not by whether an agent happens to be installed: kickstarting
+the agent from a daemon you started in a terminal would put a second one on a
+port the first is still holding.
+
+The icon disappears while the daemon is down and comes back with it, because
+the item holds the daemon's stdin and is not allowed to outlive it. `slacken
+restart` does the same thing from a terminal, and waits to see it actually come
+back before saying so.
 
 ### Settings, without the config file
 
@@ -482,14 +507,24 @@ list; this is the end that can see which channel you mean.
 ## Speed and cost
 
 Every number below was measured with `claude-haiku-4-5`, not estimated. The
-last row is the shipped configuration handling a burst of eight messages.
+number that matters is the first one: a suspected message is held behind
+*checking…* for exactly as long as a verdict takes, so this is not a figure in
+a log, it is how long you sit looking at a gap where a sentence should be.
 
 | | latency | cost per message |
 | --- | --- | --- |
 | naive `claude -p`, one call per message | 8–11 s | ~$0.0060 |
 | thinking disabled | 2.4 s | $0.0031 |
 | thinking disabled, batch of 8 | 656 ms | $0.00068 |
-| **shipped, real burst of 8** | **912 ms** | **$0.00094** |
+
+The last four entries in the list below — the schema, the exit, the window and
+the working directory — were measured old-against-new: same messages, same
+machine, back to back, so the difference is the change and not the afternoon.
+
+| | one message on its own | a burst of 8 | cost per message |
+| --- | --- | --- | --- |
+| before | 2.8 s | 6.9 s | $0.0027 / $0.00071 |
+| **now** | **1.7 s** | **5.9 s** | **$0.0015 / $0.00055** |
 
 What actually mattered, in order:
 
@@ -498,17 +533,42 @@ What actually mattered, in order:
   from ~10 s to ~2.4 s and cut cost ~3x. It also *improved* schema adherence:
   the thinking runs returned out-of-range values, the non-thinking runs did not.
 - **Batching.** One call for eight messages is 4.5x cheaper per message than
-  eight calls, and the per-message wait drops accordingly. Requests are held
-  for `batchWindowMs` (120 ms) so messages that render together travel together.
+  eight calls, and the per-message wait drops accordingly.
 - **Not calling the model.** Local triage and the disk cache are the cheapest
   optimisations available, because they cost nothing.
-- **`--json-schema`** guarantees parseable JSON back, for a small token cost.
+- **Asking for JSON rather than holding it to a schema.** `--json-schema`
+  guarantees the shape, and costs a second model turn and ~730 input tokens to
+  do it: ~1.2 s on every message, paid to prevent something that almost never
+  happens. So the fast call goes first, and output that does not parse is asked
+  again *with* the schema — which puts the cost on the failure rather than on
+  every message. `useJsonSchema: true` puts it back on every call.
+- **Answering on the answer, not on the exit.** `--output-format json` prints
+  one envelope and prints it whole, and then the process spends up to half a
+  second going away: flushing telemetry, checking for updates, tidying up. The
+  verdict is handed over the moment stdout holds one. The same background work
+  is turned off outright for the copies Slacken spawns
+  (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`,
+  `DISABLE_AUTOUPDATER`), which also took ~360 tokens off every call. The
+  `claude` you type at is untouched.
+- **A shorter batch window when nothing else is in flight.** `batchWindowMs`
+  (120 ms) is free when a call is already out — whatever it collects would have
+  queued behind that call anyway. With nothing in flight it is 120 ms of a wait
+  you sit and watch, so that case uses `batchWindowIdleMs` (25 ms) instead,
+  which still catches every message of a burst that rendered in one frame.
+- **Not starting in your repository.** Calls run from `~/.slacken` rather than
+  from wherever the daemon was started: a large repo is slower to start in, and
+  a `CLAUDE.md` sitting in one has no business shaping a verdict about somebody
+  else's Slack message.
 
-Two things measured and deliberately **not** used:
+Three things measured and deliberately **not** used:
 
 - **A persistent `--input-format stream-json` session.** Turns were no faster
   than a cold call, and because the conversation accumulates, the sixth turn
-  cost 4.7x the first. Process startup was never the bottleneck.
+  cost 4.7x the first.
+- **Spawning `claude` early so it is warm when the message arrives.** It reads
+  stdin to EOF before it does anything else, so a process started three seconds
+  ahead answered no sooner. There is ~450 ms of startup in every call and this
+  does not remove it.
 - **`--effort low`.** No measurable effect on thinking tokens or latency.
 
 ## Configuration
@@ -543,18 +603,27 @@ These are read at startup. Change one in the file and restart the daemon — a
 debug port cannot honestly be moved under a live connection, so it is not
 offered anywhere that implies it can.
 
+The file is written out in full on first run, which pins every key in it,
+including the ones nobody chose — so a default that moves later would reach new
+installs and nobody else. When one does move, the next start brings the file
+forward once, says on stdout exactly which key it changed and to what, and
+stamps the file so it never revisits it. Only a key still holding the previous
+version's default is touched: a value you chose is yours, even where it is the
+slower one, and setting it back by hand keeps it.
+
 | Key | Default | Notes |
 | --- | --- | --- |
 | `batchSize` / `batchWindowMs` | `8` / `120` | How many messages share a call, and how long to wait to fill one |
+| `batchWindowIdleMs` | `25` | The same wait with no call already out — the message you are sitting watching |
 | `maxConcurrency` | `2` | Concurrent `claude -p` processes |
-| `useJsonSchema` | `true` | Structured output; guarantees parseable verdicts |
+| `useJsonSchema` | `false` | Hold the model to the schema on every call. Costs ~1.2 s a message to prevent what a retry already catches |
 | `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
 | `menuBar` | `true` | Show the menu bar item (macOS). Needs `swiftc`; without it, skipped |
 | `retries` | `1` | How many times a failed call is tried again. Being signed out is never retried |
 | `historyMaxEntries` | `2000` | How much of the record to keep |
 | `checkUpdates` | `false` | Ask GitHub once a day whether there is a newer Slacken |
 | `cdpPort` | `9222` | Slack's debug port |
-| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/stop`, `/moderate`) |
+| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/restart`, `/stop`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
 | `claudeBin` / `claudeArgs` | `claude` / `[]` | Set `claudeBin` to a full path if `claude` lives somewhere the lookup does not find; `claudeArgs` for extra flags |
 
@@ -627,10 +696,15 @@ npm run test:fast   # skips the browser test
   decides when a verdict is allowed to change the screen.
 - `test/batch.mjs` — the batching, caching and budget logic that make this
   cheap, run against a fake `claude` binary that records how many times it was
-  actually invoked. Asserts that four simultaneous messages cost one process,
-  that the day's spend survives a restart and the cap with it, that a transient
-  failure is tried again and a signed-out one is not, and that the same message
-  in two channels with different settings is two questions.
+  actually invoked, and with what. Asserts that four simultaneous messages cost
+  one process, that the day's spend survives a restart and the cap with it,
+  that a transient failure is tried again and a signed-out one is not, and that
+  the same message in two channels with different settings is two questions. On
+  speed: that a verdict is handed over when the answer lands rather than when
+  the process gets round to leaving, that the fast call goes without the schema
+  and is asked again with it when the output does not parse, that output which
+  will not parse either way is not retried forever, and that a message arriving
+  on its own does not wait out a window meant for filling a batch.
 - `test/agent.mjs` — the generated LaunchAgent plist and systemd unit,
   including that both carry a `PATH` that can actually find `claude`, that both
   come back after a crash and stay stopped after a stop, and that both log to
@@ -643,8 +717,13 @@ npm run test:fast   # skips the browser test
   file.
 - `test/control.mjs` — pausing, settings, and the menu the menu bar item draws.
   Asserts that a pause survives a restart, that a paused Slacken makes no model
-  call and caches nothing, that the control endpoints agree with each other, and
-  that the menu offers exactly one of pause and resume. On the token: that
+  call and caches nothing, that the control endpoints agree with each other,
+  that the menu offers exactly one of pause and resume, and that `/restart`
+  answers before it acts and says so plainly when it cannot restart itself. On
+  bringing an older config file forward: that a key still holding the previous
+  default is moved and a value somebody chose is not, that a file is never
+  revisited once stamped, and that one which cannot be read is left alone
+  rather than guessed at. On the token: that
   every endpoint but `/health` refuses a request without one, that a wrong one
   changes nothing on its way to being refused, and that the file is written once
   and readable by nobody else. On settings: that a

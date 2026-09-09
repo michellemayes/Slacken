@@ -15,7 +15,7 @@ import { State } from '../src/state.js';
 import { Moderator } from '../src/moderate.js';
 import { createServer } from '../src/server.js';
 import { menuModel, settingsMenu, buildHelper, MenuBar } from '../src/menubar.js';
-import { DEFAULTS, ConfigStore, loadConfig } from '../src/config.js';
+import { DEFAULTS, ConfigStore, loadConfig, migrateConfig, CONFIG_VERSION } from '../src/config.js';
 import { coerce, coerceAll, withEntry, inList, invalidatesCache, forChannel, gateSignature } from '../src/settings.js';
 import { Attacher } from '../src/attach.js';
 import { loadToken, readToken, tokenMatches } from '../src/auth.js';
@@ -159,15 +159,77 @@ test('a verdict decided while paused is never cached as a clean one', async () =
   }
 });
 
+/* --------------------------------------------------------- config files */
+
+/*
+ * The file is written out in full on first run, so every key in it is pinned —
+ * including the ones nobody chose. Without this, a default that moves because
+ * it was measured to be slow reaches new installs and nobody else.
+ */
+test('a key still holding the old default is brought forward', () => {
+  const { file, read, cleanup } = tempConfig({ ...DEFAULTS, useJsonSchema: true });
+  try {
+    const { changed } = migrateConfig(file);
+    assert.deepEqual(changed, ['useJsonSchema']);
+    assert.equal(read().useJsonSchema, DEFAULTS.useJsonSchema);
+    assert.equal(read().configVersion, CONFIG_VERSION);
+    // Everything else is left exactly as it was found.
+    assert.equal(read().model, DEFAULTS.model);
+    assert.equal(read().cdpPort, DEFAULTS.cdpPort);
+  } finally {
+    cleanup();
+  }
+});
+
+test('a value somebody chose is theirs, and is only asked about once', () => {
+  const { file, read, cleanup } = tempConfig({ ...DEFAULTS, useJsonSchema: true, triageMode: 'always' });
+  try {
+    migrateConfig(file);
+    // Set back by hand after the migration: a stamped file is never revisited,
+    // so this stays as it was left.
+    const restored = { ...read(), useJsonSchema: true };
+    fs.writeFileSync(file, JSON.stringify(restored, null, 2));
+    assert.deepEqual(migrateConfig(file).changed, []);
+    assert.equal(read().useJsonSchema, true);
+    assert.equal(read().triageMode, 'always', 'a setting nobody moved is not collateral');
+  } finally {
+    cleanup();
+  }
+});
+
+test('there is nothing to bring forward in a file that is not there', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-config-'));
+  try {
+    assert.deepEqual(migrateConfig(path.join(dir, 'config.json')).changed, []);
+    assert.equal(fs.existsSync(path.join(dir, 'config.json')), false, 'and none is invented');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a config file that cannot be read is left exactly as it is', () => {
+  const { file, cleanup } = tempConfig({});
+  try {
+    fs.writeFileSync(file, '{ not json');
+    assert.deepEqual(migrateConfig(file).changed, []);
+    assert.equal(fs.readFileSync(file, 'utf8'), '{ not json', 'guessing at it would be worse');
+  } finally {
+    cleanup();
+  }
+});
+
 /* ----------------------------------------------------------- control API */
 
-async function withServer(run, { paused = false, stoppable = true, token = null, values = {} } = {}) {
+async function withServer(run, {
+  paused = false, stoppable = true, restartable = true, token = null, values = {},
+} = {}) {
   const state = new State({ persist: false });
   state.setPaused(paused);
   const { mod, cleanup } = moderator(state);
   let attached = 1;
   let drifted = false;
   const stops = [];
+  const restarts = [];
 
   const store = new ConfigStore({ values: { ...DEFAULTS, httpPort: 0, ...values }, persist: false });
   const server = await createServer({
@@ -179,6 +241,7 @@ async function withServer(run, { paused = false, stoppable = true, token = null,
     reinject: async () => {},
     inspect: async () => [{ target: 'w1', channel: '#eng-oncall', rows: [] }],
     onStop: stoppable ? (reason) => stops.push(reason) : undefined,
+    onRestart: restartable ? (reason) => restarts.push(reason) : undefined,
     token,
   });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -206,6 +269,7 @@ async function withServer(run, { paused = false, stoppable = true, token = null,
       state,
       store,
       stops,
+      restarts,
       setAttached: (n) => { attached = n; },
       setDrifted: (v) => { drifted = v; },
     });
@@ -288,6 +352,25 @@ test('/stop shuts the daemon down, and answers before it does', async () => {
   });
 });
 
+test('/restart answers first and goes second, the way /stop does', async () => {
+  await withServer(async ({ post, restarts, stops }) => {
+    assert.deepEqual(await post('/restart'), { ok: true, restarting: true });
+    // The reply is written before the restart runs; give the 'finish' event
+    // the tick it needs.
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(restarts, ['a restart request']);
+    // A restart is not a stop that happens to come back: how this daemon gets
+    // going again depends on how it was started, and only it knows that.
+    assert.deepEqual(stops, []);
+  });
+});
+
+test('a daemon with no way to restart itself says so rather than pretending', async () => {
+  await withServer(async ({ post }) => {
+    assert.deepEqual(await post('/restart'), { error: 'this daemon cannot restart itself' });
+  }, { restartable: false });
+});
+
 test('a daemon with no way to stop itself says so rather than pretending', async () => {
   await withServer(async ({ post }) => {
     assert.deepEqual(await post('/stop'), { error: 'this daemon cannot stop itself' });
@@ -332,9 +415,23 @@ const labels = (status) => menuModel(status).items.map((i) => i.label).filter(Bo
 
 test('the menu offers exactly one of pause and resume', () => {
   for (const paused of [false, true]) {
-    const actions = menuModel({ ...STATUS, paused }).items.filter((i) => i.post);
-    assert.equal(actions.length, 1, 'two ways to say the same thing is one too many');
-    assert.equal(actions[0].post, paused ? '/resume' : '/pause');
+    const toggles = menuModel({ ...STATUS, paused }).items
+      .filter((i) => i.post === '/pause' || i.post === '/resume');
+    assert.equal(toggles.length, 1, 'two ways to say the same thing is one too many');
+    assert.equal(toggles[0].post, paused ? '/resume' : '/pause');
+  }
+});
+
+test('the menu can restart the daemon, paused or not', () => {
+  for (const paused of [false, true]) {
+    const items = menuModel({ ...STATUS, paused }).items;
+    const restart = items.filter((i) => i.post === '/restart');
+    assert.equal(restart.length, 1, 'the one action you could not take without a terminal');
+    assert.equal(restart[0].label, 'Restart Slacken');
+    // Next to leaving, not next to pausing: both of those end something, and
+    // neither is the thing you reach for while reading.
+    assert.ok(items.indexOf(restart[0]) > items.findIndex((i) => i.submenu),
+      'it belongs at the bottom, under the settings, not among the counts');
   }
 });
 
@@ -798,7 +895,8 @@ test('every endpoint but /health needs the token', async () => {
     assert.equal((await open.json()).ok, true);
 
     for (const [method, path] of [['GET', '/status'], ['GET', '/menubar'], ['GET', '/config'],
-      ['POST', '/pause'], ['POST', '/config'], ['POST', '/channel'], ['POST', '/moderate'], ['POST', '/stop']]) {
+      ['POST', '/pause'], ['POST', '/config'], ['POST', '/channel'], ['POST', '/moderate'],
+      ['POST', '/restart'], ['POST', '/stop']]) {
       const res = await fetch(`${base}${path}`, { method });
       assert.equal(res.status, 401, `${method} ${path} should need the token`);
     }

@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadConfig, writeDefaultConfig, ConfigStore, CONFIG_PATH } from './config.js';
 import { SETTINGS, invalidatesCache } from './settings.js';
@@ -52,6 +52,8 @@ const USAGE = `slacken - a calmer reading layer for the Slack desktop app
   slacken inspect              What Slacken makes of the messages on screen now
   slacken pause                Stop rewriting, and reveal what is on screen
   slacken resume               Start rewriting again
+  slacken restart              Stop the daemon and start it again, the same way
+                               it was started — also on the menu bar
   slacken stop                 Stop the daemon, wherever it was started from
 
   slacken agent install        Run automatically when you log in, with no terminal
@@ -84,6 +86,7 @@ export async function main(argv) {
     case 'inspect': return cmdInspect(args);
     case 'pause': return cmdPause(args, true);
     case 'resume': return cmdPause(args, false);
+    case 'restart': return cmdRestart(args);
     case 'stop': return cmdStop(args);
     case 'agent': return cmdAgent(args);
     case 'help':
@@ -174,6 +177,9 @@ async function run(store) {
   // say — is remembered rather than answered with a shrug.
   let pendingStop = null;
   let stop = (reason) => { pendingStop = reason || 'a stop request'; };
+  // Read once this process has actually stopped, because a replacement started
+  // any earlier would find the port still held and give up.
+  let relaunch = false;
 
   let server;
   try {
@@ -186,6 +192,10 @@ async function run(store) {
       reinject: () => attacher.reinjectAll(),
       inspect: () => attacher.inspect(),
       onStop: (reason) => stop(reason),
+      onRestart: (reason) => {
+        restartSelf(config, reason, () => { relaunch = true; stop(reason); })
+          .catch((err) => console.error(`[slacken] could not restart: ${err.message}`));
+      },
       token,
     });
   } catch (err) {
@@ -266,7 +276,74 @@ async function run(store) {
     process.on('SIGTERM', () => shutdown());
     if (pendingStop) shutdown(pendingStop);
   });
-  return 0;
+  return relaunch ? relaunchSelf() : 0;
+}
+
+/*
+ * Off and on again, from wherever this daemon was started.
+ *
+ * There are two of these and they are not the same thing. Under the login
+ * agent, launchd (or systemd) owns this process, so the honest restart is to
+ * ask it for a fresh one — which rewrites the plist on the way, and so also
+ * fixes a claude that has moved since you logged in, the most common reason
+ * to want this at all. Started by hand there is nobody to ask, and this
+ * process hands over to its own replacement instead.
+ *
+ * Which one it is is settled by pid, not by whether an agent is installed: a
+ * daemon typed into a terminal on a machine that has an agent installed is
+ * still a daemon in a terminal, and kickstarting the agent from here would
+ * start a second one on a port this one is still holding — and under KeepAlive
+ * that second one would be restarted, and fail, for as long as this one lived.
+ */
+async function restartSelf(config, reason, relaunchAfterStop) {
+  const agent = await agentStatus().catch(() => ({}));
+  const supervised = agent.installed && agent.running && String(agent.pid) === String(process.pid);
+  if (!supervised) {
+    relaunchAfterStop();
+    return;
+  }
+
+  console.log(`[slacken] restarting (${reason}) — the login agent is bringing up a fresh one`);
+  try {
+    await restartAgent(config);
+  } catch (err) {
+    console.warn(`[slacken] the login agent would not restart us (${err.message}); doing it here instead`);
+    relaunchAfterStop();
+    return;
+  }
+  // launchd stops us by signal, and does it more or less immediately. If it
+  // somehow does not, a menu item that visibly does nothing is the worse
+  // failure of the two, so we go the other way rather than sit there.
+  const timer = setTimeout(() => {
+    console.warn('[slacken] the login agent has not taken us down; stopping and starting a replacement');
+    relaunchAfterStop();
+  }, 5000);
+  timer.unref?.();
+}
+
+/*
+ * Hand over to a fresh copy of ourselves, started the way this one was.
+ *
+ * It takes this process's own stdio, so a daemon started in a terminal keeps
+ * printing to that terminal, and its own process group, so Ctrl-C still
+ * reaches it and closing the window still ends it. A restart should change
+ * what is running and nothing else about how you can stop it. It runs whatever
+ * is on disk now, which is what makes this the way to pick up an upgrade.
+ */
+function relaunchSelf() {
+  try {
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      stdio: 'inherit',
+      env: process.env,
+    });
+    child.unref();
+    console.log(`[slacken] started again (pid ${child.pid})`);
+    return 0;
+  } catch (err) {
+    console.error(`[slacken] could not start a replacement: ${err.message}`);
+    console.error('[slacken] nothing is running now — start it again with: slacken start');
+    return 1;
+  }
 }
 
 /*
@@ -588,6 +665,56 @@ async function cmdStop(args) {
     console.log("it will be back when you next log in — 'slacken agent restart' brings it back now");
   }
   return 0;
+}
+
+/*
+ * The terminal end of the menu bar's Restart.
+ *
+ * The daemon decides how to restart itself, because it is the only one that
+ * knows how it was started. This end asks, and then waits to see it come back:
+ * "restarting" is not news, and a restart that did not finish is the only
+ * thing here worth saying out loud.
+ */
+async function cmdRestart(args) {
+  const config = configFrom(args);
+  if (!(await runningDaemon(config))) {
+    console.log("nothing is running — 'slacken start' starts it");
+    return 1;
+  }
+  try {
+    await daemon(config, 'POST', '/restart');
+  } catch (err) {
+    // It went away as it answered, which is the thing we asked it to do.
+    if (!/ECONNRESET|socket hang up|fetch failed|nothing is listening/i.test(err.message)) {
+      console.error(err.message);
+      return 1;
+    }
+  }
+
+  // It has to actually go before coming back counts as having restarted:
+  // otherwise the first health check answers from the process we just asked
+  // to leave, and every restart looks instant and does nothing.
+  const stopped = await waitFor(() => runningDaemon(config).then((d) => !d), 15000);
+  if (!stopped) {
+    console.error('it is still running. Check its log, or stop it by hand.');
+    return 1;
+  }
+  if (!(await waitFor(() => runningDaemon(config), 30000))) {
+    console.error('it stopped and has not come back. Check its log: slacken agent logs');
+    return 1;
+  }
+  console.log('restarted');
+  return 0;
+}
+
+// Polls until the answer is truthy, or until it has waited long enough.
+async function waitFor(check, timeoutMs, everyMs = 200) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(everyMs);
+  }
 }
 
 async function cmdStatus(args) {

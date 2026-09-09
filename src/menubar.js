@@ -101,6 +101,11 @@ export function menuModel(status) {
     { label: 'Recent changes…', open: HISTORY_PATH },
     { label: 'Open log…', open: LOG_PATH },
     { separator: true },
+    // Off and on again, for the times that is genuinely the fix: a claude that
+    // moved after login, an upgrade sitting on disk unread, a daemon that has
+    // been up all week. The icon goes away with the daemon and comes back with
+    // it, which is the honest thing for it to do.
+    { label: 'Restart Slacken', post: '/restart' },
     { label: 'Hide menu bar item', quit: true },
   );
 
