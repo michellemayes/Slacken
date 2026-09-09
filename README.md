@@ -1,6 +1,7 @@
 # Slacken
 
-A calmer reading layer for Slack on macOS.
+A calmer reading layer for Slack on macOS. Formerly SlackCensor — same
+project, renamed to Slacken.
 
 Incoming messages get rewritten in place, in the real desktop app, as you read
 them. Two things happen:
@@ -65,8 +66,8 @@ macOS, Node 20+, and `claude` on your `PATH` and signed in (`claude -p "hi"`
 should work).
 
 ```sh
-git clone https://github.com/michellemayes/SlackCensor.git
-cd SlackCensor
+git clone https://github.com/michellemayes/Slacken.git
+cd Slacken
 ./install.sh
 ```
 
