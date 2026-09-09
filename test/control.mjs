@@ -16,7 +16,9 @@ import { Moderator } from '../src/moderate.js';
 import { createServer } from '../src/server.js';
 import { menuModel, settingsMenu, buildHelper, MenuBar } from '../src/menubar.js';
 import { DEFAULTS, ConfigStore, loadConfig } from '../src/config.js';
-import { coerce, coerceAll, withEntry, inList, invalidatesCache } from '../src/settings.js';
+import { coerce, coerceAll, withEntry, inList, invalidatesCache, forChannel, gateSignature } from '../src/settings.js';
+import { Attacher } from '../src/attach.js';
+import { loadToken, readToken, tokenMatches } from '../src/auth.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fake-claude.mjs');
@@ -158,34 +160,53 @@ test('a verdict decided while paused is never cached as a clean one', async () =
 
 /* ----------------------------------------------------------- control API */
 
-async function withServer(run, { paused = false, stoppable = true } = {}) {
+async function withServer(run, { paused = false, stoppable = true, token = null, values = {} } = {}) {
   const state = new State({ persist: false });
   state.setPaused(paused);
   const { mod, cleanup } = moderator(state);
   let attached = 1;
+  let drifted = false;
   const stops = [];
 
-  const store = new ConfigStore({ values: { ...DEFAULTS, httpPort: 0 }, persist: false });
+  const store = new ConfigStore({ values: { ...DEFAULTS, httpPort: 0, ...values }, persist: false });
   const server = await createServer({
     config: store.values,
     moderator: mod,
     state,
     store,
-    getStatus: () => ({ attached }),
+    getStatus: () => ({ attached, drifted }),
     reinject: async () => {},
     onStop: stoppable ? (reason) => stops.push(reason) : undefined,
+    token,
   });
   const base = `http://127.0.0.1:${server.address().port}`;
-  const get = async (p) => (await fetch(`${base}${p}`)).json();
-  const post = async (p) => (await fetch(`${base}${p}`, { method: 'POST' })).json();
-  const postJson = async (p, body) => (await fetch(`${base}${p}`, {
+  const auth = token ? { authorization: `Bearer ${token}` } : {};
+  const raw = (p, init = {}) => fetch(`${base}${p}`, {
+    ...init,
+    headers: { ...auth, ...(init.headers || {}) },
+  });
+  const get = async (p) => (await raw(p)).json();
+  const post = async (p) => (await raw(p, { method: 'POST' })).json();
+  const postJson = async (p, body) => (await raw(p, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })).json();
 
   try {
-    await run({ get, post, postJson, state, store, stops, setAttached: (n) => { attached = n; } });
+    await run({
+      base,
+      raw,
+      get,
+      post,
+      postJson,
+      mod,
+      state,
+      store,
+      stops,
+      setAttached: (n) => { attached = n; },
+      setDrifted: (v) => { drifted = v; },
+    });
   } finally {
     server.close();
     cleanup();
@@ -735,4 +756,189 @@ test('a crashing helper is retried, but not forever', async () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+
+/* ------------------------------------------------------------------ token */
+
+/*
+ * Loopback is not a permission.
+ *
+ * Everything running on this machine can reach 127.0.0.1, and behind the
+ * control API is what you have been reading, what it cost, and an endpoint
+ * that will spend your Claude account on any text at all.
+ */
+test('every endpoint but /health needs the token', async () => {
+  await withServer(async ({ raw, base }) => {
+    const open = await fetch(`${base}/health`);
+    assert.equal(open.status, 200, '/health is how a second start finds the first');
+    assert.equal((await open.json()).ok, true);
+
+    for (const [method, path] of [['GET', '/status'], ['GET', '/menubar'], ['GET', '/config'],
+      ['POST', '/pause'], ['POST', '/config'], ['POST', '/channel'], ['POST', '/moderate'], ['POST', '/stop']]) {
+      const res = await fetch(`${base}${path}`, { method });
+      assert.equal(res.status, 401, `${method} ${path} should need the token`);
+    }
+
+    // And with it, everything works exactly as it did.
+    assert.equal((await (await raw('/status')).json()).attached, 1);
+  }, { token: 'a-test-token' });
+});
+
+test('a wrong token is refused, and nothing is changed on the way', async () => {
+  await withServer(async ({ base, store }) => {
+    const res = await fetch(`${base}/config`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer not-the-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ triageMode: 'always' }),
+    });
+    assert.equal(res.status, 401);
+    assert.equal(store.values.triageMode, 'heuristic', 'a refused request is not a half-applied one');
+  }, { token: 'a-test-token' });
+});
+
+test('the token is written once, kept private, and read back', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-token-'));
+  const file = path.join(dir, 'token');
+  try {
+    const first = loadToken(file);
+    assert.match(first, /^[0-9a-f]{64}$/);
+    assert.equal(loadToken(file), first, 'a second start uses the token the first one wrote');
+    assert.equal(readToken(file), first);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(file).mode & 0o077, 0, 'nobody else on this machine may read it');
+    }
+    assert.equal(tokenMatches(first, first), true);
+    assert.equal(tokenMatches(first, `${first.slice(0, -1)}0`), false);
+    assert.equal(tokenMatches(first, 'short'), false);
+    assert.equal(tokenMatches(null, undefined), true, 'a daemon with no token asks for none');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------- per-channel */
+
+test('a channel can be told to behave differently, one setting at a time', async () => {
+  await withServer(async ({ postJson, store }) => {
+    const first = await postJson('/channel', { channel: '#eng-oncall', settings: { minSeverity: 3 } });
+    assert.equal(first.ok, true);
+    assert.deepEqual(store.values.channelOverrides['#eng-oncall'], { minSeverity: 3 });
+
+    // A second setting joins the first rather than replacing it.
+    const second = await postJson('/channel', { channel: '#eng-oncall', settings: { condenseEnabled: false } });
+    assert.equal(second.ok, true);
+    assert.deepEqual(store.values.channelOverrides['#eng-oncall'], { minSeverity: 3, condenseEnabled: false });
+
+    // And the global settings are untouched by any of it.
+    assert.equal(store.values.minSeverity, DEFAULTS.minSeverity);
+    assert.equal(forChannel(store.values, '#ENG-ONCALL').minSeverity, 3, 'one channel, however you type it');
+    assert.equal(forChannel(store.values, '#other').minSeverity, DEFAULTS.minSeverity);
+  });
+});
+
+test('a channel setting that cannot honestly differ per channel is refused', async () => {
+  await withServer(async ({ postJson, store }) => {
+    const res = await postJson('/channel', { channel: '#eng', settings: { model: 'claude-opus-5' } });
+    assert.equal(res.ok, false);
+    assert.match(res.errors[0].message, /cannot differ per channel/);
+    assert.equal(store.values.channelOverrides['#eng'], undefined);
+
+    const bad = await postJson('/channel', { channel: '#eng', settings: { minSeverity: 9 } });
+    assert.equal(bad.ok, false);
+    assert.match(bad.errors[0].message, /between 0 and 3/);
+    assert.equal(store.values.channelOverrides['#eng'], undefined, 'a refused value leaves no channel behind');
+  });
+});
+
+test('clearing a channel puts it back to the global settings', async () => {
+  await withServer(async ({ postJson, store }) => {
+    await postJson('/channel', { channel: '#eng', settings: { minSeverity: 3 } });
+    await postJson('/channel', { channel: '#design', settings: { condenseEnabled: false } });
+    const cleared = await postJson('/channel', { channel: '#eng', clear: true });
+
+    assert.equal(cleared.ok, true);
+    assert.equal(store.values.channelOverrides['#eng'], undefined);
+    assert.deepEqual(store.values.channelOverrides['#design'], { condenseEnabled: false },
+      'the other channel is not collateral');
+  });
+});
+
+test('the same message in two channels is two cache keys, and the same one is one', () => {
+  const config = { ...DEFAULTS, channelOverrides: { '#loud': { minSeverity: 3 } } };
+  assert.notEqual(gateSignature(config, '#loud'), gateSignature(config, '#quiet'));
+  assert.equal(gateSignature(config, '#quiet'), gateSignature(config, '#anywhere-else'));
+});
+
+/* ------------------------------------------------------------ what it says */
+
+test('the menu says when Slack has stopped looking like Slack', () => {
+  const running = menuModel({ attached: 2, stats: {}, config: DEFAULTS });
+  assert.match(running.items[0].label, /Watching 2 Slack windows/);
+  assert.equal(running.dimmed, false);
+
+  const drifted = menuModel({ attached: 2, drifted: true, stats: {}, config: DEFAULTS });
+  assert.match(drifted.items[0].label, /layout may have changed/);
+  assert.notEqual(drifted.icon, running.icon, 'the icon has to say it without being opened');
+});
+
+test('the menu names the error rather than counting errors', () => {
+  const counted = menuModel({ attached: 1, stats: { errors: 3 }, config: DEFAULTS });
+  assert.ok(counted.items.some((i) => /3 errors/.test(i.label || '')));
+
+  const named = menuModel({
+    attached: 1,
+    stats: { errors: 3 },
+    config: DEFAULTS,
+    lastError: { kind: 'auth', hint: 'Not signed in to Claude — run: claude login' },
+  });
+  assert.ok(named.items.some((i) => /claude login/.test(i.label || '')));
+  assert.ok(!named.items.some((i) => /3 errors/.test(i.label || '')),
+    'the thing you can do about it beats the number of times it happened');
+});
+
+test('the menu counts the originals that were asked for', () => {
+  const quiet = menuModel({ attached: 1, stats: {}, config: DEFAULTS });
+  assert.ok(!quiet.items.some((i) => /asked for back/.test(i.label || '')),
+    'nothing to say before anyone has clicked a badge');
+  const asked = menuModel({ attached: 1, stats: { reveals: 4 }, config: DEFAULTS });
+  assert.ok(asked.items.some((i) => /4 originals asked for back/.test(i.label || '')));
+});
+
+test('a channel with settings of its own is in the settings menu, with a way back', () => {
+  const config = { ...DEFAULTS, channelOverrides: { '#eng': { minSeverity: 3 } } };
+  const entry = settingsMenu(config).find((i) => /Per-channel settings/.test(i.label || ''));
+  assert.match(entry.label, /: 1$/);
+
+  const channel = entry.submenu[0];
+  assert.match(channel.label, /^#eng — /);
+  const back = channel.submenu.find((i) => i.label === 'Same as everywhere else');
+  assert.deepEqual(back.body, { channel: '#eng', clear: true });
+
+  // Every choice posts the value it would set, exactly like the global ones.
+  const severity = channel.submenu.find((i) => /Soften when it is/.test(i.label || ''));
+  const chosen = severity.submenu.find((i) => i.checked);
+  assert.deepEqual(chosen.body, { channel: '#eng', settings: { minSeverity: 3 } });
+
+  const none = settingsMenu(DEFAULTS).find((i) => /Per-channel settings/.test(i.label || ''));
+  assert.match(none.label, /none$/);
+});
+
+/* --------------------------------------------------------------- drift */
+
+test('drift is list items with no message bodies in them, and nothing else', () => {
+  const attacher = new Attacher({ config: { ...DEFAULTS }, moderator: { stats: {} } });
+  assert.equal(attacher.drifted, false, 'a page that has said nothing yet is not evidence');
+
+  attacher.health = { at: Date.now(), items: 0, bodies: 0 };
+  assert.equal(attacher.drifted, false, 'an empty channel looks exactly like this');
+
+  attacher.health = { at: Date.now(), items: 12, bodies: 12 };
+  assert.equal(attacher.drifted, false);
+
+  attacher.health = { at: Date.now(), items: 12, bodies: 0 };
+  assert.equal(attacher.drifted, true, 'the list is there and the words are not');
+
+  attacher.health = { at: Date.now() - 10 * 60_000, items: 12, bodies: 0 };
+  assert.equal(attacher.drifted, false, 'ten minutes later it is not news, it is history');
 });

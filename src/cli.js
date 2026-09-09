@@ -11,8 +11,14 @@ import { listTargets } from './cdp.js';
 import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, LOG_PATH } from './agent.js';
 import { State } from './state.js';
 import { MenuBar, menuModel } from './menubar.js';
+import { History, formatEntry, HISTORY_PATH } from './history.js';
+import { loadToken, readToken } from './auth.js';
+import { CHANNEL_KEYS } from './settings.js';
+import { VERSION, checkForUpdate } from './version.js';
 
 const execFileAsync = promisify(execFile);
+
+const TOKEN_HINT = "delete ~/.slacken/token and restart the daemon if it has got out of step";
 
 const USAGE = `slacken - a calmer reading layer for Slack on macOS
 
@@ -31,6 +37,14 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
 
   slacken set                  List the settings you can change, and their values
   slacken set <name> <value>   Change one, on the running daemon and on disk
+
+  slacken channel                          What each channel does differently
+  slacken channel <#name> <name> <value>   Change one setting in one channel
+  slacken channel <#name> reset            Put a channel back to the global settings
+
+  slacken history [--lines N] [--json]     What has been rewritten, most recent last
+  slacken token                            Print the control API token
+  slacken version [--check]                What this is, and whether it is current
 
   slacken status               What the running daemon has done so far
   slacken pause                Stop rewriting, and reveal what is on screen
@@ -56,6 +70,13 @@ export async function main(argv) {
     case 'doctor': return cmdDoctor(args);
     case 'config': return cmdConfig(args);
     case 'set': return cmdSet(args);
+    case 'channel': return cmdChannel(args);
+    case 'history': return cmdHistory(args);
+    case 'token': return cmdToken(args);
+    case 'version':
+    case '--version':
+    case '-v':
+      return cmdVersion(args);
     case 'status': return cmdStatus(args);
     case 'pause': return cmdPause(args, true);
     case 'resume': return cmdPause(args, false);
@@ -121,12 +142,19 @@ async function run(store) {
   const config = store.values;
   const state = new State();
   const moderator = new Moderator(config, state);
+  // Written by the same handler that logs to the terminal, because they are
+  // two views of one thing: what Slacken did, as it did it.
+  const history = new History({ config });
+  const token = loadToken();
   const attacher = new Attacher({
     config,
     moderator,
     state,
     store,
-    onEvent: (event) => logEvent(event, config),
+    onEvent: (event) => {
+      logEvent(event, config);
+      recordEvent(history, event);
+    },
   });
 
   // POST /stop and Ctrl-C are the same thing, and neither may run twice. The
@@ -143,9 +171,10 @@ async function run(store) {
       moderator,
       state,
       store,
-      getStatus: () => ({ attached: attacher.attachedCount }),
+      getStatus: () => ({ attached: attacher.attachedCount, drifted: attacher.drifted }),
       reinject: () => attacher.reinjectAll(),
       onStop: (reason) => stop(reason),
+      token,
     });
   } catch (err) {
     if (err.code !== 'EADDRINUSE') throw err;
@@ -157,7 +186,7 @@ async function run(store) {
 
   await attacher.start();
 
-  const menuBar = new MenuBar({ config, onEvent: (event) => logEvent(event, config) });
+  const menuBar = new MenuBar({ config, token, onEvent: (event) => logEvent(event, config) });
   // The menu bar is how you notice a pause you left running yesterday, so it
   // is worth starting even when nothing else has attached yet.
   if (config.menuBar !== false) await menuBar.start();
@@ -165,6 +194,18 @@ async function run(store) {
   console.log(`[slacken] watching Slack (model ${config.model}, triage ${config.triageMode})`);
   console.log(`[slacken] control API on http://127.0.0.1:${config.httpPort}  ·  Cmd+Shift+U toggles all originals`);
   if (state.paused) console.log('[slacken] currently PAUSED — nothing will be rewritten until you resume');
+  if (state.spentToday > 0) {
+    console.log(`[slacken] $${state.spentToday.toFixed(4)} spent so far today`
+      + `${config.dailyBudgetUsd > 0 ? ` of $${Number(config.dailyBudgetUsd).toFixed(2)}` : ''}`);
+  }
+  if (config.checkUpdates) {
+    // Deliberately after everything else has started: an update check is the
+    // one thing here that talks to anything but your own machine, and nothing
+    // waits on what it finds.
+    checkForUpdate(config).then((update) => {
+      if (update?.newer) console.log(`[slacken] ${update.latest} is out (you have ${VERSION}): ${update.url}`);
+    }).catch(() => {});
+  }
   // Started by hand, so this dies with the terminal it was typed into. Say so
   // once, next to the thing that fixes it.
   if (process.platform === 'darwin' && !agentInstalled()) {
@@ -198,7 +239,7 @@ async function run(store) {
       const st = moderator.stats;
       console.log(`\n[slacken] stopping${reason ? ` (${reason})` : ''} — ${st.batched} messages in ${st.calls} calls, `
         + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
-        + `$${st.costUsd.toFixed(4)}`);
+        + `$${st.sessionCostUsd.toFixed(4)} this session, $${st.costUsd.toFixed(4)} today`);
       menuBar.stop();
       attacher.stop();
       moderator.cache.flush();
@@ -245,13 +286,18 @@ function logEvent(event, config) {
           ? `[slacken] ignoring ${event.channel} — nothing there will be rewritten`
           : `[slacken] rewriting ${event.channel} again`);
       break;
+    case 'reveal':
+      console.log(`[slacken] original asked for: ${event.sender || 'someone'} in ${event.channel || '?'}`);
+      break;
     case 'verdict': {
       const v = event.verdict;
       if (v.flagged) {
         const what = v.hostile && v.verbose ? 'softened + condensed'
           : v.verbose ? 'condensed' : 'softened';
+        const where = event.kind === 'notification' ? ' (notification)'
+          : event.kind === 'draft' ? ' (your draft)' : '';
         const who = `${event.sender || 'someone'} in ${event.channel || '?'}`;
-        console.log(`[slacken] ${what} ${who}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
+        console.log(`[slacken] ${what} ${who}${where}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
       } else if (config.verbose) {
         console.log(`[slacken] left alone: ${JSON.stringify(event.text.slice(0, 60))}`);
       }
@@ -259,6 +305,23 @@ function logEvent(event, config) {
     }
     default:
       break;
+  }
+}
+
+// The history is the same events the terminal gets, kept. A draft is not
+// recorded: it is a suggestion about something you have not sent, and writing
+// down what you nearly said is not this tool's business.
+function recordEvent(history, event) {
+  if (event.type === 'verdict' && event.kind !== 'draft') {
+    history.recordVerdict({
+      sender: event.sender,
+      channel: event.channel,
+      text: event.text,
+      verdict: event.verdict,
+    });
+  }
+  if (event.type === 'reveal') {
+    history.recordReveal({ sender: event.sender, channel: event.channel, kind: event.kind, note: event.note });
   }
 }
 
@@ -347,12 +410,22 @@ async function cmdAgent(args) {
 // two views of it rather than two copies.
 async function daemon(config, method, path, body) {
   const url = `http://127.0.0.1:${config.httpPort}${path}`;
+  // The daemon writes the token; every other process on this machine cannot
+  // read it, and this one can only because it is running as you.
+  const token = readToken();
   try {
     const res = await fetch(url, {
       method,
       signal: AbortSignal.timeout(5000),
-      ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+      headers: {
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
     });
+    if (res.status === 401) {
+      throw new Error(`the daemon refused this token; ${TOKEN_HINT}`);
+    }
     // A refused setting is an answer, not a failure to reach anyone: it comes
     // back as JSON saying why, and reading it beats falling back to the file.
     if (!res.ok && res.status !== 400) throw new Error(`${res.status} ${res.statusText}`);
@@ -517,6 +590,119 @@ async function cmdSet(args) {
     return 0;
   }
   for (const name of result.changed) console.log(`${name} = ${show(values[name])}`);
+  return 0;
+}
+
+/*
+ * What one channel does differently.
+ *
+ * The menu bar can offer this for a channel that already has settings of its
+ * own; getting the first one is a terminal job, because it needs you to name
+ * a channel rather than point at one.
+ */
+async function cmdChannel(args) {
+  writeDefaultConfig();
+  const config = configFrom(args);
+  const [, channel, key, ...rest] = args._;
+
+  if (!channel) {
+    const overrides = config.channelOverrides || {};
+    const names = Object.keys(overrides);
+    if (!names.length) {
+      console.log('every channel uses the same settings');
+      console.log('\nslacken channel #eng-oncall minSeverity 3');
+      console.log(`settings that can differ per channel: ${CHANNEL_KEYS.join(', ')}`);
+      return 0;
+    }
+    for (const name of names) {
+      const own = overrides[name];
+      console.log(`${name}`);
+      for (const [k, v] of Object.entries(own)) console.log(`  ${k.padEnd(18)} ${show(v)}`);
+    }
+    return 0;
+  }
+
+  if (!key) {
+    console.error(`usage: slacken channel ${channel} <setting> <value>   (or: ${channel} reset)`);
+    console.error(`settings: ${CHANNEL_KEYS.join(', ')}`);
+    return 1;
+  }
+
+  const clearing = key === 'reset' || key === 'clear';
+  const raw = rest.join(' ');
+  if (!clearing && !raw) {
+    console.error(`usage: slacken channel ${channel} ${key} <value>`);
+    return 1;
+  }
+
+  const body = clearing ? { channel, clear: true } : { channel, settings: { [key]: raw } };
+  let result;
+  try {
+    result = await daemon(config, 'POST', '/channel', body);
+  } catch {
+    // Nothing running to tell, so the file is the whole change.
+    const store = new ConfigStore();
+    result = clearing ? store.clearChannel(channel) : store.setChannel(channel, { [key]: raw });
+    if (!result.errors.length) console.log(`(no daemon running; saved to ${CONFIG_PATH})`);
+  }
+
+  for (const problem of result.errors || []) console.error(problem.message);
+  if (result.errors?.length) return 1;
+
+  if (clearing) {
+    console.log(`${channel} uses the global settings again`);
+    return 0;
+  }
+  const overrides = result.channelOverrides || result.values?.channelOverrides || {};
+  const own = Object.entries(overrides).find(([name]) => name.trim().toLowerCase().replace(/^#/, '')
+    === channel.trim().toLowerCase().replace(/^#/, ''))?.[1] || {};
+  console.log(`${channel}: ${Object.entries(own).map(([k, v]) => `${k} = ${show(v)}`).join(', ') || 'nothing of its own'}`);
+  return 0;
+}
+
+// Read from the file rather than from the daemon: the record is written by
+// whoever was running at the time, and reading it does not need one running now.
+async function cmdHistory(args) {
+  const config = configFrom(args);
+  const history = new History({ config });
+  const entries = history.read({ limit: Number(args.lines || 40) });
+
+  if (!entries.length) {
+    console.log(config.historyEnabled === false
+      ? `nothing recorded (historyEnabled is off; ${HISTORY_PATH})`
+      : `nothing recorded yet (${HISTORY_PATH})`);
+    return 0;
+  }
+  if (args.json) {
+    for (const entry of entries) console.log(JSON.stringify(entry));
+    return 0;
+  }
+  for (const entry of entries) console.log(formatEntry(entry));
+  return 0;
+}
+
+// For talking to the control API by hand. Printed rather than echoed into a
+// shell history by a helpful example: it is the one thing here worth keeping.
+async function cmdToken() {
+  const token = readToken();
+  if (!token) {
+    console.error('no token yet; it is written the first time the daemon starts');
+    return 1;
+  }
+  console.log(token);
+  return 0;
+}
+
+async function cmdVersion(args) {
+  const config = configFrom(args);
+  console.log(`slacken ${VERSION}`);
+  if (!args.check) return 0;
+  const update = await checkForUpdate(config, { force: true });
+  if (!update) {
+    console.log('could not reach GitHub to check for a newer one');
+    return 1;
+  }
+  console.log(update.newer ? `${update.latest} is available: ${update.url}` : 'that is the newest release');
   return 0;
 }
 

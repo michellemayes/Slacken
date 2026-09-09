@@ -13,8 +13,8 @@
   "scripts": {
     "start": "node ./bin/slacken.js start",
     "doctor": "node ./bin/slacken.js doctor",
-    "test": "node --test test/unit.mjs test/batch.mjs test/agent.mjs test/control.mjs test/e2e.mjs",
-    "test:fast": "node --test test/unit.mjs test/batch.mjs test/agent.mjs test/control.mjs",
+    "test": "node --test test/unit.mjs test/batch.mjs test/agent.mjs test/control.mjs test/history.mjs test/e2e.mjs",
+    "test:fast": "node --test test/unit.mjs test/batch.mjs test/agent.mjs test/control.mjs test/history.mjs",
     "docs:images": "node ./docs/demo/capture.mjs"
   },
   "dependencies": {
