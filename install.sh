@@ -106,9 +106,10 @@ if [ "$WANT_AGENT" = "1" ]; then
   printf '\n  installing the login agent…\n'
   node "$ENTRY" agent install
 else
-  printf '\n%s  Tip: ./install.sh --agent also starts Slacken when you log in.%s\n' "$DIM" "$OFF"
+  printf '\n%s  Tip: ./install.sh --agent runs Slacken at login, with no terminal to keep open.%s\n' "$DIM" "$OFF"
 fi
 
 printf '\n%sDone.%s\n\n' "$BOLD" "$OFF"
 printf '  slacken doctor    check everything is wired up\n'
-printf '  slacken start     quit Slack, relaunch it, and start reading\n\n'
+printf '  slacken start     quit Slack, relaunch it, and start reading\n'
+printf '  slacken stop      stop it again, from any terminal\n\n'

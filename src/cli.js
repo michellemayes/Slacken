@@ -6,9 +6,9 @@ import { SETTINGS, invalidatesCache } from './settings.js';
 import { Moderator } from './moderate.js';
 import { Attacher } from './attach.js';
 import { createServer } from './server.js';
-import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning } from './launch.js';
+import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning, sleep } from './launch.js';
 import { listTargets } from './cdp.js';
-import { installAgent, uninstallAgent, agentStatus, LOG_PATH } from './agent.js';
+import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, LOG_PATH } from './agent.js';
 import { State } from './state.js';
 import { MenuBar, menuModel } from './menubar.js';
 
@@ -35,9 +35,11 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
   slacken status               What the running daemon has done so far
   slacken pause                Stop rewriting, and reveal what is on screen
   slacken resume               Start rewriting again
+  slacken stop                 Stop the daemon, wherever it was started from
 
-  slacken agent install        Run automatically when you log in
+  slacken agent install        Run automatically when you log in, with no terminal
   slacken agent uninstall      Stop running at login
+  slacken agent restart        Restart the login agent's daemon now
   slacken agent status         Is the login agent installed and running?
   slacken agent logs           Print the login agent's recent output
 `;
@@ -57,6 +59,7 @@ export async function main(argv) {
     case 'status': return cmdStatus(args);
     case 'pause': return cmdPause(args, true);
     case 'resume': return cmdPause(args, false);
+    case 'stop': return cmdStop(args);
     case 'agent': return cmdAgent(args);
     case 'help':
     case '--help':
@@ -81,6 +84,7 @@ async function cmdStart(args) {
   writeDefaultConfig();
   const store = storeFrom(args);
   const config = store.values;
+  if (await reportAlreadyRunning(config)) return 0;
 
   if (!args['no-launch']) {
     const result = await launchSlack({ cdpPort: config.cdpPort, force: Boolean(args.force) });
@@ -98,6 +102,7 @@ async function cmdAttach(args) {
   writeDefaultConfig();
   const store = storeFrom(args);
   const config = store.values;
+  if (await reportAlreadyRunning(config)) return 0;
   if (!(await isDebugPortOpen(config.cdpPort))) {
     console.error(`[slacken] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slacken launch' first.`);
     return 1;
@@ -124,14 +129,31 @@ async function run(store) {
     onEvent: (event) => logEvent(event, config),
   });
 
-  const server = await createServer({
-    config,
-    moderator,
-    state,
-    store,
-    getStatus: () => ({ attached: attacher.attachedCount }),
-    reinject: () => attacher.reinjectAll(),
-  });
+  // POST /stop and Ctrl-C are the same thing, and neither may run twice. The
+  // real shutdown is defined at the bottom, once there is something to shut
+  // down; a stop that arrives before then — during a first-run Swift compile,
+  // say — is remembered rather than answered with a shrug.
+  let pendingStop = null;
+  let stop = (reason) => { pendingStop = reason || 'a stop request'; };
+
+  let server;
+  try {
+    server = await createServer({
+      config,
+      moderator,
+      state,
+      store,
+      getStatus: () => ({ attached: attacher.attachedCount }),
+      reinject: () => attacher.reinjectAll(),
+      onStop: (reason) => stop(reason),
+    });
+  } catch (err) {
+    if (err.code !== 'EADDRINUSE') throw err;
+    console.error(`[slacken] something else is already using 127.0.0.1:${config.httpPort}.`);
+    console.error("[slacken] if it is another Slacken, 'slacken stop' will stop it; "
+      + 'otherwise change httpPort in the config.');
+    return 1;
+  }
 
   await attacher.start();
 
@@ -143,6 +165,12 @@ async function run(store) {
   console.log(`[slacken] watching Slack (model ${config.model}, triage ${config.triageMode})`);
   console.log(`[slacken] control API on http://127.0.0.1:${config.httpPort}  ·  Cmd+Shift+U toggles all originals`);
   if (state.paused) console.log('[slacken] currently PAUSED — nothing will be rewritten until you resume');
+  // Started by hand, so this dies with the terminal it was typed into. Say so
+  // once, next to the thing that fixes it.
+  if (process.platform === 'darwin' && !agentInstalled()) {
+    console.log("[slacken] this stops when you close this window — 'slacken agent install' "
+      + 'runs it at login instead');
+  }
 
   state.onChange((paused) => {
     console.log(paused
@@ -163,19 +191,27 @@ async function run(store) {
   });
 
   await new Promise((resolve) => {
-    const shutdown = () => {
+    let stopping = false;
+    const shutdown = (reason) => {
+      if (stopping) return;
+      stopping = true;
       const st = moderator.stats;
-      console.log(`\n[slacken] stopping — ${st.batched} messages in ${st.calls} calls, `
+      console.log(`\n[slacken] stopping${reason ? ` (${reason})` : ''} — ${st.batched} messages in ${st.calls} calls, `
         + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
         + `$${st.costUsd.toFixed(4)}`);
       menuBar.stop();
       attacher.stop();
       moderator.cache.flush();
       server.close();
+      // A kept-alive control connection would otherwise hold the process open
+      // long after everything it was doing has stopped.
+      server.closeAllConnections?.();
       resolve();
     };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    stop = shutdown;
+    process.on('SIGINT', () => shutdown());
+    process.on('SIGTERM', () => shutdown());
+    if (pendingStop) shutdown(pendingStop);
   });
   return 0;
 }
@@ -255,9 +291,23 @@ async function cmdAgent(args) {
 
   switch (action) {
     case 'install': {
+      // The agent's copy would find the port taken and be restarted forever,
+      // so whatever is running now has to go first.
+      if (await runningDaemon(config)) {
+        if (!(await stopDaemon(config))) {
+          console.error('a Slacken is already running and would not stop; stop it and try again');
+          return 1;
+        }
+        console.log('stopped the copy that was already running');
+      }
       const { plist, log } = await installAgent(config);
       console.log(`installed ${plist}`);
-      console.log(`Slacken now starts at login. Output goes to ${log}`);
+      console.log(`Slacken now starts at login, with no terminal. Output goes to ${log}`);
+      return 0;
+    }
+    case 'restart': {
+      await restartAgent();
+      console.log('restarted the login agent');
       return 0;
     }
     case 'uninstall': {
@@ -287,7 +337,7 @@ async function cmdAgent(args) {
       return 0;
     }
     default:
-      console.error(`unknown agent action: ${action} (install, uninstall, status, logs)`);
+      console.error(`unknown agent action: ${action} (install, uninstall, restart, status, logs)`);
       return 1;
   }
 }
@@ -313,6 +363,64 @@ async function daemon(config, method, path, body) {
       : err.message;
     throw new Error(hint);
   }
+}
+
+// Is a daemon already answering on this port? Two of them would inject into
+// the same Slack twice and fight over the port, and under the login agent the
+// loser would be restarted forever.
+async function runningDaemon(config) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${config.httpPort}/health`, { signal: AbortSignal.timeout(2000) });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function reportAlreadyRunning(config) {
+  if (!(await runningDaemon(config))) return false;
+  const agent = await agentStatus();
+  console.log(agent.running
+    ? `[slacken] already running at login (pid ${agent.pid}) — nothing to start`
+    : '[slacken] already running — nothing to start');
+  console.log("[slacken] 'slacken status' says what it has done, 'slacken stop' stops it");
+  return true;
+}
+
+// Ask the daemon to go, then wait until it actually has: whatever comes next
+// (installing the agent, starting a fresh copy) needs the port back.
+async function stopDaemon(config, { timeoutMs = 10000 } = {}) {
+  try {
+    await daemon(config, 'POST', '/stop');
+  } catch (err) {
+    // A daemon that drops the connection as it exits has still stopped.
+    if (!(await runningDaemon(config))) return true;
+    throw err;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await runningDaemon(config))) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+async function cmdStop(args) {
+  const config = configFrom(args);
+  if (!(await runningDaemon(config))) {
+    console.log('nothing is running');
+    return 0;
+  }
+  if (!(await stopDaemon(config))) {
+    console.error('it did not stop. Check its log, or kill it by hand.');
+    return 1;
+  }
+  console.log('stopped');
+  const agent = await agentStatus();
+  if (agent.installed) {
+    console.log("it will be back when you next log in — 'slacken agent restart' brings it back now");
+  }
+  return 0;
 }
 
 async function cmdStatus(args) {
@@ -442,6 +550,15 @@ async function cmdDoctor(args) {
     // Informational: without swiftc there is no menu bar item, but everything
     // else still works, so this is never a failure.
     checks.push(['menu bar item', true, swift || 'no swiftc (run: xcode-select --install)']);
+  }
+
+  if (process.platform === 'darwin') {
+    const agent = await agentStatus();
+    // Informational: running it from a terminal is a perfectly good way to run
+    // it, so not having the agent installed is never a failure.
+    checks.push(['runs at login', true, !agent.installed
+      ? 'no (run: slacken agent install)'
+      : agent.running ? `yes (pid ${agent.pid})` : 'installed, but not running right now']);
   }
 
   const running = await isSlackRunning();

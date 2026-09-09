@@ -158,11 +158,12 @@ test('a verdict decided while paused is never cached as a clean one', async () =
 
 /* ----------------------------------------------------------- control API */
 
-async function withServer(run, { paused = false } = {}) {
+async function withServer(run, { paused = false, stoppable = true } = {}) {
   const state = new State({ persist: false });
   state.setPaused(paused);
   const { mod, cleanup } = moderator(state);
   let attached = 1;
+  const stops = [];
 
   const store = new ConfigStore({ values: { ...DEFAULTS, httpPort: 0 }, persist: false });
   const server = await createServer({
@@ -172,6 +173,7 @@ async function withServer(run, { paused = false } = {}) {
     store,
     getStatus: () => ({ attached }),
     reinject: async () => {},
+    onStop: stoppable ? (reason) => stops.push(reason) : undefined,
   });
   const base = `http://127.0.0.1:${server.address().port}`;
   const get = async (p) => (await fetch(`${base}${p}`)).json();
@@ -183,7 +185,7 @@ async function withServer(run, { paused = false } = {}) {
   })).json();
 
   try {
-    await run({ get, post, postJson, state, store, setAttached: (n) => { attached = n; } });
+    await run({ get, post, postJson, state, store, stops, setAttached: (n) => { attached = n; } });
   } finally {
     server.close();
     cleanup();
@@ -228,6 +230,24 @@ test('/health still answers, and now says whether it is paused', async () => {
     await post('/pause');
     assert.equal((await get('/health')).paused, true);
   });
+});
+
+test('/stop shuts the daemon down, and answers before it does', async () => {
+  await withServer(async ({ post, stops }) => {
+    // The terminal is not the only way Slacken gets started, so it must not be
+    // the only way it can be stopped.
+    assert.deepEqual(await post('/stop'), { ok: true, stopping: true });
+    // The reply is written before the shutdown runs; give the 'finish' event
+    // the tick it needs.
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(stops, ['a stop request']);
+  });
+});
+
+test('a daemon with no way to stop itself says so rather than pretending', async () => {
+  await withServer(async ({ post }) => {
+    assert.deepEqual(await post('/stop'), { error: 'this daemon cannot stop itself' });
+  }, { stoppable: false });
 });
 
 test('/moderate respects a pause like everything else does', async () => {
