@@ -3,6 +3,7 @@ import { menuModel } from './menubar.js';
 import { SETTINGS, CHANNEL_KEYS } from './settings.js';
 import { tokenFrom, tokenMatches } from './auth.js';
 import { errorHint } from './moderate.js';
+import { VERSION } from './version.js';
 
 /*
  * Small loopback-only control surface.
@@ -31,10 +32,17 @@ import { errorHint } from './moderate.js';
 export function createServer({
   config, moderator, state, store, getStatus, reinject, inspect, onStop, token = null,
 }) {
-  const snapshot = () => ({
+  const snapshot = async () => ({
     paused: Boolean(state?.paused),
     pausedAt: state?.pausedAt ?? null,
     uptimeMs: state?.uptimeMs ?? 0,
+    // Which Slacken is actually running, which is not necessarily the one you
+    // installed: an upgrade changes the files on disk and nothing else, and a
+    // fix that is not in this process is a fix that has not happened yet.
+    version: VERSION,
+    // Where this process — not whoever is asking — can find claude. Cheap
+    // enough to answer on every poll, because a hit is remembered.
+    claude: await moderator.whereIsClaude(),
     model: config.model,
     triageMode: config.triageMode,
     dailyBudgetUsd: config.dailyBudgetUsd,
@@ -72,11 +80,11 @@ export function createServer({
     }
 
     if (req.method === 'GET' && url.pathname === '/status') {
-      return json(res, 200, snapshot());
+      return json(res, 200, await snapshot());
     }
 
     if (req.method === 'GET' && url.pathname === '/menubar') {
-      return json(res, 200, menuModel(snapshot()));
+      return json(res, 200, menuModel(await snapshot()));
     }
 
     if (req.method === 'GET' && url.pathname === '/config') {

@@ -142,6 +142,16 @@ WantedBy=default.target
 `;
 }
 
+// The plist or unit as it would be written today, with today's claude in it.
+export async function rewriteAgentFile(config) {
+  if (process.platform === 'linux') {
+    fs.writeFileSync(UNIT_PATH, await buildUnit(config));
+    return UNIT_PATH;
+  }
+  fs.writeFileSync(PLIST_PATH, await buildPlist(config));
+  return PLIST_PATH;
+}
+
 async function systemctl(args) {
   try {
     const { stdout, stderr } = await execFileAsync('systemctl', ['--user', ...args]);
@@ -214,12 +224,24 @@ export async function uninstallAgent() {
   return { removed: existed, plist: PLIST_PATH };
 }
 
-// Bring the agent's daemon back without logging out again. `slacken stop`
-// leaves launchd holding a loaded job with nothing running, because a clean
-// exit is not something KeepAlive restarts.
-export async function restartAgent() {
+/*
+ * Bring the agent's daemon back without logging out again.
+ *
+ * `slacken stop` leaves launchd holding a loaded job with nothing running,
+ * because a clean exit is not something KeepAlive restarts.
+ *
+ * The plist is rewritten first, and that is the point of this rather than a
+ * bare kickstart: the agent's PATH is baked in at install time, so a claude
+ * that has moved — or that was installed after the agent was — makes every
+ * model call fail until the file is written again. Restarting a job with the
+ * same broken environment is the fix that visibly does nothing, so it is not
+ * one of the things this can do.
+ */
+export async function restartAgent(config = null) {
   if (!agentInstalled()) throw new Error("no login agent is installed (run 'slacken agent install')");
+  if (config) await rewriteAgentFile(config);
   if (process.platform === 'linux') {
+    if (config) await systemctl(['daemon-reload']);
     const res = await systemctl(['restart', UNIT_NAME]);
     if (!res.ok) throw new Error(`systemd would not restart the unit: ${res.out.slice(0, 300)}`);
     return { plist: UNIT_PATH, log: LOG_PATH };

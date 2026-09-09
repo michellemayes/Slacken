@@ -237,6 +237,19 @@ export class Moderator {
     return file;
   }
 
+  /*
+   * The same lookup, as an answer rather than as a path to run.
+   *
+   * This is what the daemon reports about itself, and the point of reporting
+   * it is that it is the daemon's answer: a `slacken doctor` running in a
+   * terminal has a PATH this process has never seen, so "I can run claude" in
+   * one process says nothing at all about the other.
+   */
+  async whereIsClaude() {
+    const { path: file, source, searched } = await resolveClaudeBin(this.config.claudeBin);
+    return { bin: this.config.claudeBin, path: file, source, searched };
+  }
+
   claudeArgs() {
     return [
       '-p',
