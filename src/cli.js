@@ -321,7 +321,11 @@ export function logEvent(event, config, report = SHARED_REPORT) {
         say('model', `the model could not judge a message: ${v.error}`);
         break;
       }
-      recovered('model', 'the model is answering again');
+      // Only a verdict that actually came back from the model is evidence the
+      // model is working. A paused, empty, over-length or cached one never
+      // reached it, and announcing recovery on one of those would call a
+      // still-broken claude fixed.
+      if (!v.reason && !v.cached) recovered('model', 'the model is answering again');
       if (v.flagged) {
         const what = v.hostile && v.verbose ? 'softened + condensed'
           : v.verbose ? 'condensed' : 'softened';

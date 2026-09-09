@@ -246,3 +246,24 @@ test('a dead debug port is reported once, not every four seconds', () => {
   assert.match(lines[0], /slacken launch/);
   assert.match(lines[1], /Slack is reachable again — recovered after 50 failures/);
 });
+
+test('a verdict that never reached the model is not proof it recovered', () => {
+  const report = new RepeatLog();
+  const lines = capture([
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], error: 'claude exited 1' } },
+    // Pausing, an empty message, and a cached answer all skip the model
+    // entirely. None of them says anything about whether claude works.
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], reason: 'paused' } },
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], reason: 'empty' } },
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], cached: true } },
+  ], { report });
+
+  assert.equal(lines.length, 1, 'only the failure is news');
+  assert.match(lines[0], /claude exited 1/);
+
+  // A real answer is what clears it.
+  const after = capture([
+    { type: 'verdict', sender: 'Ann', channel: 'c', text: 't', verdict: { flagged: true, verbose: true, tone: [] } },
+  ], { report });
+  assert.match(after[0], /the model is answering again — recovered after 1 failure/);
+});
