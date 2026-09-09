@@ -70,6 +70,13 @@ else
   warn "Install Claude Code and sign in, then re-run this script."
 fi
 
+if command -v swiftc >/dev/null 2>&1; then
+  ok "swiftc found (the menu bar item will be built on first run)"
+else
+  warn "swiftc is not installed, so there will be no menu bar item."
+  warn "Run 'xcode-select --install' if you want one. Everything else works."
+fi
+
 if [ -d "/Applications/Slack.app" ] || [ -d "$HOME/Applications/Slack.app" ]; then
   ok "Slack.app found"
 else

@@ -46,6 +46,10 @@
 
   const log = (...args) => { if (CONFIG.verbose) console.log('[slacken]', ...args); };
 
+  // Set from the daemon, which owns the pause state. While paused nothing is
+  // asked about and nothing stays hidden: you read exactly what was written.
+  let paused = Boolean(CONFIG.paused);
+
   /* ---------------------------------------------------------------- styles */
 
   const STYLE_ID = 'slacken-style';
@@ -367,6 +371,17 @@
     body.parentElement?.insertBefore(panel, body.nextSibling);
   }
 
+  // Pausing has to clear held messages as well as revealed ones, or a message
+  // caught mid-verdict would stay behind "checking…" with nothing coming to
+  // replace it.
+  function releaseHolds() {
+    document.querySelectorAll('.slacken-panel[data-pending]').forEach((panel) => {
+      const body = panel.previousElementSibling;
+      panel.remove();
+      if (body) body.removeAttribute(ATTR_BODY);
+    });
+  }
+
   function setAll(open) {
     document.querySelectorAll('.slacken-panel:not([data-pending])').forEach((panel) => {
       const badge = panel.querySelector('.slacken-badge');
@@ -390,6 +405,7 @@
   }
 
   async function processItem(item) {
+    if (paused) return;
     if (item.closest(SEL.composer)) return;
 
     const body = bodyFor(item);
@@ -463,6 +479,17 @@
     }
 
     if (verdict.error) log('daemon error', verdict.error);
+
+    // A verdict that lands after a pause began says nothing about the message,
+    // only about the pause. Remembering it would mean this message stayed
+    // unexamined for as long as the page lived, long after resuming.
+    if (paused || verdict.reason === 'paused') {
+      item.removeAttribute(ATTR_STATE);
+      item.removeAttribute(ATTR_HASH);
+      if (held && item.isConnected) restore(item, body);
+      return;
+    }
+
     rememberVerdict(key, verdict);
 
     // The virtual list may have recycled the node while we waited.
@@ -513,6 +540,32 @@
       .some((p) => p.dataset.open !== '1');
     setAll(anyClosed);
   });
+
+  // Called by the daemon whenever the pause state changes, and once at
+  // injection time via CONFIG.paused.
+  window.__slackenSetPaused = (on) => {
+    const next = Boolean(on);
+    if (next === paused) return;
+    paused = next;
+    if (paused) {
+      releaseHolds();
+      setAll(true);
+      log('paused: showing every original');
+      return;
+    }
+    // Anything the pause left unexamined — or cleared only because we were
+    // paused — deserves a second look. Messages already rewritten keep their
+    // verdict, so resuming costs nothing for what was decided before.
+    document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
+      const state = el.getAttribute(ATTR_STATE);
+      if (state === 'done' || state === 'skipped') return;
+      el.removeAttribute(ATTR_STATE);
+      el.removeAttribute(ATTR_HASH);
+    });
+    setAll(false);
+    log('resumed');
+    scheduleScan();
+  };
 
   window.__slackenRescan = () => {
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {

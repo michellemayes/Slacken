@@ -10,7 +10,8 @@ them. Two things happen:
 - **Even out** — messages written at high intensity are re-phrased flat.
 
 Nothing is deleted and nothing is sent anywhere. Every rewrite carries a small
-badge, and one click brings the original back.
+badge, and one click brings the original back. A menu bar item shows what has
+been changed and pauses the whole thing.
 
 ```
 ┌────────────────────────────────────────────┐   ┌────────────────────────────────────────────┐
@@ -38,6 +39,11 @@ survived. Taking the edge off must never take the facts with it.
   │   · hold suspects    ├── binding ────►│  ├─ cache lookup       │
   │   · swap in rewrite  │                │  ├─ 120ms batch window │
   │   · reveal toggle    │◄── evaluate ───┤  └─ claude -p ──► 🤖   │
+  └──────────────────────┘                └───────────┬────────────┘
+                                                      │ :8787
+  ┌──────────────────────┐                ┌───────────┴────────────┐
+  │ menu bar             │◄── GET  /menubar ── the menu, rendered  │
+  │  SlackenMenuBar      │─── POST /pause ──► pause / resume       │
   └──────────────────────┘                └────────────────────────┘
 ```
 
@@ -63,7 +69,9 @@ survived. Taking the edge off must never take the facts with it.
 ## Install
 
 macOS, Node 20+, and `claude` on your `PATH` and signed in (`claude -p "hi"`
-should work).
+should work). The menu bar item is compiled on first run and needs `swiftc`
+from the Xcode Command Line Tools (`xcode-select --install`); without it
+everything else works and the daemon says so once.
 
 ```sh
 git clone https://github.com/michellemayes/Slacken.git
@@ -114,10 +122,65 @@ what the session cost.
 | `test "<message>"` | Rewrite one string and print the verdict — no Slack needed |
 | `doctor` | Check Slack, `claude`, the debug port, and visible Slack windows |
 | `config` | Print the config file path and contents |
+| `status` | What the running daemon has done so far |
+| `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
 | `agent install\|uninstall\|status\|logs` | Manage the login agent |
 
 `--force` lets it quit a running Slack so it can be relaunched with the port.
 `Cmd+Shift+U` inside Slack toggles every original on the screen at once.
+
+## The menu bar item
+
+While the daemon runs there is an item in the menu bar. It is the answer to the
+two questions this tool raises the moment you leave it running: *is it on right
+now*, and *how much of what I just read was not what was written*.
+
+```
+                                       ┌──────────────────────────────────┐
+                                       │  Watching 1 Slack window         │
+   ▐ 🗨  ▌ ◄────────────────────────    ├──────────────────────────────────┤
+                                       │  Pause                           │
+                                       ├──────────────────────────────────┤
+                                       │  8 messages rewritten of 50 read │
+                                       │  5 softened · 3 condensed        │
+                                       │  4 model calls · 38 from cache   │
+                                       │  $0.0104 today                   │
+                                       ├──────────────────────────────────┤
+                                       │  claude-haiku-4-5 · triage …     │
+                                       │  Running for 1 hour              │
+                                       ├──────────────────────────────────┤
+                                       │  Open config…                    │
+                                       │  Open log…                       │
+                                       ├──────────────────────────────────┤
+                                       │  Hide menu bar item              │
+                                       └──────────────────────────────────┘
+```
+
+The icon dims whenever nothing is being changed — paused, or attached to no
+Slack window — so the state is readable without opening anything.
+
+**Pause** is the important one. It does not merely stop new rewrites: every
+message already swapped out on screen flips back to what its sender actually
+wrote, held messages are released, and nothing is sent to the model until you
+resume. `slacken pause` and `slacken resume` do exactly the same thing from a
+terminal, and `slacken status` prints the same lines the menu shows.
+
+A pause is written to `~/.slacken/state.json` and survives a restart. It has
+to: the login agent brings the daemon back whenever it exits, and a pause that
+quietly undid itself would leave you reading a rewritten feed you believed you
+had turned off. The menu bar item is what stops that becoming a pause you
+forgot about.
+
+The item is a small AppKit program in `menubar/SlackenMenuBar.swift`, compiled
+on first run and cached in `~/.slacken/menubar/` by the hash of its source. It
+decides nothing: the wording, the counts and the actions are rendered by
+`src/menubar.js` and fetched as JSON from `GET /menubar`, which is why the part
+that can be wrong is testable on any machine. It holds the daemon's stdin, so
+it cannot outlive the daemon even if that daemon is killed outright.
+
+Without `swiftc` there is no item, one line says so at startup, and everything
+else runs unchanged. Set `menuBar` to `false` in the config to skip it, or
+click **Hide menu bar item** to dismiss it for this run.
 
 ## Speed and cost
 
@@ -173,8 +236,9 @@ Two things measured and deliberately **not** used:
 | `ignoreSenders` | `[]` | Never rewrite these people |
 | `ignoreChannels` | `[]` | Never rewrite in these channels |
 | `maxChars` | `4000` | Longer messages are left alone |
+| `menuBar` | `true` | Show the menu bar item. Needs `swiftc`; without it, skipped |
 | `cdpPort` | `9222` | Slack's debug port |
-| `httpPort` | `8787` | Loopback control API (`/health`, `/moderate`, `/reinject`) |
+| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/pause`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
 | `claudeBin` / `claudeArgs` | `claude` / `[]` | If `claude` lives somewhere unusual, or you want extra flags |
 
@@ -203,6 +267,12 @@ Slack session. Chromium binds it to loopback only, but this is still a real
 widening of what a local process can do. Close it by quitting and reopening
 Slack normally.
 
+**You can always turn it off without turning it off.** Pause from the menu bar
+and every rewrite on screen reverts to what was written, immediately, with no
+model call and no restart. That is the intended move when a conversation
+matters enough that you want the words themselves — it is faster and less
+final than quitting, and the menu bar item makes it obvious you are paused.
+
 **It is entirely local to you.** This only changes what is drawn in your own
 client. It never edits, deletes, or replies to anything, nobody else can tell
 it is running, and it does not touch messages you write.
@@ -226,6 +296,15 @@ npm run test:fast   # skips the browser test
   actually invoked. Asserts that four simultaneous messages cost one process.
 - `test/agent.mjs` — the generated LaunchAgent plist, including that it carries
   a `PATH` that can actually find `claude`.
+- `test/control.mjs` — pausing, and the menu the menu bar item draws. Asserts
+  that a pause survives a restart, that a paused Slacken makes no model call
+  and caches nothing, that the control endpoints agree with each other, and
+  that the menu offers exactly one of pause and resume. It also covers the
+  helper around the helper: the compile is cached by source hash and never
+  repeated, a failed compile leaves nothing that looks finished, closing stdin
+  is what stops the item outliving the daemon, and a crashing one is retried
+  twice and then left alone. The AppKit itself is deliberately too dumb to
+  test; everything it says is decided here.
 - `test/e2e.mjs` — a real Chromium against a fake Slack DOM
   (`test/fixture.html`), driving the actual attach-and-inject code with a stub
   moderator. Asserts that an intense message is replaced, a padded one is
@@ -234,11 +313,18 @@ npm run test:fast   # skips the browser test
   messages are skipped, a suspected message is hidden while the model decides
   and restored if cleared, the reveal toggle works both ways, and a re-render
   that destroys the panel is repaired from cache rather than by asking again.
+  It also covers the pause: every rewritten message flips back to what was
+  written, a message that arrives during a pause is never triaged or sent, a
+  verdict that lands after a pause has begun is thrown away rather than quietly
+  applied later, and resuming picks up what the pause let through without
+  re-asking about anything already decided.
   It finds any Chromium on the machine and skips itself if there is none;
   `SLACKEN_TEST_CHROME` overrides the search.
 
-CI runs the suite on macOS and Linux against Node 20 and 22, and separately
-installs, exercises and uninstalls the installer on a real macOS runner.
+CI runs the suite on macOS and Linux against Node 20 and 22, separately
+installs, exercises and uninstalls the installer on a real macOS runner, and
+builds the menu bar helper with `swiftc` there — the only way to find out
+whether AppKit code still compiles is to compile it.
 
 ## Layout
 
@@ -251,9 +337,12 @@ src/agent.js         the login agent: plist generation and launchctl
 src/cdp.js           minimal Chrome DevTools Protocol client
 src/attach.js        attach to Slack windows, inject, serve binding calls
 src/moderate.js      batch, run claude -p, parse and gate the verdicts
+src/state.js         paused or not, persisted across restarts
+src/menubar.js       render the menu, build and supervise the helper
 src/prompt.js        the rewriting prompt and response schema
 src/cache.js         disk-backed verdict cache
 src/server.js        loopback control API
 src/config.js        defaults and ~/.slacken/config.json
 client/inject.js     the page script: find, triage, hold, replace, reveal
+menubar/             SlackenMenuBar.swift, the menu bar item itself
 ```
