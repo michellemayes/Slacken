@@ -538,6 +538,12 @@ async function cmdConfig() {
 function show(value) {
   if (Array.isArray(value)) return value.length ? value.join(', ') : '(none)';
   if (typeof value === 'boolean') return value ? 'on' : 'off';
+  // The per-channel map is a setting you edit with `slacken channel`, so what
+  // belongs in a list of one-line values is how many channels have one.
+  if (value && typeof value === 'object') {
+    const names = Object.keys(value);
+    return names.length ? names.join(', ') : '(same everywhere)';
+  }
   return String(value);
 }
 
@@ -556,7 +562,9 @@ async function cmdSet(args) {
 
   if (!key) {
     for (const [name, spec] of Object.entries(SETTINGS)) {
-      const choices = spec.choices ? spec.choices.map((c) => c.value).join(' | ') : spec.type;
+      const choices = spec.type === 'channelMap' ? 'slacken channel <#name> <setting> <value>'
+        : spec.choices ? spec.choices.map((c) => c.value).join(' | ')
+          : spec.type;
       console.log(`${name.padEnd(18)} ${show(config[name]).padEnd(28)} ${choices}`);
     }
     console.log('\nslacken set <name> <value>   (a list takes commas: slacken set ignoreChannels "#eng,#random")');
