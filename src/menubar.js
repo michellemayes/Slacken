@@ -189,7 +189,7 @@ function format(value) {
   return String(value ?? 'unset');
 }
 
-function count(n, noun) {
+export function count(n, noun) {
   return `${n} ${noun}${n === 1 ? '' : 's'}`;
 }
 

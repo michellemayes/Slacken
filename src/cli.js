@@ -10,7 +10,7 @@ import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning, sleep } fro
 import { listTargets } from './cdp.js';
 import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, LOG_PATH } from './agent.js';
 import { State } from './state.js';
-import { MenuBar, menuModel } from './menubar.js';
+import { MenuBar, menuModel, count } from './menubar.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +33,7 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
   slacken set <name> <value>   Change one, on the running daemon and on disk
 
   slacken status               What the running daemon has done so far
+  slacken inspect              What Slacken makes of the messages on screen now
   slacken pause                Stop rewriting, and reveal what is on screen
   slacken resume               Start rewriting again
   slacken stop                 Stop the daemon, wherever it was started from
@@ -57,6 +58,7 @@ export async function main(argv) {
     case 'config': return cmdConfig(args);
     case 'set': return cmdSet(args);
     case 'status': return cmdStatus(args);
+    case 'inspect': return cmdInspect(args);
     case 'pause': return cmdPause(args, true);
     case 'resume': return cmdPause(args, false);
     case 'stop': return cmdStop(args);
@@ -145,6 +147,7 @@ async function run(store) {
       store,
       getStatus: () => ({ attached: attacher.attachedCount }),
       reinject: () => attacher.reinjectAll(),
+      inspect: () => attacher.inspect(),
       onStop: (reason) => stop(reason),
     });
   } catch (err) {
@@ -437,6 +440,51 @@ async function cmdStatus(args) {
     if (item.separator || item.submenu) continue;
     if (item.post || item.open || item.quit) continue;
     console.log(item.label);
+  }
+  return 0;
+}
+
+/*
+ * Why a message on screen was left as written. `status` reports what Slacken
+ * did; this reports what it decided not to do, which is the only way to tell a
+ * message it read and cleared from one it never saw at all.
+ */
+async function cmdInspect(args) {
+  const config = configFrom(args);
+  let res;
+  try {
+    res = await daemon(config, 'GET', '/inspect');
+  } catch (err) {
+    console.error(err.message);
+    return 1;
+  }
+
+  const windows = res.windows || [];
+  if (!windows.length) {
+    console.log('no Slack window is attached');
+    return 1;
+  }
+
+  for (const win of windows) {
+    if (win.error) {
+      console.log(`window ${win.target}: ${win.error}`);
+      continue;
+    }
+    const rows = win.rows || [];
+    console.log(`${win.channel || 'unknown channel'} — ${count(rows.length, 'message')} on screen`
+      + `${win.paused ? ', paused' : ''}`);
+    for (const row of rows) {
+      const who = row.sender || 'unknown sender';
+      const kind = row.threadReply ? ' [thread reply]' : '';
+      console.log(`  ${who}${kind}: ${row.head || '(no text)'}`);
+      console.log(`    ${row.why}`);
+    }
+    if (win.missedCount) {
+      console.log(`  ${count(win.missedCount, 'message')} on this page`
+        + ` ${win.missedCount === 1 ? 'is' : 'are'} in a layout Slacken does not read:`);
+      for (const text of win.missed) console.log(`    ${text}`);
+    }
+    console.log('');
   }
   return 0;
 }
