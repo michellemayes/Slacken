@@ -1,0 +1,51 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Slack fixture</title>
+<!--
+  A stand-in for the parts of Slack's rendered DOM that the page script reads.
+  Selectors and nesting mirror the real client so the end-to-end test exercises
+  the same code paths as the desktop app.
+-->
+<button data-qa="user-button" aria-label="User menu: Michelle Mayes">me</button>
+<div data-qa="channel_name">#eng-oncall</div>
+
+<div class="c-virtual_list__scroll_container">
+  <div data-qa="virtual-list-item" id="msg-heated">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Dana Wu</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">WHY is the deploy STILL broken?? I need it fixed by 3pm today, this is unacceptable.</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-grouped">
+    <div data-qa="message_content">
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">I already asked TWICE. Answer me.</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-neutral">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Sam Ortiz</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Deploy is queued behind the migration, should land around 2pm.</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-mine">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Michelle Mayes</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">URGENT: I need this fixed ASAP!! Why is nobody responding???</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-divider">
+    <div class="c-message_list__day_divider">Today</div>
+  </div>
+</div>
