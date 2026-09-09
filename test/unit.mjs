@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseResponse, normalize } from '../src/moderate.js';
+import { compareVersions, checkForUpdate } from '../src/version.js';
 
 const SOFTEN = {
   id: 'm0',
@@ -118,4 +119,31 @@ test('normalize tolerates a garbage severity', () => {
   const out = normalize({ ...SOFTEN, severity: 'very bad' }, { minSeverity: 2 }, 'x');
   assert.equal(out.severity, 0);
   assert.equal(out.flagged, false);
+});
+
+
+/* ------------------------------------------------------------- versions */
+
+test('a newer version is recognised, numerically', () => {
+  assert.ok(compareVersions('0.10.0', '0.9.0') > 0, '10 is not less than 9 because it starts with a 1');
+  assert.ok(compareVersions('1.0.0', '0.99.99') > 0);
+  assert.equal(compareVersions('0.2.0', '0.2.0'), 0);
+  assert.ok(compareVersions('0.2.0', '0.2.1') < 0);
+  // A tag with a suffix is still comparable, and never newer than the release.
+  assert.ok(compareVersions('0.2.0', '0.2.0-rc1') > 0);
+});
+
+test('the update check does nothing at all unless it has been turned on', async () => {
+  // The only thing in Slacken that talks to anything but your own machine, so
+  // "off" has to mean no request rather than a request whose answer is
+  // ignored.
+  let asked = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { asked = true; throw new Error('should not have been called'); };
+  try {
+    assert.equal(await checkForUpdate({ checkUpdates: false }), null);
+    assert.equal(asked, false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

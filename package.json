@@ -1,8 +1,8 @@
 {
   "name": "slacken",
-  "version": "0.1.0",
-  "private": true,
-  "description": "A calmer reading layer for the macOS Slack desktop app: condenses padded messages and evens out tone, using claude -p.",
+  "version": "0.2.0",
+  "private": false,
+  "description": "A calmer reading layer for the Slack desktop app: condenses padded messages and evens out tone, using claude -p.",
   "type": "module",
   "bin": {
     "slacken": "./bin/slacken.js"
@@ -19,5 +19,34 @@
   },
   "dependencies": {
     "ws": "^8.18.0"
-  }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/michellemayes/Slacken.git"
+  },
+  "homepage": "https://github.com/michellemayes/Slacken#readme",
+  "bugs": {
+    "url": "https://github.com/michellemayes/Slacken/issues"
+  },
+  "keywords": [
+    "slack",
+    "claude",
+    "cli",
+    "electron",
+    "cdp"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "files": [
+    "bin/",
+    "src/",
+    "client/",
+    "menubar/",
+    "install.sh",
+    "README.md"
+  ]
 }

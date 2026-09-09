@@ -6,9 +6,9 @@ import { SETTINGS, invalidatesCache } from './settings.js';
 import { Moderator } from './moderate.js';
 import { Attacher } from './attach.js';
 import { createServer } from './server.js';
-import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning, sleep } from './launch.js';
+import { launchSlack, findSlackApp, slackLocations, supportedPlatform, isDebugPortOpen, isSlackRunning, sleep } from './launch.js';
 import { listTargets } from './cdp.js';
-import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, LOG_PATH } from './agent.js';
+import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, agentPath, LOG_PATH } from './agent.js';
 import { State } from './state.js';
 import { MenuBar, menuModel } from './menubar.js';
 import { History, formatEntry, HISTORY_PATH } from './history.js';
@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 
 const TOKEN_HINT = "delete ~/.slacken/token and restart the daemon if it has got out of step";
 
-const USAGE = `slacken - a calmer reading layer for Slack on macOS
+const USAGE = `slacken - a calmer reading layer for the Slack desktop app
 
   slacken start [--force] [--no-launch] [--always] [--verbose]
       Launch Slack with debugging enabled, attach, and moderate. Ctrl-C to stop.
@@ -208,7 +208,7 @@ async function run(store) {
   }
   // Started by hand, so this dies with the terminal it was typed into. Say so
   // once, next to the thing that fixes it.
-  if (process.platform === 'darwin' && !agentInstalled()) {
+  if (agentPath() && !agentInstalled()) {
     console.log("[slacken] this stops when you close this window — 'slacken agent install' "
       + 'runs it at login instead');
   }
@@ -710,11 +710,11 @@ async function cmdDoctor(args) {
   const config = configFrom(args);
   const checks = [];
 
-  checks.push(['macOS', process.platform === 'darwin', process.platform]);
+  checks.push(['platform', supportedPlatform(), process.platform]);
   checks.push(['node >= 20', Number(process.versions.node.split('.')[0]) >= 20, process.versions.node]);
 
   const app = findSlackApp();
-  checks.push(['Slack.app found', Boolean(app), app || 'not in /Applications or ~/Applications']);
+  checks.push(['Slack found', Boolean(app), app || `not in ${slackLocations()}`]);
 
   let claudeVersion = null;
   try {
@@ -738,7 +738,7 @@ async function cmdDoctor(args) {
     checks.push(['menu bar item', true, swift || 'no swiftc (run: xcode-select --install)']);
   }
 
-  if (process.platform === 'darwin') {
+  if (agentPath()) {
     const agent = await agentStatus();
     // Informational: running it from a terminal is a perfectly good way to run
     // it, so not having the agent installed is never a failure.
@@ -747,10 +747,10 @@ async function cmdDoctor(args) {
       : agent.running ? `yes (pid ${agent.pid})` : 'installed, but not running right now']);
   }
 
-  const running = await isSlackRunning();
+  const slackUp = await isSlackRunning();
   const portOpen = await isDebugPortOpen(config.cdpPort);
   // Informational: `start` launches Slack itself, so "not running" is fine.
-  checks.push(['Slack running', true, running ? 'yes' : 'no (start will launch it)']);
+  checks.push(['Slack running', true, slackUp ? 'yes' : 'no (start will launch it)']);
   checks.push([`debug port ${config.cdpPort}`, portOpen, portOpen ? 'listening' : 'closed (run: slacken launch)']);
 
   if (portOpen) {
@@ -760,6 +760,23 @@ async function cmdDoctor(args) {
       checks.push(['Slack web targets', pages.length > 0, `${pages.length} found`]);
     } catch (err) {
       checks.push(['Slack web targets', false, err.message]);
+    }
+  }
+
+  // Anything already running knows things this process cannot work out from
+  // the outside: whether the model is answering, and whether the page script
+  // is still finding messages in a Slack that may have been updated overnight.
+  const running = await runningDaemon(config);
+  if (running) {
+    try {
+      const status = await daemon(config, 'GET', '/status');
+      checks.push(['daemon', true, `running · ${status.attached} window(s) attached`
+        + `${status.paused ? ' · PAUSED' : ''}`]);
+      checks.push(['finding messages', !status.drifted,
+        status.drifted ? "no — Slack's layout may have changed (see the README)" : 'yes']);
+      if (status.lastError) checks.push(['last model call', false, status.lastError.hint]);
+    } catch (err) {
+      checks.push(['daemon', false, `running, but would not answer: ${err.message}`]);
     }
   }
 

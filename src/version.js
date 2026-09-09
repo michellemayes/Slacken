@@ -60,21 +60,35 @@ function decorate(latest, url) {
   return { current: VERSION, latest, url, newer: compareVersions(latest, VERSION) > 0 };
 }
 
-// Numeric where both sides are numeric, so 0.10.0 is newer than 0.9.0.
+/*
+ * Newer, older or the same.
+ *
+ * Numeric where both sides are numeric, so 0.10.0 is newer than 0.9.0 rather
+ * than alphabetically before it. A tag with a suffix — 0.3.0-rc1 — is a
+ * release on its way rather than one that has arrived, so it ranks below the
+ * plain version it is a candidate for, which is the one rule here that a
+ * string comparison would get backwards.
+ */
 export function compareVersions(a, b) {
   const left = String(a).split(/[.-]/);
   const right = String(b).split(/[.-]/);
   for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
-    const x = Number(left[i] ?? 0);
-    const y = Number(right[i] ?? 0);
-    if (Number.isNaN(x) || Number.isNaN(y)) {
-      const cmp = String(left[i] ?? '').localeCompare(String(right[i] ?? ''));
-      if (cmp) return cmp;
+    const l = left[i];
+    const r = right[i];
+    if (l === undefined) return isNumeric(r) ? -1 : 1;
+    if (r === undefined) return isNumeric(l) ? 1 : -1;
+    if (isNumeric(l) && isNumeric(r)) {
+      if (Number(l) !== Number(r)) return Number(l) - Number(r);
       continue;
     }
-    if (x !== y) return x - y;
+    const cmp = String(l).localeCompare(String(r));
+    if (cmp) return cmp;
   }
   return 0;
+}
+
+function isNumeric(part) {
+  return part !== undefined && part !== '' && !Number.isNaN(Number(part));
 }
 
 function readStamp() {

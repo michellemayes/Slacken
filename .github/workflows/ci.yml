@@ -81,8 +81,15 @@ jobs:
           "
 
   installer:
-    name: installer is well-formed
-    runs-on: macos-latest
+    name: installer is well-formed (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # The installer is the same script on both, and the two things that
+      # differ on Linux — no menu bar item, a systemd unit instead of a
+      # LaunchAgent — are exactly the parts worth exercising there.
+      matrix:
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
