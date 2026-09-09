@@ -101,7 +101,13 @@
     [${ATTR_HOLD}="1"] .c-message__message_blocks,
     [${ATTR_HOLD}="1"] [${ATTR_BODY}] { display: none !important; }
 
-    .slacken-panel { margin: 2px 0 0; }
+    /* A column, so the badge is a block-level box with predictable margins
+       rather than an inline one whose baseline drags phantom descender space
+       under it. */
+    .slacken-panel {
+      display: flex; flex-direction: column; align-items: flex-start;
+      margin: 2px 0 0;
+    }
     .slacken-rewrite {
       line-height: 1.46668;
       font-size: 15px;
@@ -109,16 +115,23 @@
       word-break: break-word;
     }
     .slacken-panel[data-open="1"] .slacken-rewrite { display: none; }
+    /* Deliberately not a chip. Slack stacks its own bordered boxes directly
+       under a message — reaction pills 4px below, and a thread bar whose
+       hover box is pulled up over whatever precedes it — so a bordered badge
+       either reads as one more reaction or gets crossed by the thread bar's
+       outline. A dot and two words collide with neither, and the hover fill
+       hangs 6px left the way Slack's own hover boxes do, which keeps the
+       label itself flush with the message text above it. */
     .slacken-badge {
       display: inline-flex; align-items: center; gap: 5px;
-      margin-top: 3px; padding: 1px 8px;
-      font-size: 11px; line-height: 17px; font-weight: 500;
+      box-sizing: border-box; max-width: 100%;
+      margin: 4px 0 6px -6px; padding: 1px 6px;
+      font-size: 11px; line-height: 16px; font-weight: 500;
       color: inherit; opacity: .62;
-      background: transparent;
-      border: 1px solid rgba(127,127,127,.45); border-radius: 10px;
+      background: transparent; border: 0; border-radius: 7px;
       cursor: pointer; user-select: none;
     }
-    .slacken-badge:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-badge:hover { opacity: 1; background: rgba(127,127,127,.13); }
     .slacken-badge[hidden] { display: none; }
     .slacken-dot {
       width: 6px; height: 6px; border-radius: 50%;
@@ -129,18 +142,26 @@
     .slacken-action { opacity: .75; }
     .slacken-pending { opacity: .45; font-style: italic; }
 
-    /* The channel header button. Same pill as the badge, so the two read as
-       parts of one thing rather than as something Slack shipped. */
+    /* The header button. Same dot, size and weight as the badge, so the two
+       read as parts of one thing — but bordered, which the badge deliberately
+       is not. The badge sits where Slack stacks reaction pills and thread
+       bars, and a border there reads as one of them; the header has no such
+       boxes, and without one this would read as a second line of header text
+       rather than as something you can press. */
     .slacken-channel {
       display: inline-flex; align-items: center; gap: 5px;
       margin: 0 0 0 8px; padding: 1px 8px; vertical-align: middle;
-      font-size: 11px; line-height: 17px; font-weight: 500;
+      font-size: 11px; line-height: 16px; font-weight: 500;
       color: inherit; opacity: .62;
       background: transparent;
-      border: 1px solid rgba(127,127,127,.45); border-radius: 10px;
+      border: 1px solid rgba(127,127,127,.35); border-radius: 7px;
       cursor: pointer; user-select: none;
     }
-    .slacken-channel:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-channel:hover {
+      opacity: 1;
+      background: rgba(127,127,127,.13);
+      border-color: rgba(127,127,127,.6);
+    }
     .slacken-channel[data-ignored="1"] .slacken-dot { background: #8d8d8d; }
     .slacken-channel[data-busy="1"] { opacity: .35; pointer-events: none; }
   `;
