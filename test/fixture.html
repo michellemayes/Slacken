@@ -45,6 +45,47 @@
     </div>
   </div>
 
+
+  <div data-qa="virtual-list-item" id="msg-slop">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Priya Nair</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Hey team! I wanted to take a moment to circle back on the deployment pipeline discussion from earlier this week. As you may recall, we had identified several areas where there might be opportunities for improvement. After giving it considerable thought, I believe it would be beneficial for us to consider revisiting the retry logic before the next release. Let me know if you have any questions.</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-dense">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Alex Kim</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Migration 0042 adds a partial index on events.created_at and drops the old composite. It locks the table for about 90 seconds on staging with 40M rows, so production will be closer to four minutes. I have scheduled it for the 2am window on Thursday and paged Dana as backup in case the rollback path is needed.</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-code">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Alex Kim</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Here is the failing block, I hope this helps narrow it down, let me know if you have any questions about the retry semantics or the timeout handling here:
+```
+retry(3, () => fetch(url, { timeout: 500 }))
+  .catch((e) => log.warn('giving up', e))
+```</div>
+      </div>
+    </div>
+  </div>
+
+  <div data-qa="virtual-list-item" id="msg-hold">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Jordan Lee</span>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">PLEASE take a look when you can, this is BLOCKING the release!!</div>
+      </div>
+    </div>
+  </div>
+
   <div data-qa="virtual-list-item" id="msg-divider">
     <div class="c-message_list__day_divider">Today</div>
   </div>

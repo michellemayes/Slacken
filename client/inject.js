@@ -17,11 +17,14 @@
   const CONFIG = Object.assign({
     triageMode: 'heuristic',
     triageThreshold: 2,
+    condenseEnabled: true,
+    condenseMinWords: 45,
     maxChars: 4000,
+    holdWhilePending: true,
     selfNames: [],
     ignoreSenders: [],
     ignoreChannels: [],
-    requestTimeoutMs: 20000,
+    requestTimeoutMs: 25000,
     verbose: false,
   }, window.__SLACKCENSOR_CONFIG || {});
 
@@ -71,7 +74,9 @@
       background: #d9a441; flex: 0 0 auto;
     }
     .slackcensor-badge[data-severity="3"] .slackcensor-dot { background: #e01e5a; }
+    .slackcensor-badge[data-kind="condensed"] .slackcensor-dot { background: #5b8def; }
     .slackcensor-action { opacity: .75; }
+    .slackcensor-pending { opacity: .45; font-style: italic; }
   `;
 
   function ensureStyle() {
@@ -158,6 +163,63 @@
     return score;
   }
 
+  // Padding tells. Length alone is not one: a long message dense with facts is
+  // worth reading in full. What earns a condense is length plus the shape of
+  // writing that is mostly throat-clearing.
+  const AI_TELLS = [
+    /\bi hope (this|you|we)\b/i,
+    /\b(just )?wanted to (reach out|take a moment|circle back|flag|check in|follow up|share)\b/i,
+    /\bcircl(e|ed|ing) back\b/i,
+    /\bas you (may|might) (recall|know|remember)\b/i,
+    /\bit'?s (worth|important) (noting|to note|mentioning)\b/i,
+    /\bplease (don'?t hesitate|feel free) to\b/i,
+    /\blet me know if you have any (questions|thoughts|concerns)\b/i,
+    /\b(happy|glad) to (discuss|elaborate|help|clarify)\b/i,
+    /\bthat (being )?said\b/i,
+    /\b(furthermore|moreover|additionally|in summary|to summarize|overall|in conclusion)\b/i,
+    /\b(delve|leverage|robust|seamless|holistic|synerg\w*|streamlin\w*|actionable insights?)\b/i,
+    /\bbest (path|way) forward\b/i,
+    /\balign(ing)? on\b/i,
+    /\b(several|a number of|various) (areas|aspects|factors|considerations|opportunities)\b/i,
+    /\bafter (giving it )?(considerable|careful|some) (thought|consideration)\b/i,
+    /\bi (believe|think|feel) it would be (beneficial|helpful|valuable|worth)\b/i,
+    /\b(great|excellent) (question|point)\b/i,
+    /\bcertainly[!,]/i,
+    /\bhere'?s a (breakdown|summary|quick rundown|high[- ]level)\b/i,
+    /\blet me (break|walk) (this|you|it) (down|through)\b/i,
+    /\bfor visibility\b/i,
+  ];
+
+  function wordCount(text) {
+    return text.trim().split(/\s+/).filter(Boolean).length;
+  }
+
+  function hasCode(text) {
+    return /```/.test(text) || /^\s{4,}\S/m.test(text);
+  }
+
+  function paddingScore(text) {
+    if (!CONFIG.condenseEnabled) return 0;
+    if (hasCode(text)) return 0;
+    // Mostly a bare link is not padding, it is a link.
+    if (/^\s*<?https?:\/\/\S+>?\s*$/.test(text)) return 0;
+
+    const words = wordCount(text);
+    if (words < CONFIG.condenseMinWords) return 0;
+
+    let tells = 0;
+    for (const re of AI_TELLS) if (re.test(text)) tells += 1;
+    if ((text.match(/^\s*([-*•]|\d+\.)\s+/gm) || []).length >= 3) tells += 1;
+    if ((text.match(/\n\s*\n/g) || []).length >= 2) tells += 1;
+    if (words >= 120) tells += 1;
+    return tells;
+  }
+
+  function shouldAsk(text) {
+    if (CONFIG.triageMode === 'always') return true;
+    return heuristicScore(text) >= CONFIG.triageThreshold || paddingScore(text) >= 1;
+  }
+
   /* ------------------------------------------------------------ extraction */
 
   let cachedSelf = null;
@@ -226,14 +288,43 @@
     if (verdicts.size > 800) verdicts.delete(verdicts.keys().next().value);
   }
 
-  function toneLabel(verdict) {
-    if (verdict.tone && verdict.tone.length) return verdict.tone.slice(0, 2).join(' · ');
+  function actionLabel(verdict) {
+    if (verdict.hostile && verdict.verbose) return 'softened · condensed';
+    if (verdict.verbose) return 'condensed';
     return 'softened';
+  }
+
+  function clearPanels(item) {
+    item.querySelectorAll('.slackcensor-panel').forEach((el) => el.remove());
+  }
+
+  // Local triage already suspects this one, so hide it now rather than letting
+  // the hostile version sit on screen for the couple of seconds the model
+  // takes. Restored in full if the model disagrees.
+  function renderPending(item, body) {
+    clearPanels(item);
+    const panel = document.createElement('div');
+    panel.className = 'slackcensor-panel';
+    panel.dataset.open = '0';
+    panel.dataset.pending = '1';
+
+    const placeholder = document.createElement('div');
+    placeholder.className = 'slackcensor-rewrite slackcensor-pending';
+    placeholder.textContent = 'checking…';
+    panel.appendChild(placeholder);
+
+    body.setAttribute(ATTR_BODY, 'hidden');
+    body.parentElement?.insertBefore(panel, body.nextSibling);
+  }
+
+  function restore(item, body) {
+    clearPanels(item);
+    body.removeAttribute(ATTR_BODY);
   }
 
   function render(item, body, verdict) {
     // Drop any panel left over from a previous render of this message.
-    item.querySelectorAll('.slackcensor-panel').forEach((el) => el.remove());
+    clearPanels(item);
 
     const panel = document.createElement('div');
     panel.className = 'slackcensor-panel';
@@ -248,14 +339,15 @@
     badge.type = 'button';
     badge.className = 'slackcensor-badge';
     badge.dataset.severity = String(verdict.severity);
-    badge.title = verdict.note
-      ? `SlackCensor: ${verdict.note}`
-      : 'SlackCensor rewrote this message';
+    badge.dataset.kind = verdict.hostile ? 'softened' : 'condensed';
+    const tones = (verdict.tone || []).join(', ');
+    badge.title = [verdict.note, tones && `(${tones})`].filter(Boolean).join(' ')
+      || 'SlackCensor rewrote this message';
 
     const dot = document.createElement('span');
     dot.className = 'slackcensor-dot';
     const label = document.createElement('span');
-    label.textContent = toneLabel(verdict);
+    label.textContent = actionLabel(verdict);
     const action = document.createElement('span');
     action.className = 'slackcensor-action';
     action.textContent = 'show original';
@@ -276,7 +368,7 @@
   }
 
   function setAll(open) {
-    document.querySelectorAll('.slackcensor-panel').forEach((panel) => {
+    document.querySelectorAll('.slackcensor-panel:not([data-pending])').forEach((panel) => {
       const badge = panel.querySelector('.slackcensor-badge');
       const body = panel.previousElementSibling;
       if (!badge || !body || !body.hasAttribute(ATTR_BODY)) return;
@@ -317,6 +409,10 @@
         if (verdict) render(item, body, verdict);
         else item.removeAttribute(ATTR_STATE);
       }
+      // Safety net: never leave a message hidden behind a hold that ended.
+      if ((state === 'clean' || state === 'error') && body.hasAttribute(ATTR_BODY)) {
+        restore(item, body);
+      }
       if (IGNORE_STATES.has(state)) return;
       if (state === 'done') return;
     }
@@ -346,22 +442,23 @@
       return;
     }
 
-    if (CONFIG.triageMode !== 'always') {
-      const score = heuristicScore(text);
-      if (score < CONFIG.triageThreshold) {
-        item.setAttribute(ATTR_STATE, 'clean');
-        return;
-      }
-      log('triage', score, text.slice(0, 60));
+    if (!shouldAsk(text)) {
+      item.setAttribute(ATTR_STATE, 'clean');
+      return;
     }
+    log('triage', heuristicScore(text), paddingScore(text), text.slice(0, 60));
 
     item.setAttribute(ATTR_STATE, 'pending');
+    const held = CONFIG.holdWhilePending;
+    if (held) renderPending(item, body);
+
     let verdict;
     try {
       verdict = await ask({ text, sender, channel });
     } catch (err) {
       log('ask failed', err.message);
       item.setAttribute(ATTR_STATE, 'error');
+      if (held && item.isConnected) restore(item, body);
       return;
     }
 
@@ -376,6 +473,7 @@
       render(item, body, verdict);
     } else {
       item.setAttribute(ATTR_STATE, 'clean');
+      if (held) restore(item, body);
     }
   }
 

@@ -47,27 +47,33 @@ function serveFixture() {
   });
 }
 
-async function startChrome(cdpPort, url) {
+// Port 0 lets Chrome pick a free port and write it to DevToolsActivePort.
+// Picking a random port ourselves means occasionally attaching to a Chrome
+// left over from an earlier run, which fails in a confusing way.
+async function startChrome(url) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'slackcensor-test-'));
   const child = spawn(CHROME, [
     '--headless=new',
     '--no-sandbox',
     '--disable-gpu',
     '--disable-dev-shm-usage',
-    `--remote-debugging-port=${cdpPort}`,
+    '--remote-debugging-port=0',
     `--user-data-dir=${userDataDir}`,
     url,
   ], { stdio: 'ignore' });
 
-  await waitFor('devtools endpoint', async () => {
+  const portFile = path.join(userDataDir, 'DevToolsActivePort');
+  const cdpPort = await waitFor('chrome to publish its debug port', async () => {
     try {
-      await devtoolsVersion(cdpPort);
-      return true;
+      const port = Number(fs.readFileSync(portFile, 'utf8').split('\n')[0]);
+      if (!port) return null;
+      await devtoolsVersion(port);
+      return port;
     } catch {
-      return false;
+      return null;
     }
   });
-  return { child, userDataDir };
+  return { child, userDataDir, cdpPort };
 }
 
 test('injected script rewrites heated messages and leaves the rest alone', async (t) => {
@@ -76,21 +82,35 @@ test('injected script rewrites heated messages and leaves the rest alone', async
     return;
   }
 
-  const cdpPort = 9000 + Math.floor(Math.random() * 900);
   const { server, port } = await serveFixture();
   const url = `http://127.0.0.1:${port}/`;
-  const chrome = await startChrome(cdpPort, url);
+  const chrome = await startChrome(url);
+  const { cdpPort } = chrome;
 
   const asked = [];
+  let holdRelease;
+  const heldTurn = new Promise((resolve) => { holdRelease = resolve; });
+
   const moderator = {
     stats: {},
     async moderate({ text, sender, channel }) {
       asked.push({ text, sender, channel });
+
+      // The message used to test the optimistic hold: block until the test
+      // has had a chance to look at the mid-flight state, then come back clean.
+      if (text.startsWith('PLEASE take a look')) {
+        await heldTurn;
+        return { flagged: false, hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null };
+      }
+
+      const verbose = text.split(/\s+/).length >= 45;
       return {
         flagged: true,
-        tone: ['aggressive', 'urgent'],
+        hostile: !verbose,
+        verbose,
+        tone: verbose ? ['padded', 'ai-slop'] : ['aggressive', 'urgent'],
         severity: 2,
-        rewrite: `NEUTRAL(${text.length})`,
+        rewrite: verbose ? 'CONDENSED to one sentence.' : `NEUTRAL(${text.length})`,
         note: 'test rewrite',
       };
     },
@@ -133,7 +153,9 @@ test('injected script rewrites heated messages and leaves the rest alone', async
           bodyState: body ? body.getAttribute('data-slackcensor-body') : null,
           bodyVisible: body ? body.offsetParent !== null : null,
           rewrite: panel ? panel.querySelector('.slackcensor-rewrite').textContent : null,
-          action: panel ? panel.querySelector('.slackcensor-action').textContent : null,
+          action: panel ? (panel.querySelector('.slackcensor-action') || {}).textContent ?? null : null,
+          label: panel ? (panel.querySelector('.slackcensor-badge span:nth-child(2)') || {}).textContent ?? null : null,
+          pending: panel ? panel.dataset.pending === '1' : false,
         };
       };
       return JSON.stringify({
@@ -141,13 +163,18 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         grouped: pick('msg-grouped'),
         neutral: pick('msg-neutral'),
         mine: pick('msg-mine'),
+        slop: pick('msg-slop'),
+        dense: pick('msg-dense'),
+        code: pick('msg-code'),
+        hold: pick('msg-hold'),
       });
     })()`);
 
-    const state = JSON.parse(await waitFor('both heated messages rewritten', async () => {
+    const state = JSON.parse(await waitFor('heated and padded messages handled', async () => {
       const raw = await snapshot();
-      const parsed = JSON.parse(raw);
-      return parsed.heated?.state === 'done' && parsed.grouped?.state === 'done' ? raw : null;
+      const p = JSON.parse(raw);
+      return p.heated?.state === 'done' && p.grouped?.state === 'done' && p.slop?.state === 'done'
+        ? raw : null;
     }));
 
     await t.test('the heated message is replaced and its original hidden', () => {
@@ -176,6 +203,48 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.ok(!asked.some((a) => a.text.startsWith('URGENT: I need this')));
     });
 
+    await t.test('a padded message is condensed to one sentence', () => {
+      assert.equal(state.slop.state, 'done');
+      assert.equal(state.slop.bodyState, 'hidden');
+      assert.equal(state.slop.rewrite, 'CONDENSED to one sentence.');
+      assert.equal(state.slop.label, 'condensed', 'the badge should say what it did');
+      assert.ok(asked.some((a) => a.text.startsWith('Hey team! I wanted to take a moment')));
+    });
+
+    await t.test('a long but fact-dense message is left alone', () => {
+      assert.equal(state.dense.state, 'clean');
+      assert.equal(state.dense.rewrite, null);
+      assert.ok(
+        !asked.some((a) => a.text.startsWith('Migration 0042')),
+        'length alone must not trigger a condense; that message is all facts',
+      );
+    });
+
+    await t.test('a message containing a code block is never condensed', () => {
+      assert.equal(state.code.state, 'clean');
+      assert.ok(
+        !asked.some((a) => a.text.includes('retry(3,')),
+        'padding phrases around a code block must not cost a call',
+      );
+    });
+
+    await t.test('a suspected message is hidden while the model is still deciding', async () => {
+      assert.equal(state.hold.pending, true, 'the hold panel should be up');
+      assert.equal(state.hold.bodyState, 'hidden', 'you should not be reading it yet');
+      assert.equal(state.hold.rewrite, 'checking…');
+    });
+
+    await t.test('a held message the model clears is restored in full', async () => {
+      holdRelease();
+      const restored = await waitFor('hold released', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.hold.state === 'clean' ? p.hold : null;
+      });
+      assert.equal(restored.bodyState, null, 'our attribute should be gone entirely');
+      assert.equal(restored.bodyVisible, true);
+      assert.equal(restored.rewrite, null, 'no panel should be left behind');
+    });
+
     await t.test('clicking the badge reveals the original, clicking again hides it', async () => {
       await read(`document.querySelector('#msg-heated .slackcensor-badge').click()`);
       let after = JSON.parse(await snapshot());
@@ -202,6 +271,7 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.equal(asked.filter((a) => a.text.startsWith('WHY is the deploy')).length, 1);
     });
   } finally {
+    holdRelease?.();
     probe?.close();
     attacher.stop();
     server.close();

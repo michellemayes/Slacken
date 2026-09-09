@@ -19,18 +19,40 @@ export const DEFAULTS = {
   model: 'claude-haiku-4-5-20251001',
   claudeBin: 'claude',
   claudeArgs: [],
-  requestTimeoutMs: 20000,
-  maxConcurrency: 2,
+  requestTimeoutMs: 25000,
 
-  // "heuristic" only asks Claude about messages that look heated (cheap).
-  // "always" sends every incoming message.
+  // Messages that render together travel as one `claude -p` call. Measured on
+  // haiku with thinking off: 1/call is ~2.4s and $0.0031 a message, 8/call is
+  // ~650ms and $0.00068 a message.
+  batchSize: 8,
+  batchWindowMs: 120,
+  maxConcurrency: 2,
+  // Guarantees well-formed JSON back, at a small token cost.
+  useJsonSchema: true,
+  // Stop calling the model once a day costs this much. 0 disables the cap.
+  dailyBudgetUsd: 0,
+
+  // "heuristic" only asks the model about messages that already look heated or
+  // padded, which is most of what keeps this cheap. "always" sends everything.
   triageMode: 'heuristic',
-  // Minimum in-page heuristic score before a message is worth a model call.
+  // Local score a message needs before a tone call is worth making.
   triageThreshold: 2,
-  // Minimum severity (0-3) the model must report before we replace anything.
+  // Model severity (0-3) required before hostile phrasing is replaced.
   minSeverity: 2,
+
+  // Condensing only applies to messages at least this long...
+  condenseMinWords: 45,
+  // ...and only if the rewrite comes back at most this fraction of the length.
+  condenseMaxRatio: 0.7,
+  // Set false to soften tone but never compress.
+  condenseEnabled: true,
+
   // Messages longer than this are left alone.
   maxChars: 4000,
+  // Hide a message the moment local triage suspects it, rather than letting
+  // you read the hostile version for a second while the model answers. It is
+  // restored if the model disagrees.
+  holdWhilePending: true,
 
   // Your own display names, so your messages are never rewritten. Usually
   // detected automatically from the Slack UI; this is the fallback.
@@ -68,7 +90,10 @@ export function pageConfig(config) {
   return {
     triageMode: config.triageMode,
     triageThreshold: config.triageThreshold,
+    condenseEnabled: config.condenseEnabled,
+    condenseMinWords: config.condenseMinWords,
     maxChars: config.maxChars,
+    holdWhilePending: config.holdWhilePending,
     selfNames: config.selfNames,
     ignoreSenders: config.ignoreSenders,
     ignoreChannels: config.ignoreChannels,

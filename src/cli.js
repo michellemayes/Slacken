@@ -103,7 +103,10 @@ async function run(config) {
 
   await new Promise((resolve) => {
     const shutdown = () => {
-      console.log('\n[slackcensor] stopping');
+      const st = moderator.stats;
+      console.log(`\n[slackcensor] stopping — ${st.batched} messages in ${st.calls} calls, `
+        + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
+        + `$${st.costUsd.toFixed(4)}`);
       attacher.stop();
       moderator.cache.flush();
       server.close();
@@ -128,13 +131,18 @@ function logEvent(event, config) {
     case 'moderate-error':
       console.warn(`[slackcensor] ${event.type}: ${event.message}`);
       break;
-    case 'verdict':
-      if (event.verdict.flagged) {
-        console.log(`[slackcensor] softened ${event.sender || 'someone'} in ${event.channel || '?'} (${event.verdict.tone.join(', ') || 'tone'}, sev ${event.verdict.severity})`);
+    case 'verdict': {
+      const v = event.verdict;
+      if (v.flagged) {
+        const what = v.hostile && v.verbose ? 'softened + condensed'
+          : v.verbose ? 'condensed' : 'softened';
+        const who = `${event.sender || 'someone'} in ${event.channel || '?'}`;
+        console.log(`[slackcensor] ${what} ${who}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
       } else if (config.verbose) {
         console.log(`[slackcensor] left alone: ${JSON.stringify(event.text.slice(0, 60))}`);
       }
       break;
+    }
     default:
       break;
   }

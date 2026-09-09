@@ -1,9 +1,25 @@
 import { spawn } from 'node:child_process';
-import { buildPrompt, TONE_VALUES } from './prompt.js';
+import { SYSTEM_PROMPT, RESPONSE_SCHEMA, TONE_VALUES, buildBatchPayload } from './prompt.js';
 import { Cache } from './cache.js';
 
-const CLEAN = { flagged: false, tone: [], severity: 0, rewrite: null, note: null };
+export const CLEAN = {
+  flagged: false, hostile: false, verbose: false,
+  tone: [], severity: 0, rewrite: null, note: null,
+};
 
+const clean = (extra) => ({ ...CLEAN, ...extra });
+
+/*
+ * Batches messages into a single `claude -p` call.
+ *
+ * Measured on claude-haiku-4-5, thinking disabled:
+ *   1 message  per call ~2.4s   ~$0.0031/msg
+ *   8 messages per call ~5.2s   ~$0.00068/msg   (~650ms and 4.5x cheaper per message)
+ *
+ * A persistent --input-format stream-json session was measured too and is
+ * deliberately not used: turns were no faster, and because the conversation
+ * accumulates, the sixth turn cost 4.7x the first.
+ */
 export class Moderator {
   constructor(config) {
     this.config = config;
@@ -11,15 +27,23 @@ export class Moderator {
       ttlHours: config.cacheTtlHours,
       maxEntries: config.cacheMaxEntries,
     });
-    this.inFlight = 0;
+
     this.queue = [];
-    this.stats = { calls: 0, cacheHits: 0, flagged: 0, errors: 0 };
+    this.timer = null;
+    this.inFlight = 0;
+    this.seq = 0;
+
+    this.stats = {
+      calls: 0, batched: 0, cacheHits: 0,
+      softened: 0, condensed: 0, errors: 0,
+      costUsd: 0, day: today(),
+    };
   }
 
   async moderate({ text, sender, channel }) {
     const trimmed = (text || '').trim();
-    if (!trimmed) return { ...CLEAN, reason: 'empty' };
-    if (trimmed.length > this.config.maxChars) return { ...CLEAN, reason: 'too-long' };
+    if (!trimmed) return clean({ reason: 'empty' });
+    if (trimmed.length > this.config.maxChars) return clean({ reason: 'too-long' });
 
     const key = Cache.key(this.config.model, trimmed);
     const cached = this.cache.get(key);
@@ -28,67 +52,131 @@ export class Moderator {
       return { ...cached, cached: true };
     }
 
-    const verdict = await this.withSlot(() => this.askClaude({ text: trimmed, sender, channel }));
+    if (this.overBudget()) return clean({ reason: 'budget', error: 'daily budget reached' });
+
+    const verdict = await this.enqueue({ text: trimmed, sender, channel });
     this.cache.set(key, verdict);
-    if (verdict.flagged) this.stats.flagged += 1;
+    if (verdict.hostile) this.stats.softened += 1;
+    if (verdict.verbose) this.stats.condensed += 1;
     return verdict;
   }
 
-  // Cap how many `claude -p` processes run at once. A busy channel can deliver
-  // a dozen messages in one render pass.
-  withSlot(fn) {
-    if (this.inFlight < this.config.maxConcurrency) {
-      this.inFlight += 1;
-      return fn().finally(() => {
-        this.inFlight -= 1;
-        const next = this.queue.shift();
-        if (next) next();
-      });
+  overBudget() {
+    const limit = this.config.dailyBudgetUsd;
+    if (!limit || limit <= 0) return false;
+    if (this.stats.day !== today()) {
+      this.stats.day = today();
+      this.stats.costUsd = 0;
     }
-    return new Promise((resolve, reject) => {
-      this.queue.push(() => {
-        this.inFlight += 1;
-        fn().then(resolve, reject).finally(() => {
-          this.inFlight -= 1;
-          const next = this.queue.shift();
-          if (next) next();
-        });
-      });
+    return this.stats.costUsd >= limit;
+  }
+
+  // Hold each request for a short window so messages that render together —
+  // catching up on a channel, or a burst from one person — travel as one call.
+  enqueue(item) {
+    return new Promise((resolve) => {
+      this.queue.push({ ...item, id: `m${this.seq++}`, resolve });
+      if (this.queue.length >= this.config.batchSize) this.flush();
+      // Deliberately not unref'd: the batch window is the only thing holding
+      // a queued message, so it has to keep the process alive on its own.
+      else if (!this.timer) this.timer = setTimeout(() => this.flush(), this.config.batchWindowMs);
     });
   }
 
-  async askClaude({ text, sender, channel }) {
+  flush() {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (!this.queue.length) return;
+    if (this.inFlight >= this.config.maxConcurrency) {
+      // All workers busy. Try again once one frees up.
+      this.timer = setTimeout(() => this.flush(), 50);
+      return;
+    }
+
+    const batch = this.queue.splice(0, this.config.batchSize);
+    this.inFlight += 1;
+    this.runBatch(batch)
+      .catch((err) => {
+        this.stats.errors += 1;
+        for (const item of batch) item.resolve(clean({ error: err.message }));
+      })
+      .finally(() => {
+        this.inFlight -= 1;
+        if (this.queue.length) this.flush();
+      });
+  }
+
+  async runBatch(batch) {
     this.stats.calls += 1;
-    const args = [
+    this.stats.batched += batch.length;
+
+    const stdout = await runClaude({
+      bin: this.config.claudeBin,
+      args: this.claudeArgs(),
+      input: buildBatchPayload(batch),
+      timeoutMs: this.config.requestTimeoutMs,
+    });
+
+    const { verdicts, costUsd } = parseResponse(stdout);
+    if (costUsd) {
+      if (this.stats.day !== today()) {
+        this.stats.day = today();
+        this.stats.costUsd = 0;
+      }
+      this.stats.costUsd += costUsd;
+    }
+
+    if (!verdicts) {
+      this.stats.errors += 1;
+      if (this.config.verbose) console.warn(`[slackcensor] unparseable output: ${stdout.slice(0, 300)}`);
+      for (const item of batch) item.resolve(clean({ error: 'unparseable model output' }));
+      return;
+    }
+
+    const byId = new Map(verdicts.filter((v) => v && typeof v.id === 'string').map((v) => [v.id, v]));
+    for (const item of batch) {
+      const raw = byId.get(item.id);
+      item.resolve(raw
+        ? normalize(raw, this.config, item.text)
+        : clean({ error: 'no verdict returned' }));
+    }
+  }
+
+  claudeArgs() {
+    return [
       '-p',
       '--output-format', 'json',
       '--model', this.config.model,
+      '--system-prompt', SYSTEM_PROMPT,
+      ...(this.config.useJsonSchema ? ['--json-schema', JSON.stringify(RESPONSE_SCHEMA)] : []),
+      // Everything below is startup and turn weight we do not need. Without
+      // them a verdict costs ~800 thinking tokens and 8-11 seconds.
+      '--tools', '',
+      '--strict-mcp-config',
+      '--no-session-persistence',
+      '--disable-slash-commands',
+      '--setting-sources', '',
       ...this.config.claudeArgs,
     ];
-
-    let raw;
-    try {
-      raw = await runClaude(this.config.claudeBin, args, buildPrompt({ text, sender, channel }), this.config.requestTimeoutMs);
-    } catch (err) {
-      this.stats.errors += 1;
-      return { ...CLEAN, error: err.message };
-    }
-
-    const verdict = parseVerdict(raw);
-    if (!verdict) {
-      this.stats.errors += 1;
-      if (this.config.verbose) console.warn(`[slackcensor] unparseable model output: ${raw.slice(0, 300)}`);
-      return { ...CLEAN, error: 'unparseable model output' };
-    }
-    return normalize(verdict, this.config.minSeverity);
   }
 }
 
-function runClaude(bin, args, prompt, timeoutMs) {
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function runClaude({ bin, args, input, timeoutMs }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(bin, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // The single biggest lever there is: it takes a verdict from ~800
+        // output tokens and ~10s down to ~50 tokens and ~2.4s.
+        env: { ...process.env, MAX_THINKING_TOKENS: '0' },
+      });
     } catch (err) {
       reject(new Error(`could not spawn ${bin}: ${err.message}`));
       return;
@@ -125,28 +213,33 @@ function runClaude(bin, args, prompt, timeoutMs) {
     });
 
     child.stdin.on('error', () => {});
-    child.stdin.end(prompt);
+    child.stdin.end(input);
   });
 }
 
-// `claude -p --output-format json` wraps the answer in a result envelope, but
-// fall back to treating stdout as the answer itself if that ever changes.
-export function parseVerdict(stdout) {
+// `claude -p --output-format json` wraps the answer in a result envelope that
+// also carries what the call cost.
+export function parseResponse(stdout) {
   let body = stdout;
+  let costUsd = 0;
   try {
     const envelope = JSON.parse(stdout);
-    if (envelope && typeof envelope.result === 'string') body = envelope.result;
-    else if (envelope && typeof envelope.flagged === 'boolean') return envelope;
+    if (envelope && typeof envelope === 'object') {
+      if (typeof envelope.total_cost_usd === 'number') costUsd = envelope.total_cost_usd;
+      if (typeof envelope.result === 'string') body = envelope.result;
+      else if (Array.isArray(envelope.verdicts)) return { verdicts: envelope.verdicts, costUsd };
+    }
   } catch {
-    // Not an envelope. Keep the raw text.
+    // Not an envelope. Treat stdout as the answer.
   }
-  return extractJsonObject(body);
+  const parsed = extractJsonObject(body);
+  return { verdicts: Array.isArray(parsed?.verdicts) ? parsed.verdicts : null, costUsd };
 }
 
 function extractJsonObject(text) {
   const start = text.indexOf('{');
   if (start === -1) return null;
-  // Scan for the matching brace so trailing prose or fences do not break us.
+  // Scan for the matching brace so fences or trailing prose cannot break us.
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -171,26 +264,43 @@ function extractJsonObject(text) {
   return null;
 }
 
-export function normalize(verdict, minSeverity) {
-  const severity = clampInt(verdict.severity, 0, 3);
-  const rewrite = typeof verdict.rewrite === 'string' && verdict.rewrite.trim()
-    ? verdict.rewrite.trim()
-    : null;
-  const tone = Array.isArray(verdict.tone)
-    ? verdict.tone.filter((t) => TONE_VALUES.includes(t))
-    : [];
-  // A "flagged" verdict with no rewrite, or one below the severity floor, is
-  // not actionable: leave the message exactly as it was written.
-  const flagged = Boolean(verdict.flagged) && rewrite !== null && severity >= minSeverity;
+export function normalize(raw, config = {}, originalText = '') {
+  const {
+    minSeverity = 2,
+    condenseMinWords = 45,
+    condenseMaxRatio = 0.7,
+  } = config;
+
+  const severity = clampInt(raw.severity, 0, 3);
+  const rewrite = typeof raw.rewrite === 'string' && raw.rewrite.trim() ? raw.rewrite.trim() : null;
+  const tone = Array.isArray(raw.tone) ? raw.tone.filter((t) => TONE_VALUES.includes(t)) : [];
+
+  // Each transformation earns the swap on its own terms. Softening has to
+  // clear the severity floor. Condensing has to start from something actually
+  // long, and has to come back meaningfully shorter — otherwise we would be
+  // swapping a person's own words for a paraphrase of the same length, which
+  // is all cost and no benefit.
+  const originalWords = wordCount(originalText);
+  const hostile = Boolean(raw.hostile) && severity >= minSeverity;
+  const verbose = Boolean(raw.verbose)
+    && rewrite !== null
+    && originalWords >= condenseMinWords
+    && wordCount(rewrite) <= originalWords * condenseMaxRatio;
+
+  const flagged = (hostile || verbose) && rewrite !== null;
   return {
     flagged,
+    hostile: flagged && hostile,
+    verbose: flagged && verbose,
     tone,
     severity,
     rewrite: flagged ? rewrite : null,
-    note: flagged && typeof verdict.note === 'string' && verdict.note.trim()
-      ? verdict.note.trim()
-      : null,
+    note: flagged && typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
   };
+}
+
+function wordCount(text) {
+  return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
 
 function clampInt(value, min, max) {
