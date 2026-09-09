@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { SYSTEM_PROMPT, RESPONSE_SCHEMA, TONE_VALUES, buildBatchPayload } from './prompt.js';
+import { resolveClaudeBin, notFoundMessage, spawnPath } from './claude-bin.js';
 import { Cache } from './cache.js';
 import { forChannel, gateSignature } from './settings.js';
 
@@ -200,7 +201,7 @@ export class Moderator {
       this.stats.calls += 1;
       try {
         const stdout = await runClaude({
-          bin: this.config.claudeBin,
+          bin: await this.binPath(),
           args: this.claudeArgs(),
           input,
           timeoutMs: this.config.requestTimeoutMs,
@@ -220,6 +221,20 @@ export class Moderator {
       }
     }
     throw lastErr;
+  }
+
+  /*
+   * The full path to `claude`, not the bare name.
+   *
+   * A daemon started at login has almost no PATH, so leaving the lookup to
+   * spawn() is what turns a working setup into "claude is not on the PATH".
+   * Resolved once and remembered; a genuine miss is an error that says where
+   * it looked, so the answer is in the message rather than in a support thread.
+   */
+  async binPath() {
+    const { path: file, searched } = await resolveClaudeBin(this.config.claudeBin);
+    if (!file) throw new Error(notFoundMessage(this.config.claudeBin, searched));
+    return file;
   }
 
   claudeArgs() {
@@ -277,7 +292,7 @@ export function classifyError(message) {
 export function errorHint(kind, message) {
   switch (kind) {
     case 'auth': return 'Not signed in to Claude — run: claude login';
-    case 'missing': return 'claude is not on the PATH this is running with';
+    case 'missing': return "Can't find claude — run: slacken doctor";
     case 'rate-limit': return 'Rate limited by the API — rewriting will catch up';
     case 'overloaded': return 'The API is overloaded — rewriting will catch up';
     case 'timeout': return 'Model calls are timing out';
@@ -291,9 +306,15 @@ function runClaude({ bin, args, input, timeoutMs }) {
     try {
       child = spawn(bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
-        // The single biggest lever there is: it takes a verdict from ~800
-        // output tokens and ~10s down to ~50 tokens and ~2.4s.
-        env: { ...process.env, MAX_THINKING_TOKENS: '0' },
+        env: {
+          ...process.env,
+          // The single biggest lever there is: it takes a verdict from ~800
+          // output tokens and ~10s down to ~50 tokens and ~2.4s.
+          MAX_THINKING_TOKENS: '0',
+          // An npm-installed claude is a `#!/usr/bin/env node` script, so
+          // knowing where claude is does not by itself make it runnable.
+          PATH: spawnPath(bin),
+        },
       });
     } catch (err) {
       reject(new Error(`could not spawn ${bin}: ${err.message}`));

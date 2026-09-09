@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { HOME_DIR } from './config.js';
+import { resolveClaudeBin } from './claude-bin.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -39,17 +40,11 @@ const xml = (s) => String(s)
   .replace(/>/g, '&gt;');
 
 // launchd gives an agent a bare PATH, so `claude` would not be found. Resolve
-// it now and bake its directory into the plist.
+// it now — through PATH, the usual install locations and the login shell, the
+// same way the daemon itself does — and bake its directory into the plist.
 async function resolveClaudeDir(claudeBin) {
-  if (claudeBin.includes('/')) return path.dirname(path.resolve(claudeBin));
-  try {
-    const { stdout } = await execFileAsync('/usr/bin/which', [claudeBin]);
-    const found = stdout.trim();
-    if (found) return path.dirname(found);
-  } catch {
-    // Fall through to the standard locations below.
-  }
-  return null;
+  const { path: file } = await resolveClaudeBin(claudeBin);
+  return file ? path.dirname(file) : null;
 }
 
 export async function buildPlist(config) {
@@ -57,6 +52,7 @@ export async function buildPlist(config) {
   const pathEntries = [
     claudeDir,
     path.dirname(process.execPath),
+    path.join(os.homedir(), '.local', 'bin'),
     '/opt/homebrew/bin',
     '/usr/local/bin',
     '/usr/bin',
