@@ -111,23 +111,22 @@
       word-break: break-word;
     }
     .slacken-panel[data-open="1"] .slacken-rewrite { display: none; }
-    /* Slack sets its reaction bar 4px under whatever precedes it, and a
-       reaction is itself a bordered pill. Left at 3px above and 4px below,
-       the badge read as one more chip in that row — so it sits closer to the
-       message it describes than to the reactions, and is smaller and quieter
-       than a reaction chip at every state. */
+    /* Deliberately not a chip. Slack stacks its own bordered boxes directly
+       under a message — reaction pills 4px below, and a thread bar whose
+       hover box is pulled up over whatever precedes it — so a bordered badge
+       either reads as one more reaction or gets crossed by the thread bar's
+       outline. A dot and two words collide with neither, and the hover fill
+       hangs 6px left the way Slack's own hover boxes do, which keeps the
+       label itself flush with the message text above it. */
     .slacken-badge {
       display: inline-flex; align-items: center; gap: 5px;
       box-sizing: border-box; max-width: 100%;
-      margin: 5px 0 4px; padding: 1px 8px;
+      margin: 4px 0 6px -6px; padding: 1px 6px;
       font-size: 11px; line-height: 16px; font-weight: 500;
       color: inherit; opacity: .62;
-      background: transparent;
-      border: 1px solid rgba(127,127,127,.4); border-radius: 9px;
+      background: transparent; border: 0; border-radius: 7px;
       cursor: pointer; user-select: none;
     }
-    /* Hover fills rather than darkens the outline: a heavier border is what
-       made the badge snap into the reaction cluster below it. */
     .slacken-badge:hover { opacity: 1; background: rgba(127,127,127,.13); }
     .slacken-badge[hidden] { display: none; }
     .slacken-dot {
