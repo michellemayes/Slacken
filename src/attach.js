@@ -22,6 +22,7 @@ export class Attacher {
     this.pollTimer = null;
     this.stopped = false;
     this.unsubscribe = null;
+    this.pollFailing = false;
     // The last thing a page said about what it can see. Null until one says
     // anything, which is not the same as a page that sees nothing.
     this.health = null;
@@ -63,7 +64,14 @@ export class Attacher {
       if (this.stopped) return;
       try {
         await this.sweep();
+        // Only worth an event when it is news: the log needs to say when the
+        // devtools endpoint came back, not that it is still there.
+        if (this.pollFailing) {
+          this.pollFailing = false;
+          this.onEvent({ type: 'poll-ok' });
+        }
       } catch (err) {
+        this.pollFailing = true;
         this.onEvent({ type: 'poll-error', message: err.message });
       }
       if (!this.stopped) {

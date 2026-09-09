@@ -271,3 +271,46 @@ test('a verdict is cached against the settings that produced it', async () => {
     cleanup();
   }
 });
+
+test('a failure is never cached, so a recovered claude is asked again', async () => {
+  // The bug this covers reads, from the menu bar, as "234 model calls, 130
+  // from cache, 0 rewritten": once a failure was memoised for the week-long
+  // TTL, those messages stayed unread long after claude was working again.
+  const { moderator, invocations, cleanup } = setup({ cacheTtlHours: 1 });
+  try {
+    const text = 'THIS IS COMPLETELY UNACCEPTABLE AND YOU KNOW IT';
+
+    process.env.FAKE_CLAUDE_FAIL = '1';
+    const failed = await moderator.moderate({ text });
+    assert.match(failed.error, /exited 2/);
+
+    delete process.env.FAKE_CLAUDE_FAIL;
+    const retried = await moderator.moderate({ text });
+
+    assert.equal(retried.cached, undefined, 'the failure must not have been served back');
+    assert.equal(retried.flagged, true);
+    assert.equal(invocations().length, 2, 'the second read has to reach the model again');
+    assert.equal(moderator.stats.cacheHits, 0);
+  } finally {
+    delete process.env.FAKE_CLAUDE_FAIL;
+    cleanup();
+  }
+});
+
+test('a successful verdict is still cached after a failure', async () => {
+  const { moderator, invocations, cleanup } = setup({ cacheTtlHours: 1 });
+  try {
+    const text = 'THIS IS COMPLETELY UNACCEPTABLE';
+    process.env.FAKE_CLAUDE_FAIL = '1';
+    await moderator.moderate({ text });
+    delete process.env.FAKE_CLAUDE_FAIL;
+    await moderator.moderate({ text });
+    const third = await moderator.moderate({ text });
+
+    assert.equal(third.cached, true);
+    assert.equal(invocations().length, 2, 'only the failure and the call that worked cost anything');
+  } finally {
+    delete process.env.FAKE_CLAUDE_FAIL;
+    cleanup();
+  }
+});

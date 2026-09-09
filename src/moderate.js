@@ -79,7 +79,10 @@ export class Moderator {
     if (this.overBudget()) return clean({ reason: 'budget', error: 'daily budget reached' });
 
     const verdict = await this.enqueue({ text: trimmed, sender, channel });
-    this.cache.set(key, verdict);
+    // A failure is not a verdict. Caching one would hold this message, and
+    // every later copy of it, unread for the whole TTL — a week by default —
+    // long after whatever broke had been fixed.
+    if (!verdict.error) this.cache.set(key, verdict);
     if (verdict.hostile) this.stats.softened += 1;
     if (verdict.verbose) this.stats.condensed += 1;
     return verdict;
@@ -411,7 +414,47 @@ export function normalize(raw, config = {}, originalText = '') {
     severity,
     rewrite: flagged ? rewrite : null,
     note: flagged && typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
+    // Why nothing happened, when nothing happened. See whyNot below.
+    why: flagged ? null : whyNot({
+      raw,
+      rewrite,
+      severity,
+      originalWords,
+      minSeverity,
+      condenseMinWords,
+      condenseMaxRatio,
+    }),
   };
+}
+
+/*
+ * "Left alone" covers two completely different things: a model that read the
+ * message and saw nothing wrong, and a rewrite this config refused to apply.
+ * They are not the same problem and they do not have the same fix — one is
+ * working as intended, the other means a threshold is set where you did not
+ * want it — so the log has to say which, and name the number to move.
+ */
+function whyNot({ raw, rewrite, severity, originalWords, minSeverity, condenseMinWords, condenseMaxRatio }) {
+  const calledHostile = Boolean(raw.hostile);
+  const calledVerbose = Boolean(raw.verbose);
+
+  if (!calledHostile && !calledVerbose) return 'nothing to change';
+  if (rewrite === null) return 'flagged it, but sent back no rewrite';
+
+  if (calledVerbose) {
+    if (originalWords < condenseMinWords) {
+      return `${originalWords} words, condensing starts at condenseMinWords ${condenseMinWords}`;
+    }
+    const rewriteWords = wordCount(rewrite);
+    if (rewriteWords > originalWords * condenseMaxRatio) {
+      const pct = Math.round((rewriteWords / originalWords) * 100);
+      return `the rewrite was ${pct}% of the length, condenseMaxRatio allows ${Math.round(condenseMaxRatio * 100)}%`;
+    }
+  }
+  if (calledHostile && severity < minSeverity) {
+    return `severity ${severity}, below minSeverity ${minSeverity}`;
+  }
+  return 'nothing to change';
 }
 
 function wordCount(text) {

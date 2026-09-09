@@ -2,6 +2,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseResponse, normalize } from '../src/moderate.js';
+import { devtoolsMessage } from '../src/cdp.js';
+import { RepeatLog, logEvent } from '../src/cli.js';
+import { Cache } from '../src/cache.js';
 import { compareVersions, checkForUpdate } from '../src/version.js';
 
 const SOFTEN = {
@@ -121,6 +124,202 @@ test('normalize tolerates a garbage severity', () => {
   assert.equal(out.flagged, false);
 });
 
+/* ------------------------------------------------- reporting what failed */
+
+test('a refused devtools connection says what to do about it', () => {
+  const err = new Error('fetch failed');
+  err.cause = { code: 'ECONNREFUSED', message: 'connect ECONNREFUSED 127.0.0.1:9222' };
+  const message = devtoolsMessage(err, 9222);
+  // "fetch failed", repeated every four seconds, is the message this replaces.
+  assert.match(message, /nothing is listening on 127\.0\.0\.1:9222/);
+  assert.match(message, /slacken launch/);
+});
+
+test('an unrecognised devtools failure still carries its cause', () => {
+  const err = new Error('fetch failed');
+  err.cause = { code: 'EHOSTUNREACH', message: 'no route to host' };
+  assert.equal(devtoolsMessage(err, 9222), 'fetch failed: no route to host');
+});
+
+test('RepeatLog says a new failure once and then goes quiet', () => {
+  let now = 0;
+  const log = new RepeatLog({ summariseAfterMs: 60_000, now: () => now });
+
+  assert.equal(log.fail('poll', 'boom'), 'boom');
+  for (let i = 0; i < 200; i += 1) {
+    now += 4000;
+    if (now < 60_000) assert.equal(log.fail('poll', 'boom'), null);
+    else break;
+  }
+});
+
+test('RepeatLog summarises a failure that will not stop', () => {
+  let now = 0;
+  const log = new RepeatLog({ summariseAfterMs: 60_000, now: () => now });
+  log.fail('poll', 'boom');
+  now = 30_000;
+  assert.equal(log.fail('poll', 'boom'), null);
+  now = 61_000;
+  const line = log.fail('poll', 'boom');
+  assert.match(line, /still failing after 3 tries over 1m: boom/);
+});
+
+test('RepeatLog reports a different message straight away', () => {
+  const log = new RepeatLog();
+  assert.equal(log.fail('model', 'claude exited 1'), 'claude exited 1');
+  assert.equal(log.fail('model', 'claude exited 1'), null);
+  assert.equal(log.fail('model', 'claude timed out'), 'claude timed out');
+});
+
+test('RepeatLog announces recovery, and only once', () => {
+  let now = 0;
+  const log = new RepeatLog({ now: () => now });
+  log.fail('poll', 'boom');
+  now = 8000;
+  log.fail('poll', 'boom');
+  assert.match(log.ok('poll'), /recovered after 2 failures over 8s/);
+  assert.equal(log.ok('poll'), null, 'nothing to recover from twice');
+});
+
+test('a zero TTL turns the cache off rather than emptying it onto disk', () => {
+  const off = new Cache({ ttlHours: 0, maxEntries: 5000 });
+  assert.equal(off.enabled, false);
+  off.set('k', { rewrite: 'x' });
+  assert.equal(off.map.size, 0, 'a disabled cache holds nothing');
+  assert.equal(off.get('k'), null);
+  // The important half: flush() must not write an empty file over real entries.
+  assert.equal(off.flush(), undefined);
+  assert.equal(off.flushTimer, null, 'and must never schedule a write');
+});
+
+// Captures what a run of events would actually put in the log.
+function capture(events, { config = {}, report = new RepeatLog() } = {}) {
+  const lines = [];
+  const log = console.log;
+  const warn = console.warn;
+  console.log = (line) => lines.push(line);
+  console.warn = (line) => lines.push(line);
+  try {
+    for (const event of events) logEvent(event, config, report);
+  } finally {
+    console.log = log;
+    console.warn = warn;
+  }
+  return lines;
+}
+
+test('a model that fails on every message says so, once', () => {
+  // The reported symptom: the menu bar counted 234 errors and the log it sent
+  // you to had not one word about any of them.
+  const failed = {
+    type: 'verdict',
+    sender: 'Josh',
+    channel: 'teamnami-crowddeny',
+    text: 'whatever',
+    verdict: { flagged: false, tone: [], error: "claude exited 1: unknown option '--json-schema'" },
+  };
+  const lines = capture(Array.from({ length: 234 }, () => failed));
+
+  assert.ok(lines.length >= 1, 'the log must not be silent about 234 failures');
+  assert.ok(lines.length < 10, `234 identical failures should not be 234 lines (got ${lines.length})`);
+  assert.match(lines[0], /the model could not judge a message: claude exited 1: unknown option/);
+});
+
+test('the log says when the model started working again', () => {
+  const report = new RepeatLog();
+  const lines = capture([
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], error: 'claude timed out' } },
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], error: 'claude timed out' } },
+    { type: 'verdict', sender: 'Ann', channel: 'c', text: 't', verdict: { flagged: true, verbose: true, tone: ['padded'] } },
+  ], { report });
+
+  assert.match(lines[0], /claude timed out/);
+  assert.match(lines[1], /the model is answering again — recovered after 2 failures/);
+  assert.match(lines[2], /condensed Ann in c \(padded\)/);
+});
+
+test('a dead debug port is reported once, not every four seconds', () => {
+  const report = new RepeatLog();
+  const dead = { type: 'poll-error', message: 'nothing is listening on 127.0.0.1:9222 — Slack is not running with its debug port open (run: slacken launch)' };
+  const lines = capture([...Array.from({ length: 50 }, () => dead), { type: 'poll-ok' }], { report });
+
+  assert.equal(lines.length, 2, 'one line for the outage, one for the recovery');
+  assert.match(lines[0], /slacken launch/);
+  assert.match(lines[1], /Slack is reachable again — recovered after 50 failures/);
+});
+
+test('a verdict that never reached the model is not proof it recovered', () => {
+  const report = new RepeatLog();
+  const lines = capture([
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], error: 'claude exited 1' } },
+    // Pausing, an empty message, and a cached answer all skip the model
+    // entirely. None of them says anything about whether claude works.
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], reason: 'paused' } },
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], reason: 'empty' } },
+    { type: 'verdict', channel: 'c', text: 't', verdict: { flagged: false, tone: [], cached: true } },
+  ], { report });
+
+  assert.equal(lines.length, 1, 'only the failure is news');
+  assert.match(lines[0], /claude exited 1/);
+
+  // A real answer is what clears it.
+  const after = capture([
+    { type: 'verdict', sender: 'Ann', channel: 'c', text: 't', verdict: { flagged: true, verbose: true, tone: [] } },
+  ], { report });
+  assert.match(after[0], /the model is answering again — recovered after 1 failure/);
+});
+
+/* ----------------------------------------- why nothing happened to it */
+
+test('normalize names the gate that stopped a soften', () => {
+  const out = normalize({ ...SOFTEN, severity: 1 }, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /severity 1, below minSeverity 2/);
+});
+
+test('normalize names the length that stopped a condense', () => {
+  const out = normalize(CONDENSE, { minSeverity: 2, condenseMinWords: 45 }, 'far too short to bother');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /5 words, condensing starts at condenseMinWords 45/);
+});
+
+test('normalize names the ratio that stopped a condense', () => {
+  // 60 words in, a rewrite of 50 words back: over the 0.7 allowance.
+  const rewrite = Array(50).fill('still').join(' ');
+  const out = normalize({ ...CONDENSE, rewrite }, { condenseMinWords: 45, condenseMaxRatio: 0.7 }, PADDED);
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /the rewrite was 83% of the length, condenseMaxRatio allows 70%/);
+});
+
+test('normalize says so when the model simply saw nothing wrong', () => {
+  const out = normalize({ id: 'm0', hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null }, {}, 'Good morning!');
+  assert.equal(out.why, 'nothing to change');
+});
+
+test('normalize reports a flag that arrived with no rewrite', () => {
+  const out = normalize({ ...SOFTEN, rewrite: null }, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /sent back no rewrite/);
+});
+
+test('a verdict that was rewritten carries no reason to explain', () => {
+  const out = normalize(SOFTEN, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, true);
+  assert.equal(out.why, null);
+});
+
+test('the log distinguishes a paused Slacken from a quiet one', () => {
+  const lines = capture([
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], why: 'nothing to change' } },
+    // The one that used to be indistinguishable from the line above.
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], reason: 'paused' } },
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], cached: true } },
+  ], { config: { verbose: true } });
+
+  assert.match(lines[0], /left alone \(nothing to change\)/);
+  assert.match(lines[1], /left alone \(paused\)/);
+  assert.match(lines[2], /left alone \(cached\)/);
+});
 
 /* ------------------------------------------------------------- versions */
 

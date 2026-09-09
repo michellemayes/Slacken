@@ -190,7 +190,7 @@ relaunches. On exit it prints what the session cost.
 | `launch [--force]` | Just relaunch Slack with the debug port open |
 | `attach [--verbose]` | Attach to a Slack that is already launched with the port |
 | `test "<message>"` | Rewrite one string and print the verdict — no Slack needed |
-| `doctor` | Check Slack, `claude`, the debug port, and visible Slack windows |
+| `doctor [--no-model]` | Check Slack, `claude`, one real model call, the debug port, and visible Slack windows |
 | `config` | Print the config file path and contents |
 | `set [<name> <value>]` | List the settings you can change, or change one |
 | `channel [<#name> <setting> <value>]` | What each channel does differently, or change one |
