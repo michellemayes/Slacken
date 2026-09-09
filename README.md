@@ -106,32 +106,52 @@ slacken doctor    # confirm everything is wired up
 slacken start     # quit Slack, relaunch it with the debug port, and begin
 ```
 
-To have it running whenever you are logged in:
+## Running it without a terminal
+
+`slacken start` runs in the foreground and dies with the window you typed it
+into, which is the wrong shape for something you want on all day. Install the
+login agent instead and there is no terminal in it at all:
 
 ```sh
-./install.sh --agent     # or: slacken agent install
+./install.sh --agent     # or, once installed: slacken agent install
 ```
 
 That writes a LaunchAgent at `~/Library/LaunchAgents/com.slacken.agent.plist`
-which starts Slacken at login and restarts it if it ever exits. Because launchd
-does not hand an agent a useful `PATH`, the plist bakes in the directory
-`claude` actually lives in, resolved at install time.
+which starts Slacken at login and restarts it if it ever crashes. Because
+launchd does not hand an agent a useful `PATH`, the plist bakes in the
+directory `claude` actually lives in, resolved at install time. The job is
+marked `Interactive` rather than `Background`: it holds messages hidden while
+the model decides, so a throttled one is a delay you sit and watch.
+
+From then on the menu bar item is the interface — what has been changed, the
+pause, and the settings. Everything else is there when you want it:
 
 ```sh
+slacken status           # the same lines the menu shows
+slacken pause / resume   # from anywhere, terminal or menu
+slacken stop             # stop the daemon, however it was started
+slacken agent restart    # start it again without logging out
 slacken agent status     # installed? running? what pid?
 slacken agent logs       # recent output
 slacken agent uninstall  # stop running at login
 ./install.sh --uninstall # remove the command and the agent
 ```
 
+A deliberate `slacken stop` stays stopped — launchd is asked to restart a
+crash, not a decision — so it comes back at your next login, or when you say
+so. Only one daemon runs at a time: `slacken start` finds one already
+answering, says so and leaves it alone, rather than injecting into the same
+Slack twice, and `slacken agent install` stops the copy you had running by
+hand before handing the job to launchd.
+
 Uninstalling leaves `~/.slacken` (config and cache) alone; delete it by hand if
 you want it gone.
 
 ## Use
 
-Leave `slacken start` running. It attaches to each Slack window as it appears,
-including after you switch workspaces or the app relaunches. On exit it prints
-what the session cost.
+Once it is running — from the agent or from a terminal — it attaches to each
+Slack window as it appears, including after you switch workspaces or the app
+relaunches. On exit it prints what the session cost.
 
 | Command | What it does |
 | --- | --- |
@@ -144,7 +164,8 @@ what the session cost.
 | `set [<name> <value>]` | List the settings you can change, or change one |
 | `status` | What the running daemon has done so far |
 | `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
-| `agent install\|uninstall\|status\|logs` | Manage the login agent |
+| `stop` | Stop the daemon itself, whether you started it or launchd did |
+| `agent install\|uninstall\|restart\|status\|logs` | Manage the login agent |
 
 `--force` lets it quit a running Slack so it can be relaunched with the port.
 `Cmd+Shift+U` inside Slack toggles every original on the screen at once.
@@ -317,7 +338,7 @@ offered anywhere that implies it can.
 | `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
 | `menuBar` | `true` | Show the menu bar item. Needs `swiftc`; without it, skipped |
 | `cdpPort` | `9222` | Slack's debug port |
-| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/moderate`) |
+| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/stop`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
 | `claudeBin` / `claudeArgs` | `claude` / `[]` | If `claude` lives somewhere unusual, or you want extra flags |
 

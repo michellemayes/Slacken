@@ -24,6 +24,21 @@ test('the plist carries a PATH, since launchd does not provide a useful one', as
   assert.equal(new Set(dirs).size, dirs.length, 'no duplicate PATH entries');
 });
 
+test('the agent is not asked to run throttled', async () => {
+  const plist = await buildPlist({ ...DEFAULTS });
+  // launchd throttles Background jobs. This one holds messages hidden while
+  // the model decides, so being throttled is something you sit and watch.
+  assert.ok(!plist.includes('<string>Background</string>'), 'a throttled job would be a visibly slow one');
+  assert.match(plist, /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/);
+});
+
+test('the agent comes back on its own after a crash, but not after a clean stop', async () => {
+  const plist = await buildPlist({ ...DEFAULTS });
+  // KeepAlive with SuccessfulExit false is what makes `slacken stop` stick:
+  // launchd restarts a crash and leaves a deliberate exit alone.
+  assert.match(plist, /<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>/);
+});
+
 test('an absolute claudeBin contributes its own directory', async () => {
   const plist = await buildPlist({ ...DEFAULTS, claudeBin: '/opt/custom/bin/claude' });
   assert.match(plist, /<string>[^<]*\/opt\/custom\/bin[^<]*<\/string>/);

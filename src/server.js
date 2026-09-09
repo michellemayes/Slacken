@@ -16,8 +16,9 @@ import { SETTINGS } from './settings.js';
  *   POST /toggle     whichever of the two applies — what the menu bar clicks
  *   POST /moderate   rewrite one message, for `slacken test` and poking by hand
  *   POST /reinject   reload the page script without restarting the daemon
+ *   POST /stop       shut the daemon down, the way Ctrl-C would
  */
-export function createServer({ config, moderator, state, store, getStatus, reinject }) {
+export function createServer({ config, moderator, state, store, getStatus, reinject, onStop }) {
   const snapshot = () => ({
     paused: Boolean(state?.paused),
     pausedAt: state?.pausedAt ?? null,
@@ -104,6 +105,15 @@ export function createServer({ config, moderator, state, store, getStatus, reinj
       }
       const verdict = await moderator.moderate(body);
       return json(res, 200, verdict);
+    }
+
+    // The terminal is not the only place Slacken gets started from, so it
+    // must not be the only place it can be stopped from. The reply goes out
+    // first; the shutdown happens once it has actually left.
+    if (req.method === 'POST' && url.pathname === '/stop') {
+      if (!onStop) return json(res, 501, { error: 'this daemon cannot stop itself' });
+      res.on('finish', () => onStop('a stop request'));
+      return json(res, 200, { ok: true, stopping: true });
     }
 
     if (req.method === 'POST' && url.pathname === '/reinject') {

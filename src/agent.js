@@ -74,8 +74,11 @@ export async function buildPlist(config) {
     <key>SuccessfulExit</key>
     <false/>
   </dict>
+  <!-- Not Background: launchd throttles those, and this job holds messages
+       hidden while the model decides and draws a menu bar item, so a delay
+       here is a delay you sit and watch. -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>${xml(LOG_PATH)}</string>
   <key>StandardErrorPath</key>
@@ -83,6 +86,10 @@ export async function buildPlist(config) {
 </dict>
 </plist>
 `;
+}
+
+export function agentInstalled() {
+  return fs.existsSync(PLIST_PATH);
 }
 
 async function launchctl(args) {
@@ -121,6 +128,22 @@ export async function uninstallAgent() {
   const existed = fs.existsSync(PLIST_PATH);
   if (existed) fs.unlinkSync(PLIST_PATH);
   return { removed: existed, plist: PLIST_PATH };
+}
+
+// Bring the agent's daemon back without logging out again. `slacken stop`
+// leaves launchd holding a loaded job with nothing running, because a clean
+// exit is not something KeepAlive restarts.
+export async function restartAgent() {
+  if (!fs.existsSync(PLIST_PATH)) throw new Error("no login agent is installed (run 'slacken agent install')");
+  const domain = `gui/${process.getuid()}`;
+  let res = await launchctl(['kickstart', '-k', `${domain}/${LABEL}`]);
+  if (!res.ok) {
+    // Older macOS has no kickstart; load it from scratch instead.
+    await launchctl(['bootout', `${domain}/${LABEL}`]);
+    res = await launchctl(['bootstrap', domain, PLIST_PATH]);
+  }
+  if (!res.ok) throw new Error(`launchctl would not restart the agent: ${res.out.trim().slice(0, 300)}`);
+  return { plist: PLIST_PATH, log: LOG_PATH };
 }
 
 export async function agentStatus() {
