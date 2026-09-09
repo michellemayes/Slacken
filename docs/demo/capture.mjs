@@ -255,7 +255,13 @@ async function main() {
 
   // The demo workspace, plus the menu rendered from the real menuModel().
   const workspace = fs.readFileSync(path.join(HERE, 'workspace.html'));
-  const shown = { ...DEFAULTS, ignoreChannels: ['#deploys', '#random'] };
+  const shown = {
+    ...DEFAULTS,
+    ignoreChannels: ['#deploys', '#random'],
+    // One channel that has been told to behave differently, because a menu
+    // with nothing in that submenu says nothing about what it is for.
+    channelOverrides: { '#eng-oncall': { minSeverity: 3 } },
+  };
   const model = menuModel({
     paused: false,
     attached: 1,
@@ -263,7 +269,10 @@ async function main() {
     model: 'claude-haiku-4-5',
     triageMode: shown.triageMode,
     uptimeMs: 74 * 60 * 1000,
-    stats: { batched: 12, cacheHits: 38, softened: 5, condensed: 3, calls: 4, costUsd: 0.0104 },
+    stats: {
+      batched: 12, cacheHits: 38, softened: 5, condensed: 3, calls: 4,
+      reveals: 2, notifications: 6, costUsd: 0.0104,
+    },
     config: shown,
   });
   const menu = menuHtml(model);

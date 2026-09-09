@@ -5,8 +5,26 @@
   A stand-in for the parts of Slack's rendered DOM that the page script reads.
   Selectors and nesting mirror the real client so the end-to-end test exercises
   the same code paths as the desktop app.
+
+  window.Notification below is Slack's own notification, recorded rather than
+  shown. The page script wraps whatever it finds when it is injected, so this
+  has to be defined before it runs — which is what the real client looks like.
 -->
+<script>
+  window.__notifications = [];
+  window.Notification = function (title, options) {
+    window.__notifications.push({ title: title, body: (options || {}).body });
+    this.title = title;
+    this.close = function () { this.closed = true; };
+  };
+  window.Notification.permission = 'granted';
+  window.Notification.requestPermission = function () { return Promise.resolve('granted'); };
+</script>
+
 <button data-qa="user-button" aria-label="User menu: Michelle Mayes">me</button>
+
+<!-- The column you are reading. Everything in it belongs to its channel. -->
+<div class="p-workspace__primary_view">
 
 <!-- The channel header, where the ignore button hangs itself. -->
 <div class="p-view_header">
@@ -90,7 +108,84 @@ retry(3, () => fetch(url, { timeout: 500 }))
     </div>
   </div>
 
+  <!--
+    A reply broadcast back into the channel. Slack puts a "replied to a thread:"
+    line quoting the parent above the reply, inside the same blocks, and the
+    quote is rich text like everything else: it has to stay out of both the
+    triage and the rewrite.
+  -->
+  <div data-qa="virtual-list-item" id="msg-broadcast">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Ibrahim Diallo</span>
+      <div class="c-message_kit__blocks">
+        <div class="c-message__broadcast_preamble_container">
+          <span class="c-message__broadcast_preamble">replied to a thread:</span>
+          <a class="c-message__broadcast_preamble_link" href="#"><div class="p-rich_text_section">the ddomain bug ran about nine days and cashsearchone was not the only campaign</div></a>
+        </div>
+        <div class="p-rich_text_section">Circling back on the audit with a quick rundown for visibility. As you may recall, we had flagged several areas worth a closer look, and after careful consideration I believe it would be helpful to walk through what we found before the next release. Happy to elaborate on any of it.</div>
+      </div>
+    </div>
+  </div>
+
+  <!--
+    The same reply in a layout with no message_content node. A row we cannot
+    find a body under is a row we never touch and never report on, which is
+    exactly how a thread reply goes quietly unread.
+  -->
+  <div data-qa="virtual-list-item" id="msg-broadcast-bare">
+    <div class="c-message_kit__gutter">
+      <span data-qa="message_sender_name">Ibrahim Diallo</span>
+      <div class="c-message__broadcast_preamble_container">
+        <span class="c-message__broadcast_preamble">replied to a thread:</span>
+        <a class="c-message__broadcast_preamble_link" href="#">the ddomain bug ran about nine days</a>
+      </div>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Wanted to reach out and share a quick rundown of where the audit landed, for visibility. It is worth noting that only two websites were affected here, and that said, neither excluded domain shows up in any list change at all. Let me know if you have any questions.</div>
+      </div>
+    </div>
+  </div>
+
   <div data-qa="virtual-list-item" id="msg-divider">
     <div class="c-message_list__day_divider">Today</div>
+  </div>
+</div>
+
+<!-- What you are about to send. Never rewritten, only ever offered a rewrite. -->
+<div data-qa="message_input">
+  <div class="ql-editor" contenteditable="true"></div>
+</div>
+
+</div><!-- /primary view -->
+
+<!--
+  A thread, open beside the channel. It is a different conversation in a
+  different channel, on the same screen: everything in here belongs to
+  #deploys, whatever the column on the left says.
+-->
+<div class="p-flexpane" data-qa="threads_flexpane">
+  <div class="p-view_header">
+    <div data-qa="channel_name">#deploys</div>
+  </div>
+
+  <div class="c-virtual_list__scroll_container">
+    <div data-qa="virtual-list-item" id="thread-heated">
+      <div data-qa="message_content">
+        <span data-qa="message_sender_name">Dana Wu</span>
+        <div class="c-message_kit__blocks">
+          <div class="p-rich_text_section">SERIOUSLY? The pipeline is STILL red and nobody has said anything!!</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Word for word the padded message in the channel on the left, so the
+         two can be told apart only by which channel they are in. -->
+    <div data-qa="virtual-list-item" id="thread-slop">
+      <div data-qa="message_content">
+        <span data-qa="message_sender_name">Priya Nair</span>
+        <div class="c-message_kit__blocks">
+          <div class="p-rich_text_section">Hey team! I wanted to take a moment to circle back on the deployment pipeline discussion from earlier this week. As you may recall, we had identified several areas where there might be opportunities for improvement. After giving it considerable thought, I believe it would be beneficial for us to consider revisiting the retry logic before the next release. Let me know if you have any questions.</div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>

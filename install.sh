@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Slacken installer for macOS.
+# Slacken installer for macOS and Linux.
 #
 #   ./install.sh              install dependencies and put `slacken` on your PATH
 #   ./install.sh --agent      also start it automatically when you log in
@@ -42,11 +42,13 @@ pick_bin_dir() {
   mkdir -p "$HOME/.local/bin" && printf '%s' "$HOME/.local/bin"
 }
 
+OS="$(uname -s)"
+
 if [ "$UNINSTALL" = "1" ]; then
   printf '\n%sRemoving Slacken%s\n\n' "$BOLD" "$OFF"
-  if [ "$(uname -s)" = "Darwin" ]; then
-    node "$ENTRY" agent uninstall || warn "could not remove the login agent"
-  fi
+  case "$OS" in
+    Darwin|Linux) node "$ENTRY" agent uninstall || warn "could not remove the login agent" ;;
+  esac
   for dir in "/usr/local/bin" "/opt/homebrew/bin" "$HOME/.local/bin" "$HOME/bin"; do
     if [ -L "$dir/slacken" ]; then rm -f "$dir/slacken" && ok "removed $dir/slacken"; fi
   done
@@ -56,7 +58,10 @@ fi
 
 printf '\n%sInstalling Slacken%s\n\n' "$BOLD" "$OFF"
 
-[ "$(uname -s)" = "Darwin" ] || die "Slacken drives the macOS Slack desktop app; this is $(uname -s)."
+case "$OS" in
+  Darwin|Linux) ;;
+  *) die "Slacken drives the Slack desktop app on macOS and Linux; this is $OS." ;;
+esac
 
 command -v node >/dev/null 2>&1 || die "node is not installed. Install Node 20 or newer, then re-run."
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
@@ -70,17 +75,20 @@ else
   warn "Install Claude Code and sign in, then re-run this script."
 fi
 
-if command -v swiftc >/dev/null 2>&1; then
-  ok "swiftc found (the menu bar item will be built on first run)"
+if [ "$OS" = "Darwin" ]; then
+  if command -v swiftc >/dev/null 2>&1; then
+    ok "swiftc found (the menu bar item will be built on first run)"
+  else
+    warn "swiftc is not installed, so there will be no menu bar item."
+    warn "Run 'xcode-select --install' if you want one. Everything else works."
+  fi
 else
-  warn "swiftc is not installed, so there will be no menu bar item."
-  warn "Run 'xcode-select --install' if you want one. Everything else works."
-fi
-
-if [ -d "/Applications/Slack.app" ] || [ -d "$HOME/Applications/Slack.app" ]; then
-  ok "Slack.app found"
-else
-  warn "Slack.app is not in /Applications or ~/Applications"
+  # The menu bar item is AppKit, so there is none here. Everything it shows is
+  # in `slacken status`, which is the same model rendered as lines.
+  warn "no menu bar item on $OS — 'slacken status' says everything it would"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "no systemctl, so there is no login agent either; run 'slacken start' yourself"
+  fi
 fi
 
 printf '\n  installing dependencies…\n'
@@ -91,6 +99,18 @@ else
   npm install --omit=dev --silent
 fi
 ok "dependencies installed"
+
+# Asked of the same code that will look for it at launch, rather than a second
+# list of paths here that could drift from that one. It needs the dependencies
+# above, which is why it is not further up.
+if node --input-type=module -e "
+  import { findSlackApp } from '$REPO_DIR/src/launch.js';
+  process.exit(findSlackApp() ? 0 : 1);
+" 2>/dev/null; then
+  ok "Slack found"
+else
+  warn "could not find the Slack desktop app in the usual places"
+fi
 
 chmod +x "$ENTRY"
 BIN_DIR="$(pick_bin_dir)"

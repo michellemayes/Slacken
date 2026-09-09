@@ -1,6 +1,8 @@
 # Slacken
 
-A calmer reading layer for Slack on macOS. Being bombarded with AI messages? Condense them and even out the tone of all of your team's Slack messages with a simple overlay.
+A calmer reading layer for the Slack desktop app, on macOS and Linux. Being
+bombarded with AI messages? Condense them and even out the tone of all of your
+team's Slack messages with a simple overlay.
 
 Incoming messages get rewritten in place, in the real desktop app, as you read
 them. Two things happen:
@@ -9,10 +11,13 @@ them. Two things happen:
 - **Even out** — messages written at high intensity are re-phrased flat.
 
 Nothing is deleted and nothing is sent anywhere. Every rewrite carries a small
-badge, and one click brings the original back. A menu bar item shows what has
-been changed, adjusts every setting worth adjusting, and pauses the whole
-thing. A button in Slack's own channel header takes the channel you are reading
-out of its way.
+badge, and one click brings the original back. Notifications are caught on the
+way past too, so the sharp version does not reach you in the corner of the
+screen before the calm one reaches you in the channel. A menu bar item shows
+what has been changed, adjusts every setting worth adjusting, and pauses the
+whole thing. A button in Slack's own channel header takes the channel you are
+reading out of its way, settings can differ channel by channel, and everything
+it changed is written down where you can read it back.
 
 ![A Slack channel with two messages rewritten by Slacken, each carrying a badge
 reading "softened" or "condensed" and a "show original" link](docs/images/channel-rewritten.png)
@@ -35,17 +40,20 @@ capitals and the badge now reading "hide original"](docs/images/channel-revealed
 ## How it works
 
 ```
-  Slack.app (Electron)                    slacken (node)
+  Slack (Electron)                        slacken (node)
   ┌──────────────────────┐                ┌────────────────────────┐
   │ renderer             │                │ poll /json/list        │
   │  client/inject.js    │◄── CDP ────────┤ attach + inject        │
   │   · find messages    │    :9222       │                        │
-  │   · local triage     │                │ Runtime.addBinding     │
-  │   · hold suspects    ├── binding ────►│  ├─ cache lookup       │
-  │   · swap in rewrite  │                │  ├─ 120ms batch window │
-  │   · reveal toggle    │◄── evaluate ───┤  └─ claude -p ──► 🤖   │
+  │   · which column     │                │ Runtime.addBinding     │
+  │   · local triage     ├── binding ────►│  ├─ cache lookup       │
+  │   · hold suspects    │                │  ├─ 120ms batch window │
+  │   · swap in rewrite  │◄── evaluate ───┤  └─ claude -p ──► 🤖   │
+  │   · reveal toggle    │                │                        │
+  │   · notifications    │── reveal ─────►│  history.jsonl         │
+  │   · your own draft   │── health ─────►│  drifted?              │
   └──────────────────────┘                └───────────┬────────────┘
-                                                      │ :8787
+                                                      │ :8787 + token
   ┌──────────────────────┐                ┌───────────┴────────────┐
   │ menu bar             │◄── GET  /menubar ── the menu, rendered  │
   │  SlackenMenuBar      │─── POST /pause ──► pause / resume       │
@@ -80,21 +88,43 @@ capitals and the badge now reading "hide original"](docs/images/channel-revealed
    Slack's content security policy is not involved and no HTTP request leaves
    the page.
 7. Messages that arrive together are batched into one
-   `claude -p --output-format json` call. Verdicts are cached on disk by
-   message text, so re-reading a channel is free, and kept in the renderer as
-   well so a reload repaints its rewrites without a round trip.
+   `claude -p --output-format json` call. Verdicts are cached on disk by the
+   message text *and the settings it was judged against*, so re-reading a
+   channel is free, the same message in two channels with different settings is
+   two questions rather than one wrong answer, and a rewrite is kept in the
+   renderer as well so a reload repaints without a round trip.
+8. Which channel a message is in is read from the column it is in, not from the
+   page. A thread open beside a channel is two conversations on one screen, and
+   ignoring `#deploys` has to mean the thread in `#deploys` too.
+9. `window.Notification` is wrapped in the renderer, so a notification whose
+   body looks heated is held rather than raised and then corrected — you would
+   have read it by then. If the verdict has not arrived in 2.5 seconds the
+   original is raised anyway: a notification that never arrives is a message
+   you never knew about.
 
 ## Install
 
-macOS, Node 20+, and `claude` on your `PATH` and signed in (`claude -p "hi"`
-should work). The menu bar item is compiled on first run and needs `swiftc`
-from the Xcode Command Line Tools (`xcode-select --install`); without it
-everything else works and the daemon says so once.
+Node 20+, and `claude` on your `PATH` and signed in (`claude -p "hi"` should
+work). macOS and Linux are installed and run at login the same way; on Windows
+`slacken launch`, `attach` and `start` work from a terminal, and there is no
+login agent and no menu bar item.
+
+The menu bar item is macOS only: it is compiled on first run and needs `swiftc`
+from the Xcode Command Line Tools (`xcode-select --install`). Without it
+everything else works, the daemon says so once, and `slacken status` prints the
+same lines the menu would have shown.
 
 ```sh
 git clone https://github.com/michellemayes/Slacken.git
 cd Slacken
 ./install.sh
+```
+
+Or, through a tap, on a Mac:
+
+```sh
+brew tap michellemayes/slacken https://github.com/michellemayes/Slacken
+brew install slacken
 ```
 
 That checks your setup, installs dependencies, and puts `slacken` on your PATH.
@@ -115,12 +145,14 @@ login agent instead and there is no terminal in it at all:
 ./install.sh --agent     # or, once installed: slacken agent install
 ```
 
-That writes a LaunchAgent at `~/Library/LaunchAgents/com.slacken.agent.plist`
-which starts Slacken at login and restarts it if it ever crashes. Because
-launchd does not hand an agent a useful `PATH`, the plist bakes in the
-directory `claude` actually lives in, resolved at install time. The job is
-marked `Interactive` rather than `Background`: it holds messages hidden while
-the model decides, so a throttled one is a delay you sit and watch.
+On macOS that writes a LaunchAgent at
+`~/Library/LaunchAgents/com.slacken.agent.plist`; on Linux a systemd user unit
+at `~/.config/systemd/user/slacken.service`. Both start Slacken at login and
+restart it if it ever crashes, and both bake in the directory `claude` actually
+lives in, resolved at install time, because neither launchd nor a login session
+hands a job a useful `PATH`. The macOS job is marked `Interactive` rather than
+`Background`: it holds messages hidden while the model decides, so a throttled
+one is a delay you sit and watch.
 
 From then on the menu bar item is the interface — what has been changed, the
 pause, and the settings. Everything else is there when you want it:
@@ -136,8 +168,8 @@ slacken agent uninstall  # stop running at login
 ./install.sh --uninstall # remove the command and the agent
 ```
 
-A deliberate `slacken stop` stays stopped — launchd is asked to restart a
-crash, not a decision — so it comes back at your next login, or when you say
+A deliberate `slacken stop` stays stopped — launchd and systemd are both asked
+to restart a crash, not a decision — so it comes back at your next login, or when you say
 so. Only one daemon runs at a time: `slacken start` finds one already
 answering, says so and leaves it alone, rather than injecting into the same
 Slack twice, and `slacken agent install` stops the copy you had running by
@@ -161,7 +193,12 @@ relaunches. On exit it prints what the session cost.
 | `doctor [--no-model]` | Check Slack, `claude`, one real model call, the debug port, and visible Slack windows |
 | `config` | Print the config file path and contents |
 | `set [<name> <value>]` | List the settings you can change, or change one |
+| `channel [<#name> <setting> <value>]` | What each channel does differently, or change one |
+| `history [--lines N] [--json]` | What has been rewritten, and what you asked back |
+| `token` | Print the control API token |
+| `version [--check]` | What this is, and whether there is a newer one |
 | `status` | What the running daemon has done so far |
+| `inspect` | What Slacken makes of each message on screen, and why |
 | `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
 | `stop` | Stop the daemon itself, whether you started it or launchd did |
 | `agent install\|uninstall\|restart\|status\|logs` | Manage the login agent |
@@ -181,6 +218,29 @@ slacken set triageMode always
 slacken set ignoreChannels "#deploys, #random"
 ```
 
+### When a message was left as written
+
+`slacken status` says what Slacken did. `slacken inspect` says what it decided
+not to do, message by message, reading the Slack window you are looking at
+right now:
+
+```
+#eng-oncall — 9 message(s) on screen
+  Ibrahim Diallo [thread reply]: Circling back on the audit with a quick rundown for visibility. As you
+    rewritten
+  Alex Kim: Migration 0042 adds a partial index on events.created_at and drops the
+    read as written; tone 0 of 2 needed, padding 0 of 1 needed, 56 words
+  Priya Nair: Hey team! I wanted to take a moment to circle back on the deployment
+    off screen; it gets looked at when you scroll to it
+```
+
+The last line of each entry is the answer: a message can go untouched because
+triage cleared it, because you wrote it, because the channel is ignored, or
+because it never scrolled into view. A message Slacken cannot find a body under
+is reported too, rather than passed over in silence — that is what a Slack
+layout this does not read yet looks like from the outside, and it is worth
+opening an issue over.
+
 ## The menu bar item
 
 While the daemon runs there is an item in the menu bar. It is the answer to the
@@ -192,7 +252,16 @@ counts of messages rewritten and model calls made, the running cost, a Settings
 submenu and an item to open the log](docs/images/menu-bar.png)
 
 The icon dims whenever nothing is being changed — paused, or attached to no
-Slack window — so the state is readable without opening anything.
+Slack window — so the state is readable without opening anything, and turns to
+a warning if the page script stops finding messages at all.
+
+Three lines only appear when there is something to say. **N originals asked
+for back** counts the badges you clicked, which is the one number here about
+whether Slacken is getting it right rather than how much it is doing. **N
+notifications checked before it arrived** is how you can tell whether the
+notification path is working on your build of Slack. And a failed model call is
+named rather than counted: *Not signed in to Claude — run: claude login* is
+something you can act on, where *3 errors* is not.
 
 **Pause** is the important one. It does not merely stop new rewrites: every
 message already swapped out on screen flips back to what its sender actually
@@ -247,6 +316,117 @@ outlive the daemon even if that daemon is killed outright.
 Without `swiftc` there is no item, one line says so at startup, and everything
 else runs unchanged. Set `menuBar` to `false` in the config to skip it, or
 click **Hide menu bar item** to dismiss it for this run.
+
+### Settings that differ channel by channel
+
+Sensitivity is not one answer. `#eng-oncall` at 3am is not `#design-crit`, and
+"leave it alone entirely" is a blunt way to say "not so eagerly here".
+
+```sh
+slacken channel                              # what each channel does differently
+slacken channel "#eng-oncall" minSeverity 3  # only soften what is actually hostile
+slacken channel "#announcements" condenseEnabled off
+slacken channel "#eng-oncall" reset          # back to the global settings
+```
+
+`triageMode`, `triageThreshold`, `minSeverity`, `condenseEnabled`,
+`condenseMinWords` and `maxChars` can differ per channel. The rest cannot: which
+model to use and what it may spend in a day are decisions about Slacken, not
+about a conversation, and a channel is the wrong place to keep an answer to
+them. A channel that has been given settings of its own appears in the menu bar
+under **Per-channel settings**, with the same choices as the global ones and a
+way back to them.
+
+Verdicts are cached against the settings that produced them, so moving a
+threshold does not throw the cache away — it makes the old verdicts unreachable,
+and moving it back finds them again.
+
+## Notifications
+
+The rewriting above happens once you are looking at the channel. A notification
+arrives before that, in full, in the corner of the screen — which is where a
+calmer reading layer is least able to help and most needed.
+
+Slacken wraps `window.Notification` in the Slack renderer. A body that clears
+local triage is held rather than shown: the real notification is not raised
+until the verdict lands, and then it is raised with the rewrite. Raising the
+original and correcting it a second later would be worse than not trying, since
+you would have read it by then. A verdict that has not arrived within 2.5
+seconds gives up and raises the original — a notification that never arrives is
+a message you never knew about, which is the one outcome worse than a blunt
+banner.
+
+This depends on Slack raising its notifications from the renderer, which not
+every build does. Nothing breaks if it does not; the count in the menu bar
+simply stays at zero, which is how you can tell. Turn it off with
+**Rewrite notifications too**, or `slacken set rewriteNotifications off`.
+
+## Your own drafts
+
+Off by default, and the one thing here that comes anywhere near what you write.
+
+With **Look at what I am about to send** on, a draft that reads sharp gets a
+small bar above the composer with a flatter wording in it, and two buttons.
+Nothing happens to your message until you click **Use this** — and when you do,
+the text is typed rather than assigned, so it lands in Slack's own undo stack
+and `Cmd-Z` gives you your words back. Nothing is ever sent. Only tone is
+offered, never condensing: how long your own message is, is your business.
+
+Drafts are never written to the history file. What you nearly said is not this
+tool's business either.
+
+## What it changed
+
+The counts in the menu bar say whether Slacken is doing anything. The question
+the tool actually raises is *what did it decide I did not need to read*, and by
+the time you think to ask, the message has scrolled away.
+
+```sh
+slacken history              # the last 40 changes, most recent last
+slacken history --lines 200
+slacken history --json       # one JSON object per line, for grep and jq
+```
+
+Every rewrite is appended to `~/.slacken/history.jsonl` with both texts, and so
+is every time you clicked a badge to get an original back. **Recent changes…**
+in the menu bar opens the same file. It is capped at `historyMaxEntries` lines,
+long messages are stored shortened, and `historyEnabled` turns it off.
+
+## The control API needs a token
+
+`127.0.0.1` keeps the control API off the network. It does not keep it away
+from anything else running on your machine, and behind it is what you have been
+reading, what it cost, an endpoint that will spend your Claude account on any
+text at all, and a way to stop the daemon.
+
+So the daemon writes a token to `~/.slacken/token`, readable only by you, and
+everything that talks to it sends that token: the CLI reads the file, and the
+menu bar helper is handed it in its environment rather than on a command line,
+where `ps` would show it to everyone. Only `GET /health` is left open — it is
+how a second `slacken start` finds the first one — and it says nothing but that
+a Slacken is here and whether it is paused.
+
+By hand:
+
+```sh
+curl -H "Authorization: Bearer $(slacken token)" http://127.0.0.1:8787/status
+```
+
+## When Slack changes underneath it
+
+Slack's DOM is not a public API, and the failure when it moves is silent by
+construction: the page stops finding messages, and everything goes on looking
+fine.
+
+So the page script reports what it is finding. List items with no message
+bodies inside them is the signature of a renamed class — the list is still the
+list and the words are not where they were — and that turns the menu bar icon
+and its first line into a warning, and makes `slacken doctor` say so. Finding
+no list items at all is not evidence of anything: that is also what an empty
+channel and a loading window look like.
+
+The selectors are all at the top of `client/inject.js`, and `POST /reinject`
+reloads the script without restarting the daemon.
 
 ## Ignoring a channel, from inside Slack
 
@@ -322,7 +502,11 @@ screen.
 | `selfNames` | `[]` | Fallback if your display name is not detected from the Slack UI |
 | `ignoreSenders` | `[]` | Never rewrite these people |
 | `ignoreChannels` | `[]` | Never rewrite in these channels — the button in Slack's channel header edits this |
+| `channelOverrides` | `{}` | Settings for one channel: `{"#eng": {"minSeverity": 3}}`. `slacken channel` edits this |
 | `maxChars` | `4000` | Longer messages are left alone |
+| `rewriteNotifications` | `true` | Rewrite a notification body before it is shown, not after you read it |
+| `draftCheck` | `false` | Offer a flatter wording for what you are about to send. Never edits or sends anything |
+| `historyEnabled` | `true` | Append every rewrite to `~/.slacken/history.jsonl` |
 | `verbose` | `false` | Log every verdict |
 
 These are read at startup. Change one in the file and restart the daemon — a
@@ -335,7 +519,10 @@ offered anywhere that implies it can.
 | `maxConcurrency` | `2` | Concurrent `claude -p` processes |
 | `useJsonSchema` | `true` | Structured output; guarantees parseable verdicts |
 | `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
-| `menuBar` | `true` | Show the menu bar item. Needs `swiftc`; without it, skipped |
+| `menuBar` | `true` | Show the menu bar item (macOS). Needs `swiftc`; without it, skipped |
+| `retries` | `1` | How many times a failed call is tried again. Being signed out is never retried |
+| `historyMaxEntries` | `2000` | How much of the record to keep |
+| `checkUpdates` | `false` | Ask GitHub once a day whether there is a newer Slacken |
 | `cdpPort` | `9222` | Slack's debug port |
 | `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/stop`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
@@ -356,15 +543,27 @@ always one click away. For a channel where you cannot afford any filtering, use
 
 **Message text is sent to Claude.** Everything that clears local triage goes to
 the model through `claude -p`, under your own Claude account and its data
-policies. Verdicts are cached in plain text at `~/.slacken/cache.json`. If you
-work in channels where that is not acceptable, use `ignoreChannels` or do not
-run this there.
+policies. Verdicts are cached in plain text at `~/.slacken/cache.json`, and
+every rewrite is written to `~/.slacken/history.jsonl` with both texts unless
+`historyEnabled` is off. If you work in channels where that is not acceptable,
+use `ignoreChannels` or do not run this there.
+
+**The daily budget is a property of the day, not of this process.** It is
+written to `~/.slacken/state.json` as it is spent, so restarting the daemon —
+which the login agent does on every crash and at every login — does not hand
+it back.
 
 **The debug port is powerful.** While Slack runs with `--remote-debugging-port`,
-any process on your Mac that can reach `127.0.0.1:9222` can drive your logged-in
-Slack session. Chromium binds it to loopback only, but this is still a real
-widening of what a local process can do. Close it by quitting and reopening
-Slack normally.
+any process on your machine that can reach `127.0.0.1:9222` can drive your
+logged-in Slack session. Chromium binds it to loopback only, but this is still a
+real widening of what a local process can do. Close it by quitting and reopening
+Slack normally. Slacken's own control port is narrower than that on purpose: it
+needs the token in `~/.slacken/token`, which nothing else on the machine can
+read.
+
+**Nothing here talks to anything but your own machine, except one thing you
+turn on.** `checkUpdates` asks GitHub once a day whether there is a newer
+release. It is off by default and sends nothing but the request.
 
 **You can always turn it off without turning it off.** Pause from the menu bar
 and every rewrite on screen reverts to what was written, immediately, with no
@@ -377,9 +576,15 @@ client. It never edits, deletes, or replies to anything, nobody else can tell
 it is running, and it does not touch messages you write.
 
 **Slack's DOM is not a public API.** Slack can rename a class and break message
-detection. When that happens, the selectors are all in one place at the top of
-`client/inject.js`, and `POST /reinject` reloads the script without restarting
-the daemon.
+detection. Slacken notices and says so — see *When Slack changes underneath it*
+above — the selectors are all in one place at the top of `client/inject.js`, and
+`POST /reinject` reloads the script without restarting the daemon.
+
+**Notifications and drafts are the two places Slacken reaches past reading.**
+The notification path depends on Slack raising notifications from its renderer,
+and says how many it has actually seen so you can tell whether it is doing
+anything. The draft check is off unless you turn it on, offers rather than
+edits, and never sends.
 
 ## Tests
 
@@ -392,18 +597,36 @@ npm run test:fast   # skips the browser test
   decides when a verdict is allowed to change the screen.
 - `test/batch.mjs` — the batching, caching and budget logic that make this
   cheap, run against a fake `claude` binary that records how many times it was
-  actually invoked. Asserts that four simultaneous messages cost one process.
-- `test/agent.mjs` — the generated LaunchAgent plist, including that it carries
-  a `PATH` that can actually find `claude`.
+  actually invoked. Asserts that four simultaneous messages cost one process,
+  that the day's spend survives a restart and the cap with it, that a transient
+  failure is tried again and a signed-out one is not, and that the same message
+  in two channels with different settings is two questions.
+- `test/agent.mjs` — the generated LaunchAgent plist and systemd unit,
+  including that both carry a `PATH` that can actually find `claude`, that both
+  come back after a crash and stay stopped after a stop, and that both log to
+  the same place so `slacken agent logs` needs no platform.
+- `test/history.mjs` — the record: that a rewrite is written with both texts and
+  a message left alone is not written at all, that turning it off stops the next
+  line rather than the next daemon, that a pasted stack trace is stored
+  shortened, that the file is capped keeping the newest, and that a line
+  half-written by a daemon killed mid-append costs one line rather than the
+  file.
 - `test/control.mjs` — pausing, settings, and the menu the menu bar item draws.
   Asserts that a pause survives a restart, that a paused Slacken makes no model
   call and caches nothing, that the control endpoints agree with each other, and
-  that the menu offers exactly one of pause and resume. On settings: that a
+  that the menu offers exactly one of pause and resume. On the token: that
+  every endpoint but `/health` refuses a request without one, that a wrong one
+  changes nothing on its way to being refused, and that the file is written once
+  and readable by nobody else. On settings: that a
   refused value leaves the old one standing, that a patch with one bad value in
   it is refused whole, that a change reaches disk without rewriting the keys
   around it, that the config object handed out at startup is the one that
   changes, that ignoring a channel twice ignores it once, and that a checkmark
-  in the menu can never disagree with the daemon. It also covers the
+  in the menu can never disagree with the daemon; and on per-channel settings:
+  that one setting joins another rather than replacing it, that a setting which
+  cannot honestly differ per channel is refused, that clearing one channel is
+  not collateral for the next, and that drift is list items with no message
+  bodies in them and nothing else. It also covers the
   helper around the helper: the compile is cached by source hash and never
   repeated, a failed compile leaves nothing that looks finished, closing stdin
   is what stops the item outliving the daemon, and a crashing one is retried
@@ -429,13 +652,22 @@ npm run test:fast   # skips the browser test
   list, gives back every original on screen, and stops new messages there
   costing anything; clicking it again brings the rewrites back; and a setting
   changed on the daemon reaches the page and is acted on without a reload.
-  It finds any Chromium on the machine and skips itself if there is none;
-  `SLACKEN_TEST_CHROME` overrides the search.
+  The fixture has a thread open beside the channel, so it also asserts that a
+  message in the thread is attributed to the thread's channel rather than the
+  column beside it, and that a per-channel setting changes that channel and
+  leaves the identical message in the other one alone. And the paths that reach
+  past reading: a heated notification is rewritten before it is raised and
+  raised exactly once, a calm one is raised immediately and costs nothing, a
+  draft is not looked at until you turn the draft check on, a sharp one is then
+  offered a flatter wording, and the composer is only changed when you click.
+  Clicking a badge is asserted to reach the daemon, and closing it again to say
+  nothing. It finds any Chromium on the machine and skips itself if there is
+  none; `SLACKEN_TEST_CHROME` overrides the search.
 
 CI runs the suite on macOS and Linux against Node 20 and 22, separately
-installs, exercises and uninstalls the installer on a real macOS runner, and
-builds the menu bar helper with `swiftc` there — the only way to find out
-whether AppKit code still compiles is to compile it.
+installs, exercises and uninstalls the installer on both, and builds the menu
+bar helper with `swiftc` on macOS — the only way to find out whether AppKit
+code still compiles is to compile it.
 
 ## The images above
 
@@ -463,22 +695,27 @@ fastest way to see the change.
 ## Layout
 
 ```
-install.sh           macOS installer and uninstaller
+install.sh           installer and uninstaller (macOS, Linux)
 bin/slacken.js       CLI entry point
 src/cli.js           commands, logging, arg parsing
-src/launch.js        find, quit, and relaunch Slack.app with the debug port
-src/agent.js         the login agent: plist generation and launchctl
+src/launch.js        find, quit, and relaunch Slack with the debug port
+src/agent.js         the login agent: a LaunchAgent or a systemd user unit
 src/cdp.js           minimal Chrome DevTools Protocol client
 src/attach.js        attach to Slack windows, inject, serve binding calls
 src/moderate.js      batch, run claude -p, parse and gate the verdicts
-src/state.js         paused or not, persisted across restarts
+src/state.js         paused or not, and today's spend, across restarts
+src/history.js       the record of what was changed, and what was asked back
+src/auth.js          the control API token
+src/version.js       what this is, and whether there is a newer one
 src/menubar.js       render the menu, build and supervise the helper
 src/prompt.js        the rewriting prompt and response schema
 src/cache.js         disk-backed verdict cache
 src/server.js        loopback control API
 src/config.js        defaults, ~/.slacken/config.json, the live settings store
 src/settings.js      what can be changed while it runs, and what a valid value is
-client/inject.js     the page script: find, triage, hold, replace, reveal
+client/inject.js     the page script: find, triage, hold, replace, reveal,
+                     notifications, the draft check
+Formula/slacken.rb   a Homebrew formula, for a tap
 menubar/             SlackenMenuBar.swift, the menu bar item itself
 docs/demo/           the fake workspace and capture script behind the images
 ```

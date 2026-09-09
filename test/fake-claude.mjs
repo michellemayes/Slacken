@@ -17,8 +17,23 @@ process.stdin.on('end', () => {
   if (log) fs.appendFileSync(log, `${JSON.stringify({ count: items.length, ids: items.map((i) => i.id) })}\n`);
 
   if (process.env.FAKE_CLAUDE_FAIL === '1') {
-    process.stderr.write('simulated failure\n');
+    process.stderr.write(`${process.env.FAKE_CLAUDE_MESSAGE || 'simulated failure'}\n`);
     process.exit(2);
+  }
+
+  // Fail the first N invocations and then work, so a retry can be told apart
+  // from a call that was always going to succeed. The count is kept in a file
+  // because each invocation is a new process.
+  const failTimes = Number(process.env.FAKE_CLAUDE_FAIL_TIMES || 0);
+  if (failTimes > 0) {
+    const counter = process.env.FAKE_CLAUDE_COUNTER;
+    let failed = 0;
+    try { failed = Number(fs.readFileSync(counter, 'utf8')) || 0; } catch { failed = 0; }
+    if (failed < failTimes) {
+      fs.writeFileSync(counter, String(failed + 1));
+      process.stderr.write(`${process.env.FAKE_CLAUDE_MESSAGE || 'simulated transient failure'}\n`);
+      process.exit(2);
+    }
   }
 
   const verdicts = items.map((item) => ({

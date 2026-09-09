@@ -214,6 +214,10 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         hold: pick('msg-hold'),
         arrived: pick('msg-arrived'),
         inflight: pick('msg-inflight'),
+        threadHeated: pick('thread-heated'),
+        threadSlop: pick('thread-slop'),
+        broadcast: pick('msg-broadcast'),
+        bare: pick('msg-broadcast-bare'),
       });
     })()`);
 
@@ -256,6 +260,75 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.equal(state.slop.rewrite, 'CONDENSED to one sentence.');
       assert.equal(state.slop.label, 'condensed', 'the badge should say what it did');
       assert.ok(asked.some((a) => a.text.startsWith('Hey team! I wanted to take a moment')));
+    });
+
+    await t.test('a thread reply broadcast to the channel is condensed like any other', async () => {
+      const p = JSON.parse(await waitFor('the broadcast reply to be handled', async () => {
+        const raw = await snapshot();
+        return JSON.parse(raw).broadcast?.state === 'done' ? raw : null;
+      }));
+      assert.equal(p.broadcast.bodyState, 'hidden');
+      assert.equal(p.broadcast.rewrite, 'CONDENSED to one sentence.');
+    });
+
+    await t.test('the quoted parent of a thread reply is neither read nor rewritten', () => {
+      const reply = asked.find((a) => a.text.startsWith('Circling back on the audit'));
+      assert.ok(reply, 'the broadcast reply should have been sent for moderation');
+      assert.ok(
+        !reply.text.includes('replied to a thread'),
+        'Slack\'s own preamble is not something anyone wrote in this channel',
+      );
+      assert.ok(
+        !reply.text.includes('cashsearchone'),
+        'the quoted parent belongs to the thread, not to the message being rewritten',
+      );
+    });
+
+    await t.test('a thread reply with no message_content node is still read', async () => {
+      const p = JSON.parse(await waitFor('the bare-layout reply to be handled', async () => {
+        const raw = await snapshot();
+        return JSON.parse(raw).bare?.state === 'done' ? raw : null;
+      }));
+      assert.equal(p.bare.rewrite, 'CONDENSED to one sentence.');
+      const reply = asked.find((a) => a.text.startsWith('Wanted to reach out'));
+      assert.ok(reply, 'a layout we do not recognise must not swallow the message');
+      assert.equal(reply.sender, 'Ibrahim Diallo');
+    });
+
+    await t.test('the inspector says why a message was left as written', async () => {
+      const report = JSON.parse(await read(`JSON.stringify(window.__slackenInspect())`));
+      assert.equal(report.channel, '#eng-oncall');
+      assert.equal(report.missedCount, 0, 'every message in this layout should be accounted for');
+
+      const broadcast = report.rows.find((r) => r.head.startsWith('Circling back on the audit'));
+      assert.ok(broadcast, 'the broadcast reply should be in the report');
+      assert.equal(broadcast.threadReply, true, 'it should be recognised as a thread reply');
+
+      assert.ok(
+        !report.rows.some((r) => r.why.startsWith('no message body')),
+        'a day divider is not a message Slacken failed to read',
+      );
+
+      const dense = report.rows.find((r) => r.head.startsWith('Migration 0042'));
+      assert.match(
+        dense.why,
+        /read as written; tone \d+ of \d+ needed, padding \d+ of 1 needed/,
+        'a message left as written should say what it fell short of',
+      );
+    });
+
+    await t.test('the inspector counts messages in a layout it cannot read', async () => {
+      const missed = JSON.parse(await read(`(() => {
+        const row = document.createElement('div');
+        row.innerHTML = '<div data-qa="message_content"><div class="c-message_kit__blocks">'
+          + '<div class="p-rich_text_section">a shape we do not know</div></div></div>';
+        document.body.append(row);
+        const report = window.__slackenInspect();
+        row.remove();
+        return JSON.stringify({ count: report.missedCount, sample: report.missed[0] });
+      })()`));
+      assert.equal(missed.count, 1);
+      assert.match(missed.sample, /a shape we do not know/);
     });
 
     await t.test('a long but fact-dense message is left alone', () => {
@@ -413,6 +486,14 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       document.querySelector('.c-virtual_list__scroll_container').appendChild(item);
     })()`);
 
+    // Typed rather than assigned: the draft check listens for input events,
+    // the way it does in Slack.
+    const type = (selector, text) => read(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      el.textContent = ${JSON.stringify(text)};
+      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    })()`);
+
     await t.test('a message that arrives during a pause is never sent to the model', async () => {
       const before = asked.length;
       await arrive('msg-arrived', 'THIS IS COMPLETELY UNACCEPTABLE!! Why has NOBODY fixed the build??');
@@ -511,10 +592,15 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.equal(now.ignored, '1');
 
       // Ignoring a channel is not a promise about new messages only: it also
-      // has to stop costing anything.
+      // has to stop costing anything. Counted per channel rather than per
+      // window: the thread open beside this one is in #deploys and is nobody's
+      // business but its own.
+      const here = () => asked.filter((a) => a.channel === '#eng-oncall').length;
+      const spentHere = here();
       await arrive('msg-ignored', 'THIS IS STILL COMPLETELY UNACCEPTABLE!! Answer me RIGHT NOW!!');
       await sleep(1200);
-      assert.equal(asked.length, before, 'nothing in an ignored channel is worth a model call');
+      assert.equal(here(), spentHere, 'nothing in an ignored channel is worth a model call');
+      assert.ok(before <= asked.length, 'and the thread beside it carries on as it was');
     });
 
     await t.test('clicking it again puts the channel back', async () => {
@@ -528,6 +614,163 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.match(back.rewrite, /^NEUTRAL\(/);
       assert.equal(back.bodyVisible, false);
       assert.equal(JSON.parse(await button()).label, 'Ignore in Slacken');
+    });
+
+    /* A thread open beside a channel is a second conversation on one screen. */
+
+    await t.test('a message in a thread belongs to the thread\'s channel', async () => {
+      const thread = await waitFor('the thread pane to be handled', async () => {
+        const p = JSON.parse(await snapshot()).threadHeated;
+        return p?.state === 'done' ? p : null;
+      });
+      assert.match(thread.rewrite, /^NEUTRAL\(/);
+
+      const heated = asked.find((a) => a.text.startsWith('SERIOUSLY?'));
+      assert.ok(heated, 'the thread message should have been sent for moderation');
+      assert.equal(heated.channel, '#deploys',
+        'reading the page once would have called this #eng-oncall, which is the column beside it');
+      assert.equal(heated.sender, 'Dana Wu');
+    });
+
+    await t.test('a per-channel setting changes that channel and nothing else', async () => {
+      // The same words are on screen twice: once in #eng-oncall and once in
+      // the thread. Told to leave #deploys' padding alone, exactly one of them
+      // should change.
+      const both = JSON.parse(await waitFor('both copies to be condensed', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.slop?.state === 'done' && p.threadSlop?.state === 'done' ? JSON.stringify(p) : null;
+      }));
+      assert.equal(both.slop.rewrite, 'CONDENSED to one sentence.', 'both copies start out condensed');
+      assert.equal(both.threadSlop.rewrite, 'CONDENSED to one sentence.');
+
+      const before = asked.filter((a) => a.channel === '#deploys').length;
+      store.update({ channelOverrides: { '#deploys': { condenseEnabled: false, triageThreshold: 6 } } });
+
+      const after = JSON.parse(await waitFor('the override to land', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.slop?.state === 'done' && p.threadSlop?.state === 'clean' ? JSON.stringify(p) : null;
+      }));
+      assert.equal(after.slop.rewrite, 'CONDENSED to one sentence.', 'the channel is unchanged');
+      assert.equal(after.threadSlop.rewrite, null, 'and the thread is left as it was written');
+      assert.equal(after.threadSlop.bodyVisible, true);
+      assert.equal(
+        asked.filter((a) => a.channel === '#deploys').length,
+        before,
+        'a channel that is not asking about anything should not be paying for anything',
+      );
+
+      // Put it back, so what follows is not reading a screen half in another
+      // channel's settings.
+      store.update({ channelOverrides: {} });
+      await waitFor('the thread to come back', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.threadSlop?.state === 'done';
+      });
+    });
+
+    await t.test('asking for an original back is reported to the daemon', async () => {
+      const before = events.filter((e) => e.type === 'reveal').length;
+      await read(`document.querySelector('#msg-heated .slacken-badge').click()`);
+
+      const reveal = await waitFor('the reveal to reach the daemon', () => {
+        const seen = events.filter((e) => e.type === 'reveal');
+        return seen.length > before ? seen.at(-1) : null;
+      });
+      assert.equal(reveal.channel, '#eng-oncall');
+      assert.equal(reveal.sender, 'Dana Wu');
+      assert.equal(reveal.kind, 'softened', 'what was revealed, not just that something was');
+      assert.ok(attacher.moderator.stats.reveals > 0);
+
+      // Hiding it again says nothing: you have already read it.
+      const quiet = events.filter((e) => e.type === 'reveal').length;
+      await read(`document.querySelector('#msg-heated .slacken-badge').click()`);
+      await sleep(400);
+      assert.equal(events.filter((e) => e.type === 'reveal').length, quiet);
+    });
+
+    await t.test('the page says what it can see, so a Slack that moves is noticed', async () => {
+      await read('window.__slackenReportHealth && window.__slackenReportHealth()');
+      const health = await waitFor('a health report', () => attacher.health);
+      assert.ok(health.items > 0, 'it should be finding list items');
+      // Not every list item is a message — the day divider is one too — so
+      // what matters is that the words are being found at all.
+      assert.ok(health.bodies > 0, 'and message bodies inside them');
+      assert.ok(health.bodies <= health.items);
+      assert.equal(attacher.drifted, false);
+
+      // What a renamed class looks like from here.
+      attacher.health = { at: Date.now(), items: health.items, bodies: 0 };
+      assert.equal(attacher.drifted, true);
+      attacher.health = health;
+    });
+
+    /* The message you are hit with before you are looking at the channel. */
+
+    await t.test('a heated notification is rewritten before it is shown', async () => {
+      await read(`window.__notifications.length = 0`);
+      await read(`window.__slackenNotified = new Notification('Dana Wu (#eng-oncall)', {
+        body: 'WHY has NOBODY fixed the build?? This is UNACCEPTABLE, I need it by 3pm.',
+      })`);
+
+      const raised = JSON.parse(await waitFor('the notification to be raised', async () => {
+        const out = await read(`JSON.stringify(window.__notifications)`);
+        return JSON.parse(out).length ? out : null;
+      }));
+      assert.equal(raised.length, 1, 'the original must never be raised and then corrected');
+      assert.match(raised[0].body, /^NEUTRAL\(/);
+      assert.equal(raised[0].title, 'Dana Wu (#eng-oncall)');
+      assert.ok(asked.some((a) => a.text.startsWith('WHY has NOBODY fixed the build')));
+    });
+
+    await t.test('a calm notification is raised immediately, untouched', async () => {
+      await read(`window.__notifications.length = 0`);
+      const before = asked.length;
+      await read(`new Notification('Sam Ortiz', { body: 'Deploy is queued behind the migration.' })`);
+
+      // Immediately: no round trip, so it is already there rather than on the
+      // way.
+      const raised = JSON.parse(await read(`JSON.stringify(window.__notifications)`));
+      assert.equal(raised.length, 1);
+      assert.equal(raised[0].body, 'Deploy is queued behind the migration.');
+      assert.equal(asked.length, before, 'nothing calm is worth a call');
+    });
+
+    /* What you are about to send. */
+
+    await t.test('a draft is looked at only when you have asked for that', async () => {
+      const before = asked.length;
+      await type('.ql-editor', 'WHY has nobody looked at this?? It is UNACCEPTABLE.');
+      await sleep(2000);
+      assert.equal(asked.length, before, 'the default is that Slacken never reads what you write');
+      assert.equal(await read(`document.querySelector('.slacken-draft') ? 1 : 0`), 0);
+    });
+
+    await t.test('with the draft check on, a sharp draft is offered a flatter one', async () => {
+      store.update({ draftCheck: true });
+      await sleep(300);
+      await type('.ql-editor', 'WHY has nobody looked at this?? It is UNACCEPTABLE and I need it NOW.');
+
+      const suggestion = await waitFor('the suggestion', () => read(
+        `(() => { const el = document.querySelector('.slacken-draft-text'); return el ? el.textContent : null; })()`,
+      ));
+      assert.match(suggestion, /^NEUTRAL\(/);
+      const draft = asked.find((a) => a.text.startsWith('WHY has nobody looked'));
+      assert.equal(draft.channel, '#eng-oncall');
+
+      // Nothing has happened to what you wrote.
+      assert.match(await read(`document.querySelector('.ql-editor').innerText`), /^WHY has nobody/);
+    });
+
+    await t.test('the draft is replaced only when you click, and never sent', async () => {
+      await read(`document.querySelector('.slacken-draft .slacken-draft-button').click()`);
+      const text = await waitFor('the composer to take the rewrite', async () => {
+        const value = await read(`document.querySelector('.ql-editor').innerText`);
+        return /^NEUTRAL\(/.test(value) ? value : null;
+      });
+      assert.match(text, /^NEUTRAL\(/);
+      assert.equal(await read(`document.querySelector('.slacken-draft') ? 1 : 0`), 0,
+        'the offer goes once it has been taken');
+      store.update({ draftCheck: false });
     });
 
     await t.test('a setting changed on the daemon reaches the page without a reload', async () => {

@@ -5,6 +5,7 @@ import { parseResponse, normalize } from '../src/moderate.js';
 import { devtoolsMessage } from '../src/cdp.js';
 import { RepeatLog, logEvent } from '../src/cli.js';
 import { Cache } from '../src/cache.js';
+import { compareVersions, checkForUpdate } from '../src/version.js';
 
 const SOFTEN = {
   id: 'm0',
@@ -318,4 +319,30 @@ test('the log distinguishes a paused Slacken from a quiet one', () => {
   assert.match(lines[0], /left alone \(nothing to change\)/);
   assert.match(lines[1], /left alone \(paused\)/);
   assert.match(lines[2], /left alone \(cached\)/);
+});
+
+/* ------------------------------------------------------------- versions */
+
+test('a newer version is recognised, numerically', () => {
+  assert.ok(compareVersions('0.10.0', '0.9.0') > 0, '10 is not less than 9 because it starts with a 1');
+  assert.ok(compareVersions('1.0.0', '0.99.99') > 0);
+  assert.equal(compareVersions('0.2.0', '0.2.0'), 0);
+  assert.ok(compareVersions('0.2.0', '0.2.1') < 0);
+  // A tag with a suffix is still comparable, and never newer than the release.
+  assert.ok(compareVersions('0.2.0', '0.2.0-rc1') > 0);
+});
+
+test('the update check does nothing at all unless it has been turned on', async () => {
+  // The only thing in Slacken that talks to anything but your own machine, so
+  // "off" has to mean no request rather than a request whose answer is
+  // ignored.
+  let asked = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { asked = true; throw new Error('should not have been called'); };
+  try {
+    assert.equal(await checkForUpdate({ checkUpdates: false }), null);
+    assert.equal(asked, false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

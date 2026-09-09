@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { SYSTEM_PROMPT, RESPONSE_SCHEMA, TONE_VALUES, buildBatchPayload } from './prompt.js';
 import { Cache } from './cache.js';
+import { forChannel, gateSignature } from './settings.js';
 
 export const CLEAN = {
   flagged: false, hostile: false, verbose: false,
@@ -38,8 +39,17 @@ export class Moderator {
     this.stats = {
       calls: 0, batched: 0, cacheHits: 0,
       softened: 0, condensed: 0, errors: 0,
-      costUsd: 0, day: today(),
+      retries: 0, reveals: 0, notifications: 0, drafts: 0,
+      // What today has cost, which is not what this process has cost: the
+      // budget is a property of the day and outlives any one daemon.
+      costUsd: state?.spentToday ?? 0,
+      sessionCostUsd: 0,
+      day: today(),
     };
+    // The last failure worth telling someone about, and what kind it was.
+    // Cleared by the next call that works, so the menu never goes on
+    // reporting a problem that has stopped happening.
+    this.lastError = null;
   }
 
   get paused() {
@@ -56,7 +66,10 @@ export class Moderator {
     if (!trimmed) return clean({ reason: 'empty' });
     if (trimmed.length > this.config.maxChars) return clean({ reason: 'too-long' });
 
-    const key = Cache.key(this.config.model, trimmed);
+    // Keyed by the settings that produced it as well as the text: a verdict
+    // is stored already judged, so the same message under a different
+    // threshold — or in a channel with its own — is a different answer.
+    const key = Cache.key(this.config.model, trimmed, gateSignature(this.config, channel));
     const cached = this.cache.get(key);
     if (cached) {
       this.stats.cacheHits += 1;
@@ -75,14 +88,38 @@ export class Moderator {
     return verdict;
   }
 
-  overBudget() {
-    const limit = this.config.dailyBudgetUsd;
-    if (!limit || limit <= 0) return false;
+  // The day's spend, from disk when there is state to read it from, so a
+  // daemon that has just been restarted knows what the one before it spent.
+  spentToday() {
+    if (this.state) {
+      this.stats.day = today();
+      this.stats.costUsd = this.state.spentToday;
+      return this.stats.costUsd;
+    }
     if (this.stats.day !== today()) {
       this.stats.day = today();
       this.stats.costUsd = 0;
     }
-    return this.stats.costUsd >= limit;
+    return this.stats.costUsd;
+  }
+
+  overBudget() {
+    const limit = this.config.dailyBudgetUsd;
+    if (!limit || limit <= 0) return false;
+    return this.spentToday() >= limit;
+  }
+
+  recordCost(costUsd) {
+    if (!Number.isFinite(costUsd) || costUsd <= 0) return;
+    this.stats.sessionCostUsd += costUsd;
+    if (this.state) {
+      this.state.addCost(costUsd);
+      this.stats.day = today();
+      this.stats.costUsd = this.state.spentToday;
+      return;
+    }
+    this.spentToday();
+    this.stats.costUsd += costUsd;
   }
 
   // Hold each request for a short window so messages that render together —
@@ -123,24 +160,12 @@ export class Moderator {
   }
 
   async runBatch(batch) {
-    this.stats.calls += 1;
     this.stats.batched += batch.length;
 
-    const stdout = await runClaude({
-      bin: this.config.claudeBin,
-      args: this.claudeArgs(),
-      input: buildBatchPayload(batch),
-      timeoutMs: this.config.requestTimeoutMs,
-    });
+    const stdout = await this.callWithRetry(buildBatchPayload(batch));
 
     const { verdicts, costUsd } = parseResponse(stdout);
-    if (costUsd) {
-      if (this.stats.day !== today()) {
-        this.stats.day = today();
-        this.stats.costUsd = 0;
-      }
-      this.stats.costUsd += costUsd;
-    }
+    this.recordCost(costUsd);
 
     if (!verdicts) {
       this.stats.errors += 1;
@@ -153,9 +178,48 @@ export class Moderator {
     for (const item of batch) {
       const raw = byId.get(item.id);
       item.resolve(raw
-        ? normalize(raw, this.config, item.text)
+        ? normalize(raw, forChannel(this.config, item.channel), item.text)
         : clean({ error: 'no verdict returned' }));
     }
+  }
+
+  /*
+   * One call, tried again if the way it failed could plausibly go differently.
+   *
+   * A timeout, a killed process or a rate limit is a bad moment; being signed
+   * out is a fact about the machine, and asking again immediately only makes
+   * the same answer arrive twice. So failures are classified rather than
+   * counted, the transient ones get another go after a short wait, and the
+   * kind of the last one is kept — because "3 errors" tells you nothing you
+   * can act on and "not signed in to Claude" tells you everything.
+   */
+  async callWithRetry(input) {
+    const attempts = Math.max(0, Number(this.config.retries) || 0) + 1;
+    let lastErr;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      this.stats.calls += 1;
+      try {
+        const stdout = await runClaude({
+          bin: this.config.claudeBin,
+          args: this.claudeArgs(),
+          input,
+          timeoutMs: this.config.requestTimeoutMs,
+        });
+        this.lastError = null;
+        return stdout;
+      } catch (err) {
+        lastErr = err;
+        const kind = classifyError(err.message);
+        this.lastError = { kind, message: err.message, at: Date.now() };
+        if (attempt >= attempts || !RETRIABLE.has(kind)) break;
+        this.stats.retries += 1;
+        if (this.config.verbose) console.warn(`[slacken] ${kind}, trying once more: ${err.message}`);
+        // Long enough for a rate limit to move on, short enough that a held
+        // message is still a wait rather than a hang.
+        await sleep(600 * attempt);
+      }
+    }
+    throw lastErr;
   }
 
   claudeArgs() {
@@ -179,6 +243,46 @@ export class Moderator {
 
 function today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Deliberately not unref'd, for the same reason the batch window is not: a
+// message is being held on screen for the answer this wait is on its way to.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/*
+ * What went wrong, in the only terms worth acting on.
+ *
+ * The message comes from whatever `claude` printed, so this reads it the way a
+ * person would: the point is not to enumerate every failure but to separate
+ * the one you have to do something about (sign in) from the ones that fix
+ * themselves (a rate limit, a timeout, a bad moment).
+ */
+export const RETRIABLE = new Set(['timeout', 'rate-limit', 'overloaded', 'unknown']);
+
+export function classifyError(message) {
+  const text = String(message || '').toLowerCase();
+  if (/not (logged|signed) in|unauthor|authentication|invalid api key|please run .?claude login|credit balance/.test(text)) {
+    return 'auth';
+  }
+  if (/rate limit|429|too many requests|usage limit/.test(text)) return 'rate-limit';
+  if (/overloaded|529|503|502|temporarily unavailable/.test(text)) return 'overloaded';
+  if (/timed out|timeout|etimedout/.test(text)) return 'timeout';
+  if (/could not spawn|could not run|enoent|not found/.test(text)) return 'missing';
+  return 'unknown';
+}
+
+// One line, in the imperative where there is something to do about it.
+export function errorHint(kind, message) {
+  switch (kind) {
+    case 'auth': return 'Not signed in to Claude — run: claude login';
+    case 'missing': return 'claude is not on the PATH this is running with';
+    case 'rate-limit': return 'Rate limited by the API — rewriting will catch up';
+    case 'overloaded': return 'The API is overloaded — rewriting will catch up';
+    case 'timeout': return 'Model calls are timing out';
+    default: return String(message || 'model call failed').slice(0, 80);
+  }
 }
 
 function runClaude({ bin, args, input, timeoutMs }) {

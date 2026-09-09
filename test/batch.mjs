@@ -8,26 +8,31 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Moderator } from '../src/moderate.js';
+import { Moderator, classifyError } from '../src/moderate.js';
 import { DEFAULTS } from '../src/config.js';
+import { State } from '../src/state.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fake-claude.mjs');
 
 const LONG = Array(60).fill('padding').join(' ');
 
-function setup(overrides = {}) {
+function setup(overrides = {}, { state = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-batch-'));
   const log = path.join(dir, 'invocations.log');
   process.env.FAKE_CLAUDE_LOG = log;
+  process.env.FAKE_CLAUDE_COUNTER = path.join(dir, 'failures');
   delete process.env.FAKE_CLAUDE_FAIL;
+  delete process.env.FAKE_CLAUDE_FAIL_TIMES;
+  delete process.env.FAKE_CLAUDE_MESSAGE;
 
   const moderator = new Moderator({
     ...DEFAULTS,
     claudeBin: FAKE,
     cacheTtlHours: 0.0001,
+    retries: 0,
     ...overrides,
-  });
+  }, state);
   // Keep every run isolated from the real on-disk cache.
   moderator.cache.map.clear();
   moderator.cache.flush = () => {};
@@ -151,6 +156,122 @@ test('a long padded message is condensed, a long dense one is not', async () => 
   }
 });
 
+
+/*
+ * What the day cost, across the daemons that spent it.
+ *
+ * The login agent restarts on every crash and at every login, so a budget
+ * held in memory is a budget per restart. These are the tests that say the
+ * cap means a day.
+ */
+test('the day\'s spend survives a restart, and so does the cap', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-spend-'));
+  const file = path.join(dir, 'state.json');
+  try {
+    const first = new State({ file });
+    const a = setup({ dailyBudgetUsd: 0.0005 }, { state: first });
+    await a.moderator.moderate({ text: 'FIRST MESSAGE UNACCEPTABLE' });
+    a.cleanup();
+    assert.ok(first.spentToday > 0, 'the call should have cost something');
+
+    // A new daemon, reading the file the old one wrote.
+    const second = new State({ file });
+    assert.equal(Number(second.spentToday.toFixed(6)), Number(first.spentToday.toFixed(6)));
+
+    const b = setup({ dailyBudgetUsd: 0.0005 }, { state: second });
+    try {
+      const after = await b.moderator.moderate({ text: 'SECOND MESSAGE UNACCEPTABLE' });
+      assert.equal(b.invocations().length, 0, 'a restart must not hand the budget back');
+      assert.equal(after.reason, 'budget');
+      assert.equal(b.moderator.stats.costUsd, second.spentToday, 'the menu counts the day, not the session');
+    } finally {
+      b.cleanup();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('yesterday\'s spend is not today\'s', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-spend-'));
+  const file = path.join(dir, 'state.json');
+  try {
+    fs.writeFileSync(file, JSON.stringify({ paused: false, day: '2000-01-01', costUsd: 99 }));
+    const state = new State({ file });
+    assert.equal(state.spentToday, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a transient failure is tried again, and the second answer is used', async () => {
+  const { moderator, invocations, cleanup } = setup({ retries: 1 });
+  try {
+    process.env.FAKE_CLAUDE_FAIL_TIMES = '1';
+    process.env.FAKE_CLAUDE_MESSAGE = 'Error: request timed out';
+    const verdict = await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+
+    assert.equal(invocations().length, 2, 'the failed call and the one that worked');
+    assert.equal(verdict.flagged, true, 'the retry\'s verdict is the verdict');
+    assert.equal(moderator.stats.retries, 1);
+    assert.equal(moderator.lastError, null, 'a call that worked clears the error');
+  } finally {
+    delete process.env.FAKE_CLAUDE_FAIL_TIMES;
+    delete process.env.FAKE_CLAUDE_MESSAGE;
+    cleanup();
+  }
+});
+
+test('being signed out is not retried, and is named', async () => {
+  const { moderator, invocations, cleanup } = setup({ retries: 2 });
+  try {
+    process.env.FAKE_CLAUDE_FAIL = '1';
+    process.env.FAKE_CLAUDE_MESSAGE = 'Invalid API key · Please run /login';
+    const verdict = await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+
+    assert.equal(invocations().length, 1, 'asking again would only be told the same thing');
+    assert.equal(verdict.flagged, false);
+    assert.equal(moderator.lastError.kind, 'auth');
+    assert.equal(moderator.stats.retries, 0);
+  } finally {
+    delete process.env.FAKE_CLAUDE_FAIL;
+    delete process.env.FAKE_CLAUDE_MESSAGE;
+    cleanup();
+  }
+});
+
+test('failures are classified by what can be done about them', () => {
+  assert.equal(classifyError('claude exited 1: Invalid API key'), 'auth');
+  assert.equal(classifyError('claude exited 1: 429 rate limit exceeded'), 'rate-limit');
+  assert.equal(classifyError('claude timed out after 25000ms'), 'timeout');
+  assert.equal(classifyError('could not spawn claude: ENOENT'), 'missing');
+  assert.equal(classifyError('claude exited 1: something new'), 'unknown');
+});
+
+test('a verdict is cached against the settings that produced it', async () => {
+  const { moderator, invocations, cleanup } = setup({
+    cacheTtlHours: 1,
+    channelOverrides: { '#loud': { minSeverity: 3 } },
+  });
+  try {
+    const text = 'THIS IS COMPLETELY UNACCEPTABLE';
+    const quiet = await moderator.moderate({ text, channel: '#quiet' });
+    const loud = await moderator.moderate({ text, channel: '#loud' });
+
+    assert.equal(invocations().length, 2,
+      'the same words under a different threshold are a different question');
+    assert.equal(quiet.flagged, true, 'severity 2 clears the global floor of 2');
+    assert.equal(loud.flagged, false, '#loud only softens what reaches 3');
+
+    // And the answer to each question is still remembered.
+    const again = await moderator.moderate({ text, channel: '#quiet' });
+    assert.equal(invocations().length, 2);
+    assert.equal(again.cached, true);
+  } finally {
+    cleanup();
+  }
+});
+
 test('a failure is never cached, so a recovered claude is asked again', async () => {
   // The bug this covers reads, from the menu bar, as "234 model calls, 130
   // from cache, 0 rewritten": once a failure was memoised for the week-long
@@ -187,7 +308,7 @@ test('a successful verdict is still cached after a failure', async () => {
     const third = await moderator.moderate({ text });
 
     assert.equal(third.cached, true);
-    assert.equal(invocations().length, 2, 'only the failure and the retry cost a call');
+    assert.equal(invocations().length, 2, 'only the failure and the call that worked cost anything');
   } finally {
     delete process.env.FAKE_CLAUDE_FAIL;
     cleanup();

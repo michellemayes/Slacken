@@ -19,8 +19,11 @@ export class Cache {
     if (this.enabled) this.load();
   }
 
-  static key(model, text) {
-    return crypto.createHash('sha256').update(`${model} ${text}`).digest('hex').slice(0, 32);
+  // The gate is the settings the verdict was judged against. Two verdicts for
+  // the same text under different thresholds are different answers, and a
+  // cache that could not tell them apart would hand one channel the other's.
+  static key(model, text, gate = '') {
+    return crypto.createHash('sha256').update(`${model} ${gate} ${text}`).digest('hex').slice(0, 32);
   }
 
   load() {
