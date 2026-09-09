@@ -1,7 +1,7 @@
 /* Parsing and gating around whatever `claude -p` hands back. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseResponse, normalize } from '../src/moderate.js';
+import { parseResponse, normalize, isComplete } from '../src/moderate.js';
 import { devtoolsMessage } from '../src/cdp.js';
 import { RepeatLog, logEvent } from '../src/cli.js';
 import { Cache } from '../src/cache.js';
@@ -61,6 +61,28 @@ test('parseResponse returns null verdicts when there is no usable object', () =>
   assert.equal(parseResponse('I refuse to answer.').verdicts, null);
   assert.equal(parseResponse('').verdicts, null);
   assert.equal(parseResponse(envelope({ nope: true })).verdicts, null);
+});
+
+/*
+ * The test for stopping early: what counts as the whole answer.
+ *
+ * A verdict is handed over the moment stdout holds one, rather than when the
+ * process gets round to exiting, so being wrong here is either a truncated
+ * answer parsed as a whole one or a failure reported as a success.
+ */
+test('a complete envelope is complete, and half of one is not', () => {
+  const whole = JSON.stringify({ type: 'result', total_cost_usd: 0.0007, result: '{"verdicts":[]}' });
+  assert.equal(isComplete(whole), true);
+  assert.equal(isComplete(whole.slice(0, whole.length - 20)), false, 'half an envelope is not an answer');
+  assert.equal(isComplete(''), false);
+  assert.equal(isComplete('{'), false);
+});
+
+test('a failure envelope is left to the exit code, which knows what to say', () => {
+  // "claude exited 1: Invalid API key" is something a person can act on. The
+  // JSON that came with it is not, so it must not be taken as the answer.
+  assert.equal(isComplete(JSON.stringify({ type: 'result', is_error: true, result: 'Invalid API key' })), false);
+  assert.equal(isComplete(JSON.stringify({ type: 'system', subtype: 'init' })), false);
 });
 
 test('normalize keeps a genuine soften', () => {

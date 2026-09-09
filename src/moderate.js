@@ -1,7 +1,9 @@
+import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { SYSTEM_PROMPT, RESPONSE_SCHEMA, TONE_VALUES, buildBatchPayload } from './prompt.js';
 import { resolveClaudeBin, notFoundMessage, spawnPath } from './claude-bin.js';
 import { Cache } from './cache.js';
+import { HOME_DIR } from './config.js';
 import { forChannel, gateSignature } from './settings.js';
 
 export const CLEAN = {
@@ -21,6 +23,13 @@ const clean = (extra) => ({ ...CLEAN, ...extra });
  * A persistent --input-format stream-json session was measured too and is
  * deliberately not used: turns were no faster, and because the conversation
  * accumulates, the sixth turn cost 4.7x the first.
+ *
+ * Everything in here that is about speed is about the same thing: a message is
+ * held on screen behind "checking…" for exactly as long as this takes, so
+ * the wait is not a number in a log, it is a person sitting and watching a gap
+ * where a sentence should be. What is not the model answering — process
+ * startup, a telemetry flush on the way out, a round trip spent proving the
+ * JSON was JSON — is worth removing even a few hundred milliseconds at a time.
  */
 export class Moderator {
   constructor(config, state = null) {
@@ -40,7 +49,7 @@ export class Moderator {
     this.stats = {
       calls: 0, batched: 0, cacheHits: 0,
       softened: 0, condensed: 0, errors: 0,
-      retries: 0, reveals: 0, notifications: 0, drafts: 0,
+      retries: 0, schemaRetries: 0, reveals: 0, notifications: 0, drafts: 0,
       // What today has cost, which is not what this process has cost: the
       // budget is a property of the day and outlives any one daemon.
       costUsd: state?.spentToday ?? 0,
@@ -123,16 +132,33 @@ export class Moderator {
     this.stats.costUsd += costUsd;
   }
 
-  // Hold each request for a short window so messages that render together —
-  // catching up on a channel, or a burst from one person — travel as one call.
+  /*
+   * Hold each request for a short window so messages that render together —
+   * catching up on a channel, or a burst from one person — travel as one call.
+   *
+   * How long is worth waiting depends on what else is happening. With a call
+   * already out, more messages are plainly arriving and the window is free:
+   * whatever it collects would have queued behind that call anyway. With
+   * nothing in flight, this is the message that just landed in a channel you
+   * are reading, and the window buys nothing but a wait you sit and watch —
+   * a burst rendered in one frame reaches us within a millisecond or two of
+   * itself, so a much shorter window still catches every one of them.
+   */
   enqueue(item) {
     return new Promise((resolve) => {
       this.queue.push({ ...item, id: `m${this.seq++}`, resolve });
       if (this.queue.length >= this.config.batchSize) this.flush();
       // Deliberately not unref'd: the batch window is the only thing holding
       // a queued message, so it has to keep the process alive on its own.
-      else if (!this.timer) this.timer = setTimeout(() => this.flush(), this.config.batchWindowMs);
+      else if (!this.timer) this.timer = setTimeout(() => this.flush(), this.batchWindow());
     });
+  }
+
+  batchWindow() {
+    const full = this.config.batchWindowMs;
+    if (this.inFlight > 0) return full;
+    const idle = Number(this.config.batchWindowIdleMs);
+    return Number.isFinite(idle) && idle >= 0 ? Math.min(idle, full) : full;
   }
 
   flush() {
@@ -162,11 +188,31 @@ export class Moderator {
 
   async runBatch(batch) {
     this.stats.batched += batch.length;
+    const payload = buildBatchPayload(batch);
 
-    const stdout = await this.callWithRetry(buildBatchPayload(batch));
+    const stdout = await this.callWithRetry(payload);
 
-    const { verdicts, costUsd } = parseResponse(stdout);
+    let { verdicts, costUsd } = parseResponse(stdout);
     this.recordCost(costUsd);
+
+    /*
+     * Asked for JSON rather than held to it, and asked again properly when
+     * that was not enough.
+     *
+     * `--json-schema` guarantees the shape, and measurably costs a second
+     * model turn and ~730 input tokens to do it — around 1.2s on every
+     * message, paid to prevent something that almost never happens. So the
+     * fast call goes first and the schema is what a failure is retried with,
+     * which puts the cost where the failure is instead of on every message.
+     */
+    if (!verdicts && !this.config.useJsonSchema) {
+      this.stats.schemaRetries += 1;
+      if (this.config.verbose) console.warn('[slacken] output did not parse, asking again with the schema');
+      const strict = await this.callWithRetry(payload, { schema: true });
+      const second = parseResponse(strict);
+      this.recordCost(second.costUsd);
+      verdicts = second.verdicts;
+    }
 
     if (!verdicts) {
       this.stats.errors += 1;
@@ -194,7 +240,7 @@ export class Moderator {
    * kind of the last one is kept — because "3 errors" tells you nothing you
    * can act on and "not signed in to Claude" tells you everything.
    */
-  async callWithRetry(input) {
+  async callWithRetry(input, { schema = this.config.useJsonSchema } = {}) {
     const attempts = Math.max(0, Number(this.config.retries) || 0) + 1;
     let lastErr;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -202,8 +248,9 @@ export class Moderator {
       try {
         const stdout = await runClaude({
           bin: await this.binPath(),
-          args: this.claudeArgs(),
+          args: this.claudeArgs({ schema }),
           input,
+          cwd: this.workDir(),
           timeoutMs: this.config.requestTimeoutMs,
         });
         this.lastError = null;
@@ -250,13 +297,34 @@ export class Moderator {
     return { bin: this.config.claudeBin, path: file, source, searched };
   }
 
-  claudeArgs() {
+  /*
+   * Where a call is run from, which is not where the daemon was started from.
+   *
+   * `claude` looks around the directory it is in on the way up. Started by
+   * hand that directory is whatever repository you happened to be standing in,
+   * which is both slower to start in and a place a CLAUDE.md can sit and have
+   * opinions about a Slack message it was never written for. ~/.slacken is
+   * small, ours, and says nothing.
+   */
+  workDir() {
+    if (this.cwd !== undefined) return this.cwd;
+    try {
+      fs.mkdirSync(HOME_DIR, { recursive: true });
+      this.cwd = HOME_DIR;
+    } catch {
+      // Unwritable home. Not worth failing a verdict over.
+      this.cwd = null;
+    }
+    return this.cwd;
+  }
+
+  claudeArgs({ schema = this.config.useJsonSchema } = {}) {
     return [
       '-p',
       '--output-format', 'json',
       '--model', this.config.model,
       '--system-prompt', SYSTEM_PROMPT,
-      ...(this.config.useJsonSchema ? ['--json-schema', JSON.stringify(RESPONSE_SCHEMA)] : []),
+      ...(schema ? ['--json-schema', JSON.stringify(RESPONSE_SCHEMA)] : []),
       // Everything below is startup and turn weight we do not need. Without
       // them a verdict costs ~800 thinking tokens and 8-11 seconds.
       '--tools', '',
@@ -313,17 +381,44 @@ export function errorHint(kind, message) {
   }
 }
 
-function runClaude({ bin, args, input, timeoutMs }) {
+/*
+ * What `claude` is asked not to do on a call that somebody is waiting on.
+ *
+ * None of this changes the answer; all of it is work happening around one.
+ * The first line is the one that matters most, and the rest are all the same
+ * kind of thing: an update check, an error report and a telemetry flush are
+ * fine in a session you are sitting in, and on this path they are a message
+ * held back on somebody's screen while a background task finishes.
+ */
+const QUIET_ENV = {
+  // The single biggest lever there is: it takes a verdict from ~800 output
+  // tokens and ~10s down to ~50 tokens and ~2.4s.
+  MAX_THINKING_TOKENS: '0',
+  // Measured at ~500ms on every single call: the result was already on stdout
+  // and the process was still holding on, flushing what it had learned.
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  DISABLE_TELEMETRY: '1',
+  DISABLE_ERROR_REPORTING: '1',
+  DISABLE_NON_ESSENTIAL_MODEL_CALLS: '1',
+  // Only for the copies Slacken spawns. The claude you type at still updates
+  // itself; a verdict is not the place to find out about a new version.
+  DISABLE_AUTOUPDATER: '1',
+};
+
+// A child that has already given us the answer, kept only long enough to exit
+// on its own terms. Nothing is waiting on it, so being tidy is all this is.
+const REAP_GRACE_MS = 2000;
+
+function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        ...(cwd ? { cwd } : {}),
         env: {
           ...process.env,
-          // The single biggest lever there is: it takes a verdict from ~800
-          // output tokens and ~10s down to ~50 tokens and ~2.4s.
-          MAX_THINKING_TOKENS: '0',
+          ...QUIET_ENV,
           // An npm-installed claude is a `#!/usr/bin/env node` script, so
           // knowing where claude is does not by itself make it runnable.
           PATH: spawnPath(bin),
@@ -345,7 +440,26 @@ function runClaude({ bin, args, input, timeoutMs }) {
       reject(new Error(`claude timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    child.stdout.on('data', (d) => { stdout += d; });
+    /*
+     * Answer on the answer, not on the exit.
+     *
+     * `--output-format json` prints one envelope and prints it whole, so the
+     * moment it parses there is nothing further to wait for — and what came
+     * after it, measured, was up to half a second of a process shutting
+     * itself down. A verdict that is sitting in this buffer while a message
+     * stays hidden on screen is the wait this exists to delete. The child is
+     * left to go in its own time; only the answer stopped waiting.
+     */
+    child.stdout.on('data', (d) => {
+      stdout += d;
+      if (settled || !isComplete(stdout)) return;
+      settled = true;
+      clearTimeout(timer);
+      const grace = setTimeout(() => child.kill('SIGKILL'), REAP_GRACE_MS);
+      grace.unref?.();
+      child.on('close', () => clearTimeout(grace));
+      resolve(stdout);
+    });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('error', (err) => {
       if (settled) return;
@@ -367,6 +481,26 @@ function runClaude({ bin, args, input, timeoutMs }) {
     child.stdin.on('error', () => {});
     child.stdin.end(input);
   });
+}
+
+/*
+ * Is this the whole answer, or the first half of one?
+ *
+ * Only a result envelope that parses and reports success counts. A failure
+ * envelope is left to the exit code and stderr, which is where a message
+ * worth showing anyone actually is — "claude exited 1: not logged in" is an
+ * answer, and the JSON that came with it is not.
+ */
+export function isComplete(stdout) {
+  if (!stdout.trimEnd().endsWith('}')) return false;
+  let envelope;
+  try {
+    envelope = JSON.parse(stdout);
+  } catch {
+    return false;
+  }
+  if (!envelope || typeof envelope !== 'object' || envelope.is_error === true) return false;
+  return typeof envelope.result === 'string' || Array.isArray(envelope.verdicts);
 }
 
 // `claude -p --output-format json` wraps the answer in a result envelope that

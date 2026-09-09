@@ -21,6 +21,7 @@ import { VERSION } from './version.js';
  *   POST /channel    change, or clear, the settings for one channel
  *   GET  /inspect    what each attached window makes of the messages on screen
  *   POST /reinject   reload the page script without restarting the daemon
+ *   POST /restart    stop, and come straight back — the menu bar's Restart
  *   POST /stop       shut the daemon down, the way Ctrl-C would
  *
  * Everything but /health needs the token from ~/.slacken/token, because
@@ -30,7 +31,7 @@ import { VERSION } from './version.js';
  * would turn "already running" into "something is wrong".
  */
 export function createServer({
-  config, moderator, state, store, getStatus, reinject, inspect, onStop, token = null,
+  config, moderator, state, store, getStatus, reinject, inspect, onStop, onRestart, token = null,
 }) {
   const snapshot = async () => ({
     paused: Boolean(state?.paused),
@@ -168,6 +169,22 @@ export function createServer({
       }
       const verdict = await moderator.moderate(body);
       return json(res, 200, verdict);
+    }
+
+    /*
+     * Off and on again, without a terminal.
+     *
+     * This is the one thing you could not do from the menu bar, and the one
+     * thing that fixes the most: a claude that has moved since login, an
+     * upgrade sitting on disk that the running process has never read, a
+     * daemon that has been up for a week. Answered the same way /stop is —
+     * reply first, act once it has gone out — because whoever asked is about
+     * to lose the connection either way.
+     */
+    if (req.method === 'POST' && url.pathname === '/restart') {
+      if (!onRestart) return json(res, 501, { error: 'this daemon cannot restart itself' });
+      res.on('finish', () => onRestart('a restart request'));
+      return json(res, 200, { ok: true, restarting: true });
     }
 
     // The terminal is not the only place Slacken gets started from, so it

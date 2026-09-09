@@ -6,6 +6,31 @@ import { coerceAll, coerceChannelPatch, inList, withEntry, channelKey, forChanne
 export const HOME_DIR = path.join(os.homedir(), '.slacken');
 export const CONFIG_PATH = path.join(HOME_DIR, 'config.json');
 
+/*
+ * Bumped when a default moves in a way an existing config file would hide.
+ *
+ * The file is written out in full on first run, which is friendly — every
+ * setting is there to read and edit — and has one consequence: every key is
+ * pinned, including the ones nobody chose. A default that moves afterwards
+ * reaches new installs and nobody else, which for a change made because it was
+ * measured to be slow is the same as not making it.
+ */
+export const CONFIG_VERSION = 2;
+
+/*
+ * Defaults that have moved, and the value they used to hold.
+ *
+ * A key is only rewritten if it still holds exactly the old default: that is
+ * a leftover, not a decision. A value you chose is yours, even when it happens
+ * to be slower, and the version stamp means none of this happens twice.
+ */
+const SUPERSEDED_DEFAULTS = {
+  // On for every call until it was measured: a second model turn and ~730
+  // input tokens, ~1.2s a message, to prevent something a retry already
+  // catches.
+  useJsonSchema: true,
+};
+
 export const DEFAULTS = {
   // Chrome DevTools Protocol port that Slack.app is launched with.
   cdpPort: 9222,
@@ -35,9 +60,18 @@ export const DEFAULTS = {
   // ~650ms and $0.00068 a message.
   batchSize: 8,
   batchWindowMs: 120,
+  // How long the same wait lasts with no call already out — a message that
+  // arrives on its own in a channel you are reading, where the window fills
+  // nothing and you are watching it pass. Long enough to still collect a burst
+  // that rendered in one frame.
+  batchWindowIdleMs: 25,
   maxConcurrency: 2,
-  // Guarantees well-formed JSON back, at a small token cost.
-  useJsonSchema: true,
+  // Hold the model to the response schema on every call. Measured at a second
+  // model turn and ~730 extra input tokens — about 1.2s a message — to prevent
+  // something that almost never happens, so it is off: output that does not
+  // parse is asked again with the schema instead, which puts the cost on the
+  // failure rather than on every message.
+  useJsonSchema: false,
   // Stop calling the model once a day costs this much. 0 disables the cap.
   dailyBudgetUsd: 0,
 
@@ -120,9 +154,56 @@ function readConfigFile(file) {
 
 export function writeDefaultConfig() {
   fs.mkdirSync(HOME_DIR, { recursive: true });
-  if (fs.existsSync(CONFIG_PATH)) return CONFIG_PATH;
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2) + '\n');
+  if (!fs.existsSync(CONFIG_PATH)) {
+    writeConfigFile(CONFIG_PATH, { configVersion: CONFIG_VERSION, ...DEFAULTS });
+    return CONFIG_PATH;
+  }
+  migrateConfig(CONFIG_PATH);
   return CONFIG_PATH;
+}
+
+/*
+ * Bring a config file written by an older Slacken up to date, once.
+ *
+ * Only keys still holding a previous version's default are touched, and the
+ * file is stamped so this cannot happen a second time — including to a value
+ * you set back by hand afterwards. Returns what it changed, so startup can say
+ * so rather than quietly moving a setting under you.
+ */
+export function migrateConfig(file = CONFIG_PATH) {
+  const raw = readConfigFile(file);
+  // Missing, empty or unreadable. There is nothing here to bring forward, and
+  // guessing at a file we could not parse would be worse than leaving it.
+  if (!Object.keys(raw).length) return { changed: [] };
+  if (Number(raw.configVersion) >= CONFIG_VERSION) return { changed: [] };
+
+  const next = { ...raw };
+  const changed = [];
+  for (const [key, was] of Object.entries(SUPERSEDED_DEFAULTS)) {
+    if (!(key in raw) || !same(raw[key], was)) continue;
+    next[key] = DEFAULTS[key];
+    changed.push(key);
+  }
+  next.configVersion = CONFIG_VERSION;
+  try {
+    writeConfigFile(file, next);
+  } catch (err) {
+    console.warn(`[slacken] could not bring ${file} up to date: ${err.message}`);
+    return { changed: [] };
+  }
+  for (const key of changed) {
+    console.log(`[slacken] ${key} was still set to the old default; it is now `
+      + `${JSON.stringify(DEFAULTS[key])} — set it back in ${file} if you want it`);
+  }
+  return { changed };
+}
+
+// Written beside the real file and moved into place, so a process killed
+// mid-write cannot leave half a config to be read at the next login.
+function writeConfigFile(file, values) {
+  const temp = `${file}.writing`;
+  fs.writeFileSync(temp, JSON.stringify(values, null, 2) + '\n');
+  fs.renameSync(temp, file);
 }
 
 /*
@@ -233,11 +314,7 @@ export class ConfigStore {
       // an older version wrote — survive being edited from the menu.
       const merged = { ...DEFAULTS, ...readConfigFile(this.file) };
       for (const key of changed) merged[key] = this.values[key];
-      // Written beside the real file and moved into place: a daemon killed
-      // mid-write must not leave a half-written config to be read at login.
-      const temp = `${this.file}.writing`;
-      fs.writeFileSync(temp, JSON.stringify(merged, null, 2) + '\n');
-      fs.renameSync(temp, this.file);
+      writeConfigFile(this.file, merged);
     } catch (err) {
       console.warn(`[slacken] could not write ${this.file}: ${err.message}`);
     }

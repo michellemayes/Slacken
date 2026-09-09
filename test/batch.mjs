@@ -25,6 +25,8 @@ function setup(overrides = {}, { state = null } = {}) {
   delete process.env.FAKE_CLAUDE_FAIL;
   delete process.env.FAKE_CLAUDE_FAIL_TIMES;
   delete process.env.FAKE_CLAUDE_MESSAGE;
+  delete process.env.FAKE_CLAUDE_UNPARSEABLE;
+  delete process.env.FAKE_CLAUDE_LINGER_MS;
 
   const moderator = new Moderator({
     ...DEFAULTS,
@@ -236,6 +238,93 @@ test('being signed out is not retried, and is named', async () => {
   } finally {
     delete process.env.FAKE_CLAUDE_FAIL;
     delete process.env.FAKE_CLAUDE_MESSAGE;
+    cleanup();
+  }
+});
+
+/* ------------------------------------------------------------------ speed */
+
+test('the fast call goes without the schema, and is asked again with it when it does not parse', async () => {
+  const { moderator, invocations, cleanup } = setup({ retries: 0, useJsonSchema: false });
+  try {
+    process.env.FAKE_CLAUDE_UNPARSEABLE = '1';
+    const verdict = await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+
+    const calls = invocations();
+    assert.equal(calls.length, 2, 'the fast call, and the strict one it fell back to');
+    assert.equal(calls[0].schema, false, 'the schema is what the retry adds, not what every call pays');
+    assert.equal(calls[1].schema, true);
+    assert.equal(verdict.flagged, true, 'the answer comes from the call that could answer');
+    assert.equal(moderator.stats.schemaRetries, 1);
+    assert.equal(moderator.stats.errors, 0, 'a retry that worked is not an error');
+  } finally {
+    delete process.env.FAKE_CLAUDE_UNPARSEABLE;
+    cleanup();
+  }
+});
+
+test('output that will not parse either way is not retried forever', async () => {
+  const { moderator, invocations, cleanup } = setup({ retries: 0, useJsonSchema: true });
+  try {
+    process.env.FAKE_CLAUDE_UNPARSEABLE = 'always';
+    // With the schema already in force there is nothing left to fall back to,
+    // so the message is handed back unchanged rather than asked about again.
+    const verdict = await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+    assert.equal(invocations().length, 1);
+    assert.equal(verdict.flagged, false);
+    assert.equal(verdict.error, 'unparseable model output');
+  } finally {
+    delete process.env.FAKE_CLAUDE_UNPARSEABLE;
+    cleanup();
+  }
+});
+
+test('the verdict lands when the answer does, not when the process gets round to leaving', async () => {
+  const { moderator, cleanup } = setup();
+  try {
+    // Measured on the real thing at up to half a second per call, spent
+    // entirely after the answer was already on stdout.
+    process.env.FAKE_CLAUDE_LINGER_MS = '800';
+    const started = Date.now();
+    const verdict = await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+    const waited = Date.now() - started;
+
+    assert.equal(verdict.flagged, true);
+    assert.ok(waited < 600, `held on screen for ${waited}ms of a wait nothing was happening in`);
+  } finally {
+    delete process.env.FAKE_CLAUDE_LINGER_MS;
+    cleanup();
+  }
+});
+
+test('a message that arrives on its own does not wait out a window meant for filling a batch', async () => {
+  const { moderator, cleanup } = setup({ batchWindowMs: 4000, batchWindowIdleMs: 20 });
+  try {
+    const started = Date.now();
+    await moderator.moderate({ text: 'THIS IS UNACCEPTABLE' });
+    const waited = Date.now() - started;
+    assert.ok(waited < 2000, `the idle window, not the full one (waited ${waited}ms)`);
+  } finally {
+    cleanup();
+  }
+});
+
+test('with a call already out, the full window is used to fill the next one', async () => {
+  const { moderator, cleanup } = setup({ batchWindowMs: 60, batchWindowIdleMs: 0 });
+  try {
+    assert.equal(moderator.batchWindow(), 0, 'nothing in flight: go now');
+    moderator.inFlight = 1;
+    assert.equal(moderator.batchWindow(), 60, 'a call is out; whatever this collects queues behind it anyway');
+  } finally {
+    cleanup();
+  }
+});
+
+test('the idle window is never longer than the one it stands in for', () => {
+  const { moderator, cleanup } = setup({ batchWindowMs: 30, batchWindowIdleMs: 500 });
+  try {
+    assert.equal(moderator.batchWindow(), 30, 'a config that reads backwards must not make it slower');
+  } finally {
     cleanup();
   }
 });
