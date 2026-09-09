@@ -24,8 +24,8 @@ import { fileURLToPath } from 'node:url';
 import { Attacher } from '../../src/attach.js';
 import { State } from '../../src/state.js';
 import { CdpSession, listTargets, devtoolsVersion } from '../../src/cdp.js';
-import { DEFAULTS } from '../../src/config.js';
-import { menuModel } from '../../src/menubar.js';
+import { DEFAULTS, ConfigStore } from '../../src/config.js';
+import { menuModel, settingsMenu } from '../../src/menubar.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.join(HERE, '..', 'images');
@@ -159,12 +159,17 @@ async function shot(probe, name, { selector = '#shot', scale = 2 } = {}) {
 // The menu bar item itself is AppKit and only exists on a Mac. Everything it
 // says, though, is decided by menuModel() in Node — so the image is drawn from
 // that same JSON rather than from a description of it.
-function menuHtml(model) {
-  const rows = model.items.map((item) => {
+function menuHtml(model, { items = model.items, width = 296 } = {}) {
+  const rows = items.map((item) => {
     if (item.separator) return '<li class="sep"></li>';
     const cls = item.enabled === false ? 'info' : 'action';
-    const key = item.key ? `<span class="key">⌘${item.key.toUpperCase()}</span>` : '';
-    return `<li class="${cls}">${escapeHtml(item.label)}${key}</li>`;
+    // A checked item is drawn where the checkmark column is, so the settings
+    // menu lines up the way a real one does.
+    const tick = item.checked ? '✓' : '';
+    const trailing = item.submenu ? '▸' : item.key ? `⌘${item.key.toUpperCase()}` : '';
+    return `<li class="${cls}"><span class="tick">${tick}</span>`
+      + `<span class="text">${escapeHtml(item.label)}</span>`
+      + `<span class="key">${trailing}</span></li>`;
   }).join('\n');
 
   return `<!doctype html>
@@ -190,7 +195,7 @@ function menuHtml(model) {
     opacity: ${model.dimmed ? '.45' : '1'};
   }
   .menu {
-    width: 296px; margin: 5px 12px 0 auto;
+    width: ${width}px; margin: 5px 12px 0 auto;
     background: rgba(246,246,246,.98);
     border: 1px solid rgba(0,0,0,.12);
     border-radius: 8px;
@@ -200,10 +205,12 @@ function menuHtml(model) {
     font-size: 13px;
     color: #1d1d1f;
   }
-  .menu li { padding: 3px 14px; display: flex; justify-content: space-between; gap: 12px; }
+  .menu li { padding: 3px 14px 3px 6px; display: flex; align-items: baseline; gap: 6px; }
   .menu li.info { color: #8b8b8f; }
   .menu li.sep { padding: 0; margin: 5px 12px; border-top: 1px solid rgba(0,0,0,.10); }
-  .menu .key { color: #a0a0a4; }
+  .menu .tick { width: 12px; flex: 0 0 12px; text-align: center; font-size: 11px; }
+  .menu .text { flex: 1 1 auto; }
+  .menu .key { color: #a0a0a4; flex: 0 0 auto; }
 </style>
 <div id="shot">
   <div class="menubar">
@@ -248,19 +255,27 @@ async function main() {
 
   // The demo workspace, plus the menu rendered from the real menuModel().
   const workspace = fs.readFileSync(path.join(HERE, 'workspace.html'));
-  const menu = menuHtml(menuModel({
+  const shown = { ...DEFAULTS, ignoreChannels: ['#deploys', '#random'] };
+  const model = menuModel({
     paused: false,
     attached: 1,
+    // Shortened for the picture; the settings menu below shows the real one.
     model: 'claude-haiku-4-5',
-    triageMode: 'heuristic',
+    triageMode: shown.triageMode,
     uptimeMs: 74 * 60 * 1000,
     stats: { batched: 12, cacheHits: 38, softened: 5, condensed: 3, calls: 4, costUsd: 0.0104 },
-  }));
+    config: shown,
+  });
+  const menu = menuHtml(model);
+  // The settings menu, drawn from the same model the helper draws it from.
+  const settings = menuHtml(model, { items: settingsMenu(shown), width: 330 });
 
   const server = http.createServer((req, res) => {
-    const isMenu = req.url.startsWith('/menu');
+    const page = req.url.startsWith('/menu-settings') ? settings
+      : req.url.startsWith('/menu') ? menu
+        : workspace;
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(isMenu ? menu : workspace);
+    res.end(page);
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -282,15 +297,24 @@ async function main() {
   };
 
   const events = [];
+  // A real settings store, minus the writing to disk, so the button in the
+  // header is photographed doing what it actually does.
+  const store = new ConfigStore({
+    persist: false,
+    values: { ...DEFAULTS, cdpPort: chrome.cdpPort, targetUrlPattern: '^http://127\\.0\\.0\\.1:' },
+  });
   const attacher = new Attacher({
-    config: { ...DEFAULTS, cdpPort: chrome.cdpPort, targetUrlPattern: '^http://127\\.0\\.0\\.1:' },
+    config: store.values,
     moderator,
     state,
+    store,
     onEvent: (e) => events.push(e),
   });
+  store.onChange(() => { attacher.broadcastConfig().catch(() => {}); });
 
   let probe;
   let menuProbe;
+  let settingsProbe;
   try {
     await attacher.start();
     await waitFor('attach', () => events.some((e) => e.type === 'attached'));
@@ -326,7 +350,18 @@ async function main() {
     await sleep(250);
     await shot(probe, 'channel-revealed');
 
-    // 4. The menu bar item, from the real menu model.
+    // 4. The channel header, after clicking the button the page script drew
+    // there: the channel is on the daemon's ignore list and says so.
+    await evaluate(probe, `document.querySelector('.slacken-channel').click()`);
+    await waitFor('the channel to be ignored', () => store.values.ignoreChannels.includes('#eng-oncall'));
+    await waitFor('the button to say so', () => evaluate(
+      probe,
+      `document.querySelector('.slacken-channel').dataset.ignored === '1'`,
+    ));
+    await sleep(250);
+    await shot(probe, 'channel-ignored', { selector: '.channel-header' });
+
+    // 5. The menu bar item, from the real menu model.
     const menuTarget = await probe.send('Target.createTarget', { url: `${base}/menu` });
     menuProbe = await openProbe(chrome.cdpPort, `${base}/menu`);
     await menuProbe.send('Emulation.setDeviceMetricsOverride', {
@@ -335,9 +370,20 @@ async function main() {
     await sleep(250);
     await shot(menuProbe, 'menu-bar');
     await probe.send('Target.closeTarget', { targetId: menuTarget.targetId }).catch(() => {});
+
+    // 6. The settings menu, where the config file used to be the only way in.
+    const settingsTarget = await probe.send('Target.createTarget', { url: `${base}/menu-settings` });
+    settingsProbe = await openProbe(chrome.cdpPort, `${base}/menu-settings`);
+    await settingsProbe.send('Emulation.setDeviceMetricsOverride', {
+      width: 640, height: 620, deviceScaleFactor: 1, mobile: false,
+    });
+    await sleep(250);
+    await shot(settingsProbe, 'menu-settings');
+    await probe.send('Target.closeTarget', { targetId: settingsTarget.targetId }).catch(() => {});
   } finally {
     probe?.close();
     menuProbe?.close();
+    settingsProbe?.close();
     attacher.stop?.();
     chrome.child.kill('SIGKILL');
     server.close();

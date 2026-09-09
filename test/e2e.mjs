@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { Attacher } from '../src/attach.js';
 import { State } from '../src/state.js';
 import { CdpSession, listTargets, devtoolsVersion } from '../src/cdp.js';
-import { DEFAULTS } from '../src/config.js';
+import { DEFAULTS, ConfigStore } from '../src/config.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 // Any Chromium will do. Checked in order so this runs unchanged on a dev Mac,
@@ -149,18 +149,25 @@ test('injected script rewrites heated messages and leaves the rest alone', async
     },
   };
 
-  const config = {
-    ...DEFAULTS,
-    cdpPort,
-    targetUrlPattern: '^http://127\\.0\\.0\\.1:',
-    triageThreshold: 2,
-  };
+  // The same store the daemon runs on, minus the writing to disk: settings
+  // changed here have to reach the page exactly as they would in Slack.
+  const store = new ConfigStore({
+    persist: false,
+    values: {
+      ...DEFAULTS,
+      cdpPort,
+      targetUrlPattern: '^http://127\\.0\\.0\\.1:',
+      triageThreshold: 2,
+    },
+  });
+  const config = store.values;
 
   const events = [];
   // Named for what it holds, not just `state`: the DOM snapshots below use
   // that name for something else entirely.
   const pauseState = new State({ persist: false });
-  const attacher = new Attacher({ config, moderator, state: pauseState, onEvent: (e) => events.push(e) });
+  const attacher = new Attacher({ config, moderator, state: pauseState, store, onEvent: (e) => events.push(e) });
+  store.onChange(() => { attacher.broadcastConfig().catch(() => {}); });
 
   let probe;
   try {
@@ -460,6 +467,84 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       });
       assert.match(after.rewrite, /^NEUTRAL\(/);
       assert.equal(asked.filter((a) => a.text === text).length, 2, 'it has to actually be re-asked');
+    });
+    /* The button in Slack's own header, and the settings behind it. */
+
+    const button = () => read(`(() => {
+      const el = document.querySelector('.slacken-channel');
+      if (!el) return null;
+      return JSON.stringify({
+        label: el.querySelector('.slacken-channel-label').textContent,
+        ignored: el.dataset.ignored,
+        channel: el.dataset.channel,
+        title: el.title,
+        parent: el.parentElement.className,
+      });
+    })()`);
+
+    await t.test('the channel header carries a button saying what Slacken is doing here', async () => {
+      const raw = await waitFor('the channel button', () => button());
+      const state = JSON.parse(raw);
+      assert.equal(state.label, 'Ignore in Slacken');
+      assert.equal(state.ignored, '0');
+      assert.equal(state.channel, '#eng-oncall');
+      assert.equal(state.parent, 'p-view_header', 'it belongs in the header, next to the channel name');
+      assert.match(state.title, /#eng-oncall/);
+    });
+
+    await t.test('clicking it ignores the channel, and hands back what was written', async () => {
+      const before = asked.length;
+      await read(`document.querySelector('.slacken-channel').click()`);
+
+      await waitFor('the daemon to write the channel down', () => store.values.ignoreChannels.includes('#eng-oncall'));
+
+      const after = JSON.parse(await waitFor('the rewrites to be given back', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.heated.rewrite === null && p.slop.rewrite === null ? JSON.stringify(p) : null;
+      }));
+      assert.equal(after.heated.bodyVisible, true, 'the original has to be readable again');
+      assert.equal(after.heated.hold, null, 'and nothing should be left holding it');
+      assert.equal(after.slop.bodyVisible, true);
+
+      const now = JSON.parse(await button());
+      assert.equal(now.label, 'Ignored by Slacken');
+      assert.equal(now.ignored, '1');
+
+      // Ignoring a channel is not a promise about new messages only: it also
+      // has to stop costing anything.
+      await arrive('msg-ignored', 'THIS IS STILL COMPLETELY UNACCEPTABLE!! Answer me RIGHT NOW!!');
+      await sleep(1200);
+      assert.equal(asked.length, before, 'nothing in an ignored channel is worth a model call');
+    });
+
+    await t.test('clicking it again puts the channel back', async () => {
+      await read(`document.querySelector('.slacken-channel').click()`);
+      await waitFor('the daemon to drop the channel', () => !store.values.ignoreChannels.includes('#eng-oncall'));
+
+      const back = await waitFor('the rewrites to come back', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.heated.state === 'done' ? p.heated : null;
+      });
+      assert.match(back.rewrite, /^NEUTRAL\(/);
+      assert.equal(back.bodyVisible, false);
+      assert.equal(JSON.parse(await button()).label, 'Ignore in Slacken');
+    });
+
+    await t.test('a setting changed on the daemon reaches the page without a reload', async () => {
+      const before = asked.length;
+      // Nothing about this message looks heated, so under the default triage
+      // it was never worth a call — and it has been sitting on screen, clean,
+      // since the first assertion in this file.
+      assert.ok(!asked.some((a) => a.text.startsWith('Deploy is queued')));
+
+      store.update({ triageMode: 'always' });
+      const neutral = await waitFor('the message that was never worth asking about', async () => {
+        const p = JSON.parse(await snapshot()).neutral;
+        return p?.state === 'done' ? p : null;
+      });
+      assert.match(neutral.rewrite, /^NEUTRAL\(/);
+      assert.ok(asked.length > before);
+      assert.ok(asked.some((a) => a.text.startsWith('Deploy is queued')));
     });
   } finally {
     holdRelease?.();

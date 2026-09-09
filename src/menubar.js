@@ -5,6 +5,7 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { HOME_DIR, CONFIG_PATH } from './config.js';
+import { SETTINGS } from './settings.js';
 import { LOG_PATH } from './agent.js';
 
 const execFileAsync = promisify(execFile);
@@ -22,6 +23,11 @@ export const BUILD_DIR = path.join(HOME_DIR, 'menubar');
  * in Node and handed over as JSON. That keeps the Swift small enough to read
  * in one sitting, and keeps the part that can actually be wrong under test on
  * every platform, not just on a Mac with a screen.
+ *
+ * Settings work the same way. A settings item carries the value it would set
+ * and the endpoint to send it to, so the helper never has to know what a
+ * setting means, what a legal value for it is, or which one is in force: it
+ * draws the checkmark it is told to draw and posts the body it was given.
  */
 
 const ICON_RUNNING = 'text.bubble';
@@ -37,6 +43,7 @@ export function menuModel(status) {
     uptimeMs = 0,
     dailyBudgetUsd = 0,
     stats = {},
+    config = {},
   } = status || {};
 
   const seen = (stats.batched || 0) + (stats.cacheHits || 0);
@@ -69,7 +76,7 @@ export function menuModel(status) {
     { label: `${model || 'no model set'} · triage ${triageMode}`, enabled: false },
     { label: `Running for ${duration(uptimeMs)}`, enabled: false },
     { separator: true },
-    { label: 'Open config…', open: CONFIG_PATH },
+    { label: 'Settings', submenu: settingsMenu(config) },
     { label: 'Open log…', open: LOG_PATH },
     { separator: true },
     { label: 'Hide menu bar item', quit: true },
@@ -85,6 +92,101 @@ export function menuModel(status) {
     dimmed: paused || attached === 0,
     items,
   };
+}
+
+/* --------------------------------------------------------------- settings */
+
+/*
+ * Everything you would otherwise open the config file to change.
+ *
+ * Only settings that take effect on a running daemon are here. A port or a URL
+ * pattern cannot be changed under a live connection, so those stay in the file
+ * — and the file is one click away at the bottom for exactly that reason.
+ */
+export function settingsMenu(config) {
+  return [
+    { label: 'What gets rewritten', enabled: false },
+    choice('triageMode', config),
+    choice('triageThreshold', config),
+    choice('minSeverity', config),
+    { separator: true },
+    toggle('condenseEnabled', config),
+    choice('condenseMinWords', config),
+    { separator: true },
+    { label: 'Where it is left alone', enabled: false },
+    list('ignoreChannels', config),
+    list('ignoreSenders', config),
+    { separator: true },
+    { label: 'What it costs', enabled: false },
+    choice('model', config),
+    choice('dailyBudgetUsd', config),
+    { separator: true },
+    toggle('holdWhilePending', config),
+    toggle('persistVerdicts', config),
+    toggle('verbose', config),
+    { separator: true },
+    { label: 'Everything else…', open: CONFIG_PATH },
+  ];
+}
+
+function toggle(key, config) {
+  const on = Boolean(config[key]);
+  return {
+    label: SETTINGS[key].label,
+    checked: on,
+    post: '/config',
+    // The value to set, not the change to make: two clicks racing each other
+    // land on the same answer instead of flipping it twice.
+    body: { [key]: !on },
+  };
+}
+
+function choice(key, config) {
+  const spec = SETTINGS[key];
+  const current = config[key];
+  const known = spec.choices.find((c) => c.value === current);
+
+  const items = spec.choices.map((c) => ({
+    label: c.label,
+    checked: c.value === current,
+    post: '/config',
+    body: { [key]: c.value },
+  }));
+
+  // A value set by hand in the config file is not one of the choices offered,
+  // and must not disappear from the menu — or silently lose its checkmark —
+  // just because we did not think to offer it.
+  if (!known && current !== undefined) {
+    items.push({ separator: true }, { label: `Set to ${format(current)} in the config file`, enabled: false });
+  }
+
+  return { label: `${spec.label}: ${known ? known.short : format(current)}`, submenu: items };
+}
+
+function list(key, config) {
+  const spec = SETTINGS[key];
+  const entries = Array.isArray(config[key]) ? config[key] : [];
+
+  const items = entries.map((entry) => ({
+    label: entry,
+    checked: true,
+    // Clicking an entry stops it being ignored, which is the only thing you
+    // can do to one from here. Adding a channel happens in Slack, where you
+    // can see which channel you mean.
+    post: '/ignore',
+    body: { list: key, value: entry, ignored: false },
+  }));
+
+  if (!items.length) items.push({ label: spec.empty, enabled: false });
+  else items.push({ separator: true }, { label: 'Click one to stop ignoring it', enabled: false });
+
+  return { label: `${spec.label}: ${entries.length || 'none'}`, submenu: items };
+}
+
+function format(value) {
+  if (Array.isArray(value)) return value.length ? value.join(', ') : 'none';
+  if (typeof value === 'boolean') return value ? 'on' : 'off';
+  return String(value ?? 'unset');
 }
 
 function count(n, noun) {

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { coerceAll, inList, withEntry } from './settings.js';
 
 export const HOME_DIR = path.join(os.homedir(), '.slacken');
 export const CONFIG_PATH = path.join(HOME_DIR, 'config.json');
@@ -75,16 +76,20 @@ export const DEFAULTS = {
   verbose: false,
 };
 
-export function loadConfig() {
-  let onDisk = {};
+export function loadConfig(file = CONFIG_PATH) {
+  return { ...DEFAULTS, ...readConfigFile(file) };
+}
+
+function readConfigFile(file) {
   try {
-    onDisk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch (err) {
     if (err.code !== 'ENOENT') {
-      console.warn(`[slacken] ignoring unreadable ${CONFIG_PATH}: ${err.message}`);
+      console.warn(`[slacken] ignoring unreadable ${file}: ${err.message}`);
     }
+    return {};
   }
-  return { ...DEFAULTS, ...onDisk };
 }
 
 export function writeDefaultConfig() {
@@ -92,6 +97,100 @@ export function writeDefaultConfig() {
   if (fs.existsSync(CONFIG_PATH)) return CONFIG_PATH;
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2) + '\n');
   return CONFIG_PATH;
+}
+
+/*
+ * The running configuration, and the only thing allowed to change it.
+ *
+ * Settings are adjusted from the menu bar, from a button inside Slack and from
+ * the terminal, which means three places could each hold their own idea of
+ * what Slacken is currently doing. They do not: they all go through one store,
+ * which validates the change, writes it to the config file so it survives a
+ * restart, and tells everyone holding the config that it moved.
+ *
+ * The values object is mutated in place rather than replaced. The moderator,
+ * the attacher and the HTTP server were handed that object at startup and read
+ * fields off it as they work, so a change lands on a message being judged
+ * right now, without any of them subscribing to anything.
+ */
+export class ConfigStore {
+  constructor({ file = CONFIG_PATH, values = null, persist = true } = {}) {
+    this.file = file;
+    this.persist = persist;
+    this.values = values || loadConfig(file);
+    this.listeners = new Set();
+  }
+
+  // Returns the keys that actually moved, plus anything it refused and why.
+  // A patch is validated whole before any of it is applied: a menu click that
+  // carries one bad value must not leave the other half of it applied.
+  update(patch) {
+    const { values, errors } = coerceAll(patch);
+    const changed = [];
+    for (const [key, value] of Object.entries(values)) {
+      if (same(this.values[key], value)) continue;
+      this.values[key] = value;
+      changed.push(key);
+    }
+    if (changed.length) {
+      this.save(changed);
+      this.announce(changed);
+    }
+    return { changed, errors, values: this.values };
+  }
+
+  // Adding the channel you are reading to the ignore list is the one change
+  // that arrives from inside Slack, and the one that has to be idempotent:
+  // clicking an already-ignoring button twice should not add it twice.
+  setIgnored(key, value, ignored) {
+    const entry = String(value ?? '').trim();
+    if (!entry) return { changed: [], errors: [{ key, message: 'nothing to ignore' }], values: this.values };
+    return this.update({ [key]: withEntry(this.values[key], entry, ignored) });
+  }
+
+  isIgnored(key, value) {
+    return inList(this.values[key], value);
+  }
+
+  save(changed) {
+    if (!this.persist) return;
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      // Merged over what is on disk, so keys we do not know about — and keys
+      // an older version wrote — survive being edited from the menu.
+      const merged = { ...DEFAULTS, ...readConfigFile(this.file) };
+      for (const key of changed) merged[key] = this.values[key];
+      // Written beside the real file and moved into place: a daemon killed
+      // mid-write must not leave a half-written config to be read at login.
+      const temp = `${this.file}.writing`;
+      fs.writeFileSync(temp, JSON.stringify(merged, null, 2) + '\n');
+      fs.renameSync(temp, this.file);
+    } catch (err) {
+      console.warn(`[slacken] could not write ${this.file}: ${err.message}`);
+    }
+  }
+
+  announce(changed) {
+    for (const listener of this.listeners) {
+      try {
+        listener(changed, this.values);
+      } catch {
+        // A listener that throws must not stop the others being told.
+      }
+    }
+  }
+
+  onChange(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+}
+
+function same(a, b) {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => v === b[i]);
+  }
+  return a === b;
 }
 
 // Only the fields the injected page script needs to make triage decisions,
