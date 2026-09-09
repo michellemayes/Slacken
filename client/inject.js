@@ -40,6 +40,7 @@
     maxChars: 4000,
     holdWhilePending: true,
     persistVerdicts: true,
+    paused: false,
     selfNames: [],
     ignoreSenders: [],
     ignoreChannels: [],
@@ -81,6 +82,10 @@
   };
 
   const log = (...args) => { if (CONFIG.verbose) console.log('[slacken]', ...args); };
+
+  // Set from the daemon, which owns the pause state. While paused nothing is
+  // asked about and nothing stays hidden: you read exactly what was written.
+  let paused = Boolean(CONFIG.paused);
 
   /* ---------------------------------------------------------------- styles */
 
@@ -525,6 +530,16 @@
     dropAttr(body, ATTR_BODY);
   }
 
+  // Pausing has to clear held messages as well as revealed ones, or a message
+  // caught mid-verdict would stay behind "checking…" with nothing coming to
+  // replace it.
+  function releaseHolds() {
+    document.querySelectorAll('.slacken-panel[data-pending]').forEach((panel) => {
+      const item = panel.closest(SEL.item);
+      if (item) clearItem(item, bodyFor(item));
+    });
+  }
+
   function setAll(open) {
     revealAll = open;
     document.querySelectorAll(`[${ATTR_STATE}="done"]`).forEach((item) => {
@@ -572,6 +587,11 @@
         ? { ...base, act: 'apply', verdict: cached, state: 'done' }
         : { ...base, act: 'clear', state: 'clean' };
     }
+
+    // Paused. Verdicts already on screen stay, revealed by setAll, so the badge
+    // still flips back; everything else is released and left unexamined, with
+    // no state stamped, so resuming gives it a fresh look.
+    if (paused) return { ...base, act: 'idle' };
 
     // Second fast path: decisions that belong to this item rather than to the
     // text, so they cannot live in the shared cache.
@@ -663,25 +683,43 @@
 
   const inFlight = new Set();
 
+  // Every copy of this text on screen, not just the one that asked for it.
+  function itemsFor(sig) {
+    return Array.from(document.querySelectorAll(`[${ATTR_HASH}="${sig}"]`));
+  }
+
   function startAsk(p) {
     if (inFlight.has(p.key)) return;
     inFlight.add(p.key);
 
     ask({ text: p.text, sender: p.sender, channel: p.channel }).then((verdict) => {
       if (verdict.error) log('daemon error', verdict.error);
+
+      // A verdict that lands after a pause began says nothing about the
+      // message, only about the pause. Remembering it would leave this message
+      // unexamined for as long as the page lived, long after resuming.
+      if (paused || verdict.reason === 'paused') {
+        for (const item of itemsFor(p.sig)) {
+          dirty.add(item);
+          item.removeAttribute(ATTR_STATE);
+          item.removeAttribute(ATTR_HASH);
+        }
+        return;
+      }
+
       remember(p.key, verdict);
       link(p.sig, p.key);
       persistSoon();
     }).catch((err) => {
       log('ask failed', err.message);
       // Never leave a message hidden behind a hold that will not lift.
-      document.querySelectorAll(`[${ATTR_HASH}="${p.sig}"]`).forEach((item) => {
+      for (const item of itemsFor(p.sig)) {
         if (item.getAttribute(ATTR_STATE) === 'pending') setAttr(item, ATTR_STATE, 'error');
-      });
+      }
     }).finally(() => {
       inFlight.delete(p.key);
-      // Every copy of this text on screen, not just the one that asked.
-      refresh(`[${ATTR_HASH}="${p.sig}"]`);
+      for (const item of itemsFor(p.sig)) dirty.add(item);
+      flush();
     });
   }
 
@@ -798,6 +836,38 @@
     event.preventDefault();
     setAll(!revealAll);
   });
+
+  // Called by the daemon whenever the pause state changes, and once at
+  // injection time via CONFIG.paused.
+  window.__slackenSetPaused = (on) => {
+    const next = Boolean(on);
+    if (next === paused) return;
+    paused = next;
+
+    if (paused) {
+      // A hold with no verdict coming is just a message you cannot read, so
+      // release those outright; rewrites already decided keep their badge and
+      // simply show the original.
+      releaseHolds();
+      setAll(true);
+      log('paused: showing every original');
+      sweep();
+      return;
+    }
+
+    // Anything the pause left unexamined — or released only because we were
+    // paused — deserves a second look. Messages already rewritten keep their
+    // verdict, so resuming costs nothing for what was decided before.
+    document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
+      const state = el.getAttribute(ATTR_STATE);
+      if (state === 'done' || state === 'skipped') return;
+      el.removeAttribute(ATTR_STATE);
+      el.removeAttribute(ATTR_HASH);
+    });
+    setAll(false);
+    log('resumed');
+    sweep();
+  };
 
   window.__slackenRescan = () => {
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((item) => {

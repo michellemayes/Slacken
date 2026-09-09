@@ -16,6 +16,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Attacher } from '../src/attach.js';
+import { State } from '../src/state.js';
 import { CdpSession, listTargets, devtoolsVersion } from '../src/cdp.js';
 import { DEFAULTS } from '../src/config.js';
 
@@ -111,17 +112,28 @@ test('injected script rewrites heated messages and leaves the rest alone', async
   const asked = [];
   let holdRelease;
   const heldTurn = new Promise((resolve) => { holdRelease = resolve; });
+  let pauseRelease;
+  const pausedTurn = new Promise((resolve) => { pauseRelease = resolve; });
+
+  const CLEAN = { flagged: false, hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null };
 
   const moderator = {
     stats: {},
     async moderate({ text, sender, channel }) {
+      // The real Moderator refuses before it reaches the model; this stub
+      // stands in for both, so it has to refuse in the same place.
+      if (pauseState.paused) return { ...CLEAN, reason: 'paused' };
       asked.push({ text, sender, channel });
+
+      // The message used to test what happens when a verdict lands after a
+      // pause has already begun: it is held open until the test says so.
+      if (text.startsWith('HOLD EVERYTHING')) await pausedTurn;
 
       // The message used to test the optimistic hold: block until the test
       // has had a chance to look at the mid-flight state, then come back clean.
       if (text.startsWith('PLEASE take a look')) {
         await heldTurn;
-        return { flagged: false, hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null };
+        return { ...CLEAN };
       }
 
       const verbose = text.split(/\s+/).length >= 45;
@@ -145,7 +157,10 @@ test('injected script rewrites heated messages and leaves the rest alone', async
   };
 
   const events = [];
-  const attacher = new Attacher({ config, moderator, onEvent: (e) => events.push(e) });
+  // Named for what it holds, not just `state`: the DOM snapshots below use
+  // that name for something else entirely.
+  const pauseState = new State({ persist: false });
+  const attacher = new Attacher({ config, moderator, state: pauseState, onEvent: (e) => events.push(e) });
 
   let probe;
   try {
@@ -190,6 +205,8 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         dense: pick('msg-dense'),
         code: pick('msg-code'),
         hold: pick('msg-hold'),
+        arrived: pick('msg-arrived'),
+        inflight: pick('msg-inflight'),
       });
     })()`);
 
@@ -329,8 +346,92 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       // Repair comes from the in-page cache, not another model call.
       assert.equal(asked.filter((a) => a.text.startsWith('WHY is the deploy')).length, 1);
     });
+
+    // Everything below is the pause: the menu bar item's only real job is
+    // flipping this, so this is the behaviour behind that click.
+    await t.test('pausing shows every rewritten message as it was written', async () => {
+      pauseState.setPaused(true);
+      const paused = await waitFor('originals revealed', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.heated.bodyState === 'shown' && p.slop.bodyState === 'shown' ? p : null;
+      });
+      assert.equal(paused.heated.bodyVisible, true);
+      assert.equal(paused.heated.action, 'hide original', 'the badge has to agree with what is on screen');
+      assert.equal(paused.slop.bodyVisible, true);
+    });
+
+    // Slack renders new messages by appending to the virtual list; this does
+    // the same thing to the fixture.
+    const arrive = (id, text) => read(`(() => {
+      const item = document.getElementById('msg-heated').cloneNode(true);
+      item.id = ${JSON.stringify(id)};
+      item.removeAttribute('data-slacken');
+      item.removeAttribute('data-slacken-hash');
+      item.querySelectorAll('.slacken-panel').forEach((el) => el.remove());
+      const body = item.querySelector('.c-message_kit__blocks');
+      body.removeAttribute('data-slacken-body');
+      item.querySelector('.p-rich_text_section').textContent = ${JSON.stringify(text)};
+      document.querySelector('.c-virtual_list__scroll_container').appendChild(item);
+    })()`);
+
+    await t.test('a message that arrives during a pause is never sent to the model', async () => {
+      const before = asked.length;
+      await arrive('msg-arrived', 'THIS IS COMPLETELY UNACCEPTABLE!! Why has NOBODY fixed the build??');
+
+      // Long enough for a scan to have run and not asked about it.
+      await sleep(1500);
+      const arrived = JSON.parse(await snapshot()).arrived;
+      assert.ok(arrived, 'the new message should be in the DOM');
+      assert.equal(arrived.state, null, 'a paused Slacken should not even triage');
+      assert.equal(arrived.bodyVisible, true, 'and it must be readable as written');
+      assert.equal(asked.length, before, 'a pause has to be free');
+    });
+
+    await t.test('resuming picks up what the pause let through', async () => {
+      pauseState.setPaused(false);
+      const arrived = await waitFor('the message that arrived during the pause', async () => {
+        const p = JSON.parse(await snapshot()).arrived;
+        return p?.state === 'done' ? p : null;
+      });
+      assert.match(arrived.rewrite, /^NEUTRAL\(/);
+      assert.equal(arrived.bodyState, 'hidden');
+
+      // A message decided before the pause keeps its verdict rather than
+      // costing a second call to reach the same answer.
+      const heated = JSON.parse(await snapshot()).heated;
+      assert.equal(heated.bodyState, 'hidden');
+      assert.equal(heated.action, 'show original');
+      assert.equal(asked.filter((a) => a.text.startsWith('WHY is the deploy')).length, 1);
+    });
+
+    await t.test('a verdict that lands during a pause is thrown away, not remembered', async () => {
+      const text = 'HOLD EVERYTHING RIGHT NOW, the build is COMPLETELY BROKEN!!';
+      await arrive('msg-inflight', text);
+      await waitFor('the message to be sent for moderation', () => asked.some((a) => a.text === text));
+
+      // The verdict is still in flight. Pause, then let it come back: it is a
+      // real rewrite, and applying it would be Slacken changing the screen
+      // after being told to stop.
+      pauseState.setPaused(true);
+      pauseRelease();
+      await sleep(1000);
+
+      const during = JSON.parse(await snapshot()).inflight;
+      assert.equal(during.rewrite, null, 'nothing should have been swapped in');
+      assert.equal(during.bodyVisible, true);
+
+      // ...and forgetting it is what lets the message be looked at again.
+      pauseState.setPaused(false);
+      const after = await waitFor('the message examined again after resuming', async () => {
+        const p = JSON.parse(await snapshot()).inflight;
+        return p?.state === 'done' ? p : null;
+      });
+      assert.match(after.rewrite, /^NEUTRAL\(/);
+      assert.equal(asked.filter((a) => a.text === text).length, 2, 'it has to actually be re-asked');
+    });
   } finally {
     holdRelease?.();
+    pauseRelease?.();
     probe?.close();
     attacher.stop();
     server.close();

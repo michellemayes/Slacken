@@ -11,8 +11,13 @@ export const DEFAULTS = {
   // Which DevTools page targets to inject into. Widen this if your workspace
   // lives on a custom domain.
   targetUrlPattern: '^https://([a-z0-9-]+\\.)*slack\\.com/',
-  // Local HTTP API, used by `slacken test` and health checks. Loopback only.
+  // Local HTTP API, used by `slacken test`, `slacken status`, health checks
+  // and the menu bar item. Loopback only.
   httpPort: 8787,
+  // Show a menu bar item while the daemon runs: what it has done, and a
+  // pause/resume toggle. Needs `swiftc` (Xcode Command Line Tools); without it
+  // the daemon says so once and carries on.
+  menuBar: true,
 
   // Which model does the rewriting. Haiku keeps it cheap and fast; messages
   // arrive faster than you read them.
@@ -89,9 +94,12 @@ export function writeDefaultConfig() {
   return CONFIG_PATH;
 }
 
-// Only the fields the injected page script needs to make triage decisions.
-export function pageConfig(config) {
+// Only the fields the injected page script needs to make triage decisions,
+// plus whether Slacken is paused right now — a page injected during a pause
+// must not start rewriting before the daemon gets a chance to tell it.
+export function pageConfig(config, { paused = false } = {}) {
   return {
+    paused,
     triageMode: config.triageMode,
     triageThreshold: config.triageThreshold,
     condenseEnabled: config.condenseEnabled,

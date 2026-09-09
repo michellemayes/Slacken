@@ -44,6 +44,42 @@ jobs:
 
       - run: npm test
 
+  menubar:
+    name: menu bar helper builds
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      # The helper is AppKit, so nothing but a real Mac can tell us whether it
+      # still compiles. Build it the way the daemon does, through the same code.
+      - name: swiftc builds it, through buildHelper()
+        run: |
+          node --input-type=module -e "
+            import { buildHelper } from './src/menubar.js';
+            const binary = await buildHelper();
+            console.log('built', binary);
+          "
+
+      # A second call must be a cache hit, not a second compile: the daemon
+      # calls this on every start.
+      - name: A rebuild reuses the cached binary
+        run: |
+          node --input-type=module -e "
+            import fs from 'node:fs';
+            import { buildHelper } from './src/menubar.js';
+            const first = await buildHelper();
+            const stamp = fs.statSync(first).mtimeMs;
+            const second = await buildHelper();
+            if (second !== first) throw new Error('same source should give the same binary');
+            if (fs.statSync(second).mtimeMs !== stamp) throw new Error('it recompiled instead of reusing');
+            console.log('reused', second);
+          "
+
   installer:
     name: installer is well-formed
     runs-on: macos-latest
