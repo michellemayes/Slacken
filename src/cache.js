@@ -49,6 +49,13 @@ export class Cache {
     this.scheduleFlush();
   }
 
+  // Every entry was judged against thresholds that have just moved, so none of
+  // them answers the question being asked now.
+  clear() {
+    this.map.clear();
+    this.scheduleFlush();
+  }
+
   scheduleFlush() {
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {

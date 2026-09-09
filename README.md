@@ -11,7 +11,9 @@ them. Two things happen:
 
 Nothing is deleted and nothing is sent anywhere. Every rewrite carries a small
 badge, and one click brings the original back. A menu bar item shows what has
-been changed and pauses the whole thing.
+been changed, adjusts every setting worth adjusting, and pauses the whole
+thing. A button in Slack's own channel header takes the channel you are reading
+out of its way.
 
 ![A Slack channel with two messages rewritten by Slacken, each carrying a badge
 reading "softened" or "condensed" and a "show original" link](docs/images/channel-rewritten.png)
@@ -139,12 +141,25 @@ what the session cost.
 | `test "<message>"` | Rewrite one string and print the verdict — no Slack needed |
 | `doctor` | Check Slack, `claude`, the debug port, and visible Slack windows |
 | `config` | Print the config file path and contents |
+| `set [<name> <value>]` | List the settings you can change, or change one |
 | `status` | What the running daemon has done so far |
 | `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
 | `agent install\|uninstall\|status\|logs` | Manage the login agent |
 
 `--force` lets it quit a running Slack so it can be relaunched with the port.
 `Cmd+Shift+U` inside Slack toggles every original on the screen at once.
+
+`--always` and `--verbose` apply to that run only. `slacken set` is the lasting
+version, and is the terminal view of the settings menu below: it asks the
+running daemon to make the change, so it lands on what is on screen right now,
+and the daemon writes it to the config file. With nothing running it edits the
+file directly.
+
+```sh
+slacken set                          # every adjustable setting and its value
+slacken set triageMode always
+slacken set ignoreChannels "#deploys, #random"
+```
 
 ## The menu bar item
 
@@ -153,8 +168,8 @@ two questions this tool raises the moment you leave it running: *is it on right
 now*, and *how much of what I just read was not what was written*.
 
 ![The Slacken menu bar item, open, listing what it is watching, a Pause item,
-counts of messages rewritten and model calls made, the running cost, and items
-to open the config and the log](docs/images/menu-bar.png)
+counts of messages rewritten and model calls made, the running cost, a Settings
+submenu and an item to open the log](docs/images/menu-bar.png)
 
 The icon dims whenever nothing is being changed — paused, or attached to no
 Slack window — so the state is readable without opening anything.
@@ -177,16 +192,62 @@ quietly undid itself would leave you reading a rewritten feed you believed you
 had turned off. The menu bar item is what stops that becoming a pause you
 forgot about.
 
+### Settings, without the config file
+
+Everything worth changing while Slacken runs is under **Settings**, and takes
+effect on the messages already on your screen.
+
+![The Slacken settings menu, listing what gets rewritten, where it is left
+alone, what it costs, and toggles for holding, remembering and
+logging](docs/images/menu-settings.png)
+
+Pick a model, cap the day's spend, move the sensitivity, decide what counts as
+harsh enough to soften, turn condensing off, or stop ignoring a channel you
+ignored last week. A change is applied to the running daemon, written to
+`~/.slacken/config.json` so it survives a restart, and pushed into every open
+Slack window — the verdicts decided under the old settings are dropped rather
+than left on screen answering a question you have stopped asking.
+
+Only settings that can honestly change under a live connection are offered. A
+debug port or a URL pattern cannot, so those stay in the file, which
+**Everything else…** opens.
+
+### How the item is drawn
+
 The item is a small AppKit program in `menubar/SlackenMenuBar.swift`, compiled
 on first run and cached in `~/.slacken/menubar/` by the hash of its source. It
 decides nothing: the wording, the counts and the actions are rendered by
 `src/menubar.js` and fetched as JSON from `GET /menubar`, which is why the part
-that can be wrong is testable on any machine. It holds the daemon's stdin, so
-it cannot outlive the daemon even if that daemon is killed outright.
+that can be wrong is testable on any machine. A settings item is no different:
+it arrives carrying the value it would set and the endpoint to post it to, so
+the Swift never learns what a setting means or which one is in force — it draws
+the checkmark it is told to draw. It holds the daemon's stdin, so it cannot
+outlive the daemon even if that daemon is killed outright.
 
 Without `swiftc` there is no item, one line says so at startup, and everything
 else runs unchanged. Set `menuBar` to `false` in the config to skip it, or
 click **Hide menu bar item** to dismiss it for this run.
+
+## Ignoring a channel, from inside Slack
+
+The menu bar cannot know which channel you are reading. Slack can, so the
+button lives there — in the channel header, next to the channel name. It reads
+**Ignore in Slacken** until you click it (it is in the first image on this
+page), and afterwards:
+
+![A Slack channel header showing the channel name, the member count, and a
+small button reading "Ignored by Slacken"](docs/images/channel-ignored.png)
+
+One click and nothing in that channel is rewritten again: the rewrites already
+on screen give their originals back, held messages are released, and messages
+arriving there stop costing anything at all. Clicking it again puts the channel
+back.
+
+Either way the change goes to the daemon, which owns the list: it writes it to
+the config file and tells every other Slack window, so the ignore list is one
+thing everywhere rather than a per-window opinion, and it is still there
+tomorrow. The menu bar lists what is ignored and takes channels back off the
+list; this is the end that can see which channel you mean.
 
 ## Speed and cost
 
@@ -222,30 +283,41 @@ Two things measured and deliberately **not** used:
 
 ## Configuration
 
-`~/.slacken/config.json`, created on first run.
+`~/.slacken/config.json`, created on first run. These are the settings that can
+be changed while Slacken is running — from the menu bar, from the button in
+Slack, or with `slacken set` — and they take effect on what is already on your
+screen.
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `model` | `claude-haiku-4-5-20251001` | Small and fast; messages arrive quicker than you read them |
-| `batchSize` / `batchWindowMs` | `8` / `120` | How many messages share a call, and how long to wait to fill one |
-| `maxConcurrency` | `2` | Concurrent `claude -p` processes |
-| `useJsonSchema` | `true` | Structured output; guarantees parseable verdicts |
 | `dailyBudgetUsd` | `0` | Stop calling the model past this much in a day. `0` disables the cap |
 | `triageMode` | `heuristic` | `always` sends every message to the model |
 | `triageThreshold` | `2` | Local score needed before a call is worth making |
 | `minSeverity` | `2` | Model severity (0–3) required before a tone rewrite is applied |
 | `condenseEnabled` | `true` | Set `false` to leave long messages alone |
 | `condenseMinWords` | `45` | Shorter messages are never condensed |
-| `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
 | `holdWhilePending` | `true` | Hide a suspected message while the model decides, rather than after |
 | `persistVerdicts` | `true` | Keep rewrites in Slack's `localStorage` too, so a reload repaints instantly. `false` leaves nothing behind |
 | `selfNames` | `[]` | Fallback if your display name is not detected from the Slack UI |
 | `ignoreSenders` | `[]` | Never rewrite these people |
-| `ignoreChannels` | `[]` | Never rewrite in these channels |
+| `ignoreChannels` | `[]` | Never rewrite in these channels — the button in Slack's channel header edits this |
 | `maxChars` | `4000` | Longer messages are left alone |
+| `verbose` | `false` | Log every verdict |
+
+These are read at startup. Change one in the file and restart the daemon — a
+debug port cannot honestly be moved under a live connection, so it is not
+offered anywhere that implies it can.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `batchSize` / `batchWindowMs` | `8` / `120` | How many messages share a call, and how long to wait to fill one |
+| `maxConcurrency` | `2` | Concurrent `claude -p` processes |
+| `useJsonSchema` | `true` | Structured output; guarantees parseable verdicts |
+| `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
 | `menuBar` | `true` | Show the menu bar item. Needs `swiftc`; without it, skipped |
 | `cdpPort` | `9222` | Slack's debug port |
-| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/pause`, `/moderate`) |
+| `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
 | `claudeBin` / `claudeArgs` | `claude` / `[]` | If `claude` lives somewhere unusual, or you want extra flags |
 
@@ -303,10 +375,15 @@ npm run test:fast   # skips the browser test
   actually invoked. Asserts that four simultaneous messages cost one process.
 - `test/agent.mjs` — the generated LaunchAgent plist, including that it carries
   a `PATH` that can actually find `claude`.
-- `test/control.mjs` — pausing, and the menu the menu bar item draws. Asserts
-  that a pause survives a restart, that a paused Slacken makes no model call
-  and caches nothing, that the control endpoints agree with each other, and
-  that the menu offers exactly one of pause and resume. It also covers the
+- `test/control.mjs` — pausing, settings, and the menu the menu bar item draws.
+  Asserts that a pause survives a restart, that a paused Slacken makes no model
+  call and caches nothing, that the control endpoints agree with each other, and
+  that the menu offers exactly one of pause and resume. On settings: that a
+  refused value leaves the old one standing, that a patch with one bad value in
+  it is refused whole, that a change reaches disk without rewriting the keys
+  around it, that the config object handed out at startup is the one that
+  changes, that ignoring a channel twice ignores it once, and that a checkmark
+  in the menu can never disagree with the daemon. It also covers the
   helper around the helper: the compile is cached by source hash and never
   repeated, a failed compile leaves nothing that looks finished, closing stdin
   is what stops the item outliving the daemon, and a crashing one is retried
@@ -327,7 +404,11 @@ npm run test:fast   # skips the browser test
   what was written, a message that arrives during a pause is never triaged or
   sent, a verdict that lands after a pause has begun is thrown away rather than
   quietly applied later, and resuming picks up what the pause let through
-  without re-asking about anything already decided.
+  without re-asking about anything already decided. It also drives the button
+  in the channel header: clicking it puts the channel on the daemon's ignore
+  list, gives back every original on screen, and stops new messages there
+  costing anything; clicking it again brings the rewrites back; and a setting
+  changed on the daemon reaches the page and is acted on without a reload.
   It finds any Chromium on the machine and skips itself if there is none;
   `SLACKEN_TEST_CHROME` overrides the search.
 
@@ -347,8 +428,11 @@ drawing of what the code does. `docs/demo/capture.mjs` serves the fake
 workspace in `docs/demo/workspace.html`, runs the real attach-and-inject path
 against a headless Chromium, and photographs the result — so every badge,
 hidden original and reveal toggle was drawn by the page script that ships. The
-menu image is rendered from the real `menuModel()` output, because that is
-where the wording and the counts are actually decided.
+menu images are rendered from the real `menuModel()` and `settingsMenu()`
+output, because that is where the wording, the counts and the checkmarks are
+actually decided. The button in the channel header was drawn by the page
+script, and the picture of it reading "Ignored by Slacken" was taken after
+clicking it — against a real settings store, in the same run.
 
 Two things are staged: the channel, so nobody's real messages end up in a
 README, and the verdicts, which come from a stub rather than `claude -p` so
@@ -372,7 +456,8 @@ src/menubar.js       render the menu, build and supervise the helper
 src/prompt.js        the rewriting prompt and response schema
 src/cache.js         disk-backed verdict cache
 src/server.js        loopback control API
-src/config.js        defaults and ~/.slacken/config.json
+src/config.js        defaults, ~/.slacken/config.json, the live settings store
+src/settings.js      what can be changed while it runs, and what a valid value is
 client/inject.js     the page script: find, triage, hold, replace, reveal
 menubar/             SlackenMenuBar.swift, the menu bar item itself
 docs/demo/           the fake workspace and capture script behind the images

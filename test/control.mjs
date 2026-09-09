@@ -14,8 +14,9 @@ import { fileURLToPath } from 'node:url';
 import { State } from '../src/state.js';
 import { Moderator } from '../src/moderate.js';
 import { createServer } from '../src/server.js';
-import { menuModel, buildHelper, MenuBar } from '../src/menubar.js';
-import { DEFAULTS } from '../src/config.js';
+import { menuModel, settingsMenu, buildHelper, MenuBar } from '../src/menubar.js';
+import { DEFAULTS, ConfigStore, loadConfig } from '../src/config.js';
+import { coerce, coerceAll, withEntry, inList, invalidatesCache } from '../src/settings.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fake-claude.mjs');
@@ -163,10 +164,12 @@ async function withServer(run, { paused = false } = {}) {
   const { mod, cleanup } = moderator(state);
   let attached = 1;
 
+  const store = new ConfigStore({ values: { ...DEFAULTS, httpPort: 0 }, persist: false });
   const server = await createServer({
-    config: { ...DEFAULTS, httpPort: 0 },
+    config: store.values,
     moderator: mod,
     state,
+    store,
     getStatus: () => ({ attached }),
     reinject: async () => {},
   });
@@ -180,7 +183,7 @@ async function withServer(run, { paused = false } = {}) {
   })).json();
 
   try {
-    await run({ get, post, postJson, state, setAttached: (n) => { attached = n; } });
+    await run({ get, post, postJson, state, store, setAttached: (n) => { attached = n; } });
   } finally {
     server.close();
     cleanup();
@@ -322,14 +325,251 @@ test('the menu survives a status with nothing in it', () => {
   assert.equal(menuModel(undefined).items.length, model.items.length);
 });
 
-test('every menu item is a separator, a label, or a thing you can click', () => {
-  for (const item of menuModel(STATUS).items) {
-    if (item.separator) continue;
-    assert.equal(typeof item.label, 'string');
-    assert.ok(item.label.length > 0);
-    const clickable = Boolean(item.post || item.open || item.quit);
-    assert.equal(clickable, item.enabled !== false, 'a clickable item must not be drawn as a label');
+test('every menu item is a separator, a label, a submenu, or a thing you can click', () => {
+  const check = (items) => {
+    for (const item of items) {
+      if (item.separator) continue;
+      assert.equal(typeof item.label, 'string');
+      assert.ok(item.label.length > 0);
+      if (item.submenu) {
+        assert.ok(item.submenu.length > 0, 'a submenu with nothing in it is a dead end');
+        check(item.submenu);
+        continue;
+      }
+      const clickable = Boolean(item.post || item.open || item.quit);
+      assert.equal(clickable, item.enabled !== false, 'a clickable item must not be drawn as a label');
+    }
+  };
+  check(menuModel({ ...STATUS, config: { ...DEFAULTS } }).items);
+});
+
+/* ---------------------------------------------------------------- settings */
+
+function tempConfig(initial) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-config-'));
+  const file = path.join(dir, 'config.json');
+  if (initial) fs.writeFileSync(file, JSON.stringify(initial, null, 2));
+  return { file, read: () => JSON.parse(fs.readFileSync(file, 'utf8')), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+test('a setting only accepts values that mean something', () => {
+  assert.equal(coerce('triageMode', 'always'), 'always');
+  assert.throws(() => coerce('triageMode', 'sometimes'), /heuristic, always/);
+
+  assert.equal(coerce('condenseEnabled', 'off'), false);
+  assert.equal(coerce('condenseEnabled', true), true);
+  assert.throws(() => coerce('condenseEnabled', 'maybe'), /on or off/);
+
+  assert.equal(coerce('condenseMinWords', '60'), 60);
+  assert.throws(() => coerce('condenseMinWords', '2'), /between 10 and 500/);
+  assert.throws(() => coerce('condenseMinWords', 'lots'), /a number/);
+
+  assert.equal(coerce('dailyBudgetUsd', '0.5'), 0.5);
+  assert.deepEqual(coerce('ignoreChannels', '#eng, #random ,'), ['#eng', '#random']);
+  assert.deepEqual(coerce('ignoreChannels', ['#eng', '#ENG']), ['#eng'], 'one channel, however it is typed');
+});
+
+test('settings that cannot be changed under a running daemon say so', () => {
+  // Changing the debug port on a live connection would be a lie, not a change.
+  for (const key of ['cdpPort', 'httpPort', 'targetUrlPattern', 'claudeBin']) {
+    assert.throws(() => coerce(key, '1'), /cannot be changed while Slacken runs/);
   }
+});
+
+test('a patch with one bad value in it is refused whole', () => {
+  const { values, errors } = coerceAll({ triageMode: 'always', minSeverity: 9 });
+  assert.equal(values.triageMode, 'always');
+  assert.equal(values.minSeverity, undefined);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /between 0 and 3/);
+});
+
+test('an ignore list is edited by entry, case-insensitively', () => {
+  assert.deepEqual(withEntry([], '#eng', true), ['#eng']);
+  assert.deepEqual(withEntry(['#eng'], '#ENG', true), ['#ENG'], 'ignoring twice ignores once');
+  assert.deepEqual(withEntry(['#eng', '#ops'], '#ENG', false), ['#ops']);
+  assert.deepEqual(withEntry(['#eng'], '   ', true), ['#eng'], 'nothing to add is not an empty entry');
+  assert.equal(inList(['#Eng'], '#eng'), true);
+  assert.equal(inList(['#eng'], null), false);
+});
+
+test('a change reaches disk, and leaves the rest of the file alone', () => {
+  const { file, read, cleanup } = tempConfig({ cdpPort: 9333, somethingWeDoNotKnowAbout: 'keep me' });
+  try {
+    const store = new ConfigStore({ file });
+    assert.equal(store.values.cdpPort, 9333, 'the file wins over the defaults');
+
+    const { changed, errors } = store.update({ triageMode: 'always', condenseMinWords: 60 });
+    assert.deepEqual(changed.sort(), ['condenseMinWords', 'triageMode']);
+    assert.deepEqual(errors, []);
+
+    const onDisk = read();
+    assert.equal(onDisk.triageMode, 'always');
+    assert.equal(onDisk.condenseMinWords, 60);
+    assert.equal(onDisk.cdpPort, 9333, 'a setting we did not touch must survive being written around');
+    assert.equal(onDisk.somethingWeDoNotKnowAbout, 'keep me');
+
+    // The point of writing it: a restart reads the change back.
+    assert.equal(loadConfig(file).triageMode, 'always');
+  } finally {
+    cleanup();
+  }
+});
+
+test('the config object handed out at startup is the one that changes', () => {
+  const store = new ConfigStore({ persist: false });
+  // The moderator and the attacher were given this object and read fields off
+  // it as they work; replacing it would leave them on the old settings.
+  const held = store.values;
+  store.update({ model: 'claude-opus-5' });
+  assert.equal(held.model, 'claude-opus-5');
+  assert.equal(held, store.values);
+});
+
+test('a change nobody asked for is not announced', () => {
+  const store = new ConfigStore({ persist: false, values: { ...DEFAULTS } });
+  const heard = [];
+  store.onChange((changed) => heard.push(changed));
+
+  store.update({ triageMode: 'always' });
+  store.update({ triageMode: 'always' });
+  assert.deepEqual(heard, [['triageMode']], 'setting a setting to what it already is changes nothing');
+
+  const bad = store.update({ triageMode: 'nonsense' });
+  assert.equal(bad.changed.length, 0);
+  assert.equal(bad.errors.length, 1);
+  assert.equal(store.values.triageMode, 'always', 'a refused value leaves the old one standing');
+});
+
+test('ignoring a channel is idempotent, and reversible', () => {
+  const store = new ConfigStore({ persist: false, values: { ...DEFAULTS, ignoreChannels: [] } });
+  store.setIgnored('ignoreChannels', '#eng-oncall', true);
+  store.setIgnored('ignoreChannels', '#eng-oncall', true);
+  assert.deepEqual(store.values.ignoreChannels, ['#eng-oncall']);
+  assert.equal(store.isIgnored('ignoreChannels', '#ENG-ONCALL'), true);
+
+  store.setIgnored('ignoreChannels', '#eng-oncall', false);
+  assert.deepEqual(store.values.ignoreChannels, []);
+});
+
+test('moving a threshold is what makes the cached verdicts wrong', () => {
+  // A verdict was judged against these, so a cached one no longer answers the
+  // question. Everything else leaves the cache worth keeping.
+  assert.equal(invalidatesCache(['minSeverity']), true);
+  assert.equal(invalidatesCache(['condenseMinWords']), true);
+  assert.equal(invalidatesCache(['verbose', 'holdWhilePending']), false);
+});
+
+/* --------------------------------------------------------- settings menu */
+
+function findItem(items, prefix) {
+  return items.find((i) => typeof i.label === 'string' && i.label.startsWith(prefix));
+}
+
+test('the settings menu shows what each setting is set to without opening it', () => {
+  const items = settingsMenu({ ...DEFAULTS, model: 'claude-opus-5', dailyBudgetUsd: 0.5 });
+  assert.equal(findItem(items, 'Model').label, 'Model: Opus 5');
+  assert.equal(findItem(items, 'Daily budget').label, 'Daily budget: $0.50');
+  assert.equal(findItem(items, 'Look at:').label, 'Look at: flagged only');
+});
+
+test('exactly one choice is ticked, and clicking another sets it', () => {
+  const items = settingsMenu({ ...DEFAULTS, triageMode: 'heuristic' });
+  const choices = findItem(items, 'Look at:').submenu;
+  assert.deepEqual(choices.filter((c) => c.checked).map((c) => c.body.triageMode), ['heuristic']);
+
+  const other = choices.find((c) => !c.checked);
+  assert.equal(other.post, '/config');
+  assert.deepEqual(other.body, { triageMode: 'always' });
+});
+
+test('a toggle carries the value it would set, not the flip', () => {
+  // Two clicks racing each other should land on the same answer rather than
+  // undoing one another.
+  const on = findItem(settingsMenu({ ...DEFAULTS, condenseEnabled: true }), 'Condense padded');
+  assert.equal(on.checked, true);
+  assert.deepEqual(on.body, { condenseEnabled: false });
+
+  const off = findItem(settingsMenu({ ...DEFAULTS, condenseEnabled: false }), 'Condense padded');
+  assert.equal(off.checked, false);
+  assert.deepEqual(off.body, { condenseEnabled: true });
+});
+
+test('a value set by hand in the config file still shows up in the menu', () => {
+  const items = settingsMenu({ ...DEFAULTS, model: 'claude-something-else', condenseMinWords: 33 });
+  assert.equal(findItem(items, 'Model').label, 'Model: claude-something-else');
+  const words = findItem(items, 'Condense messages over');
+  assert.equal(words.label, 'Condense messages over: 33');
+  assert.ok(words.submenu.some((i) => i.label === 'Set to 33 in the config file'));
+  assert.ok(!words.submenu.some((i) => i.checked), 'nothing offered is the value in force');
+});
+
+test('ignored channels are listed, and clicking one stops ignoring it', () => {
+  const empty = findItem(settingsMenu({ ...DEFAULTS, ignoreChannels: [] }), 'Ignored channels');
+  assert.equal(empty.label, 'Ignored channels: none');
+  assert.deepEqual(empty.submenu.map((i) => i.label), ['No channels ignored']);
+
+  const listed = findItem(settingsMenu({ ...DEFAULTS, ignoreChannels: ['#eng', '#ops'] }), 'Ignored channels');
+  assert.equal(listed.label, 'Ignored channels: 2');
+  const entry = listed.submenu[0];
+  assert.equal(entry.label, '#eng');
+  assert.equal(entry.checked, true);
+  assert.equal(entry.post, '/ignore');
+  assert.deepEqual(entry.body, { list: 'ignoreChannels', value: '#eng', ignored: false });
+});
+
+test('the menu still draws with no settings to draw from', () => {
+  assert.ok(menuModel(STATUS).items.some((i) => i.submenu));
+});
+
+/* ------------------------------------------------- settings over the API */
+
+test('/config reports the settings in force and changes them', async () => {
+  await withServer(async ({ get, postJson, store }) => {
+    assert.equal((await get('/config')).config.triageMode, DEFAULTS.triageMode);
+
+    const res = await postJson('/config', { triageMode: 'always', minSeverity: 3 });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.changed.sort(), ['minSeverity', 'triageMode']);
+    assert.equal(store.values.triageMode, 'always', 'the daemon has to be changed, not just answered');
+    assert.equal((await get('/status')).config.minSeverity, 3);
+  });
+});
+
+test('/config refuses a bad value and says which one', async () => {
+  await withServer(async ({ postJson, store }) => {
+    const res = await postJson('/config', { triageMode: 'sometimes' });
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0].key, 'triageMode');
+    assert.equal(store.values.triageMode, DEFAULTS.triageMode);
+  });
+});
+
+test('/ignore adds and removes one entry without touching the rest', async () => {
+  await withServer(async ({ postJson, store }) => {
+    store.update({ ignoreChannels: ['#ops'] });
+
+    const added = await postJson('/ignore', { list: 'ignoreChannels', value: '#eng-oncall' });
+    assert.equal(added.ok, true);
+    assert.deepEqual(added.ignoreChannels, ['#ops', '#eng-oncall']);
+
+    const removed = await postJson('/ignore', { list: 'ignoreChannels', value: '#ops', ignored: false });
+    assert.deepEqual(removed.ignoreChannels, ['#eng-oncall'], 'the other entry is not collateral');
+
+    const bad = await postJson('/ignore', { list: 'somethingElse', value: '#eng' });
+    assert.match(bad.error, /ignoreChannels or ignoreSenders/);
+  });
+});
+
+test('the menu bar and the daemon cannot disagree about a setting', async () => {
+  await withServer(async ({ get, postJson }) => {
+    await postJson('/config', { condenseEnabled: false });
+    const menu = await get('/menubar');
+    const settings = menu.items.find((i) => i.label === 'Settings');
+    const toggle = findItem(settings.submenu, 'Condense padded');
+    assert.equal(toggle.checked, false);
+    assert.deepEqual(toggle.body, { condenseEnabled: true });
+  });
 });
 
 /* ------------------------------------------------------- building the helper */

@@ -9,10 +9,13 @@ const INJECT_PATH = path.join(HERE, '..', 'client', 'inject.js');
 const BINDING = '__slackenAsk';
 
 export class Attacher {
-  constructor({ config, moderator, state, onEvent }) {
+  constructor({ config, moderator, state, store, onEvent }) {
     this.config = config;
     this.moderator = moderator;
     this.state = state || null;
+    // Optional: without it the page can still read settings, but the button
+    // inside Slack has nowhere to write a change to.
+    this.store = store || null;
     this.onEvent = onEvent || (() => {});
     this.targetUrl = new RegExp(config.targetUrlPattern, 'i');
     this.sessions = new Map(); // target id -> CdpSession
@@ -56,14 +59,28 @@ export class Attacher {
   // Pausing has to reach the page, not just the daemon: the daemon going quiet
   // would leave every message already rewritten on screen still rewritten.
   async broadcastPaused(paused) {
-    const expression = `window.__slackenSetPaused && window.__slackenSetPaused(${paused ? 'true' : 'false'})`;
+    await this.evaluateEverywhere(
+      `window.__slackenSetPaused && window.__slackenSetPaused(${paused ? 'true' : 'false'})`,
+    );
+  }
+
+  // Settings changed from the menu bar, the terminal or another Slack window.
+  // Every window gets told, including the one the change came from: a setting
+  // that only took hold where you clicked it would be a setting you could not
+  // trust.
+  async broadcastConfig() {
+    const payload = JSON.stringify(JSON.stringify(pageConfig(this.config, { paused: Boolean(this.state?.paused) })));
+    await this.evaluateEverywhere(`window.__slackenSetConfig && window.__slackenSetConfig(${payload})`);
+  }
+
+  async evaluateEverywhere(expression) {
     for (const session of this.sessions.values()) {
       if (!session) continue;
       try {
         await session.send('Runtime.evaluate', { expression });
       } catch {
         // The window is going away; the poll loop will re-attach and the
-        // prelude will carry the current state.
+        // prelude will carry the current settings.
       }
     }
   }
@@ -133,6 +150,10 @@ export class Attacher {
     } catch {
       return;
     }
+    if (request.op === 'ignore-channel') {
+      await this.handleIgnoreChannel(session, params, request);
+      return;
+    }
     const verdict = await this.moderator.moderate({
       text: request.text,
       sender: request.sender,
@@ -146,6 +167,32 @@ export class Attacher {
       verdict,
     });
     await this.reply(session, params.executionContextId, { id: request.id, ...verdict });
+  }
+
+  // The button in Slack's channel header. The page knows which channel you are
+  // reading; the daemon owns the ignore list. Answered directly as well as
+  // broadcast, so the button redraws from the daemon's answer rather than from
+  // its own optimism about what the click did.
+  async handleIgnoreChannel(session, params, request) {
+    const channel = String(request.channel || '').trim();
+    const ignored = request.ignored !== false;
+    if (!channel || !this.store) {
+      await this.reply(session, params.executionContextId, {
+        id: request.id,
+        error: channel ? 'settings are not writable' : 'no channel to ignore',
+        ignoreChannels: this.config.ignoreChannels,
+      });
+      return;
+    }
+
+    const { errors } = this.store.setIgnored('ignoreChannels', channel, ignored);
+    this.onEvent({ type: 'ignore-channel', channel, ignored, error: errors[0]?.message });
+    await this.reply(session, params.executionContextId, {
+      id: request.id,
+      ok: errors.length === 0,
+      error: errors[0]?.message,
+      ignoreChannels: this.config.ignoreChannels,
+    });
   }
 
   async reply(session, contextId, payload) {

@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { loadConfig, writeDefaultConfig, CONFIG_PATH } from './config.js';
+import { loadConfig, writeDefaultConfig, ConfigStore, CONFIG_PATH } from './config.js';
+import { SETTINGS, invalidatesCache } from './settings.js';
 import { Moderator } from './moderate.js';
 import { Attacher } from './attach.js';
 import { createServer } from './server.js';
@@ -28,6 +29,9 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
   slacken doctor               Check the pieces this needs
   slacken config               Print the config file path and contents
 
+  slacken set                  List the settings you can change, and their values
+  slacken set <name> <value>   Change one, on the running daemon and on disk
+
   slacken status               What the running daemon has done so far
   slacken pause                Stop rewriting, and reveal what is on screen
   slacken resume               Start rewriting again
@@ -49,6 +53,7 @@ export async function main(argv) {
     case 'test': return cmdTest(args);
     case 'doctor': return cmdDoctor(args);
     case 'config': return cmdConfig(args);
+    case 'set': return cmdSet(args);
     case 'status': return cmdStatus(args);
     case 'pause': return cmdPause(args, true);
     case 'resume': return cmdPause(args, false);
@@ -74,7 +79,8 @@ function configFrom(args) {
 
 async function cmdStart(args) {
   writeDefaultConfig();
-  const config = configFrom(args);
+  const store = storeFrom(args);
+  const config = store.values;
 
   if (!args['no-launch']) {
     const result = await launchSlack({ cdpPort: config.cdpPort, force: Boolean(args.force) });
@@ -85,26 +91,36 @@ async function cmdStart(args) {
     return 1;
   }
 
-  return run(config);
+  return run(store);
 }
 
 async function cmdAttach(args) {
   writeDefaultConfig();
-  const config = configFrom(args);
+  const store = storeFrom(args);
+  const config = store.values;
   if (!(await isDebugPortOpen(config.cdpPort))) {
     console.error(`[slacken] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slacken launch' first.`);
     return 1;
   }
-  return run(config);
+  return run(store);
 }
 
-async function run(config) {
+// Flags are for this run only, so they are applied to the values the store
+// starts from rather than written to the file: `--always` for an afternoon
+// should not still be in force next week.
+function storeFrom(args) {
+  return new ConfigStore({ values: configFrom(args) });
+}
+
+async function run(store) {
+  const config = store.values;
   const state = new State();
   const moderator = new Moderator(config, state);
   const attacher = new Attacher({
     config,
     moderator,
     state,
+    store,
     onEvent: (event) => logEvent(event, config),
   });
 
@@ -112,6 +128,7 @@ async function run(config) {
     config,
     moderator,
     state,
+    store,
     getStatus: () => ({ attached: attacher.attachedCount }),
     reinject: () => attacher.reinjectAll(),
   });
@@ -131,6 +148,18 @@ async function run(config) {
     console.log(paused
       ? '[slacken] paused — every message will be shown as written'
       : '[slacken] resumed');
+  });
+
+  // A setting can be changed from the menu bar, from the button in Slack or
+  // from another terminal. Wherever it came from, the change has to reach the
+  // pages being rewritten right now, and the verdicts already decided under
+  // the old thresholds have to go.
+  store.onChange((changed) => {
+    console.log(`[slacken] ${changed.map((key) => `${key} = ${show(config[key])}`).join(', ')}`);
+    if (invalidatesCache(changed)) moderator.cache.clear();
+    attacher.broadcastConfig().catch((err) => {
+      console.warn(`[slacken] could not tell Slack about the change: ${err.message}`);
+    });
   });
 
   await new Promise((resolve) => {
@@ -172,6 +201,13 @@ function logEvent(event, config) {
     case 'moderate-error':
     case 'menubar-error':
       console.warn(`[slacken] ${event.type}: ${event.message}`);
+      break;
+    case 'ignore-channel':
+      console.log(event.error
+        ? `[slacken] could not ignore ${event.channel}: ${event.error}`
+        : event.ignored
+          ? `[slacken] ignoring ${event.channel} — nothing there will be rewritten`
+          : `[slacken] rewriting ${event.channel} again`);
       break;
     case 'verdict': {
       const v = event.verdict;
@@ -259,11 +295,17 @@ async function cmdAgent(args) {
 // `status`, `pause` and `resume` are thin clients for the running daemon: the
 // pause state lives in one place, and the menu bar item and the terminal are
 // two views of it rather than two copies.
-async function daemon(config, method, path) {
+async function daemon(config, method, path, body) {
   const url = `http://127.0.0.1:${config.httpPort}${path}`;
   try {
-    const res = await fetch(url, { method, signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const res = await fetch(url, {
+      method,
+      signal: AbortSignal.timeout(5000),
+      ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+    });
+    // A refused setting is an answer, not a failure to reach anyone: it comes
+    // back as JSON saying why, and reading it beats falling back to the file.
+    if (!res.ok && res.status !== 400) throw new Error(`${res.status} ${res.statusText}`);
     return await res.json();
   } catch (err) {
     const hint = /ECONNREFUSED|fetch failed/i.test(err.message)
@@ -284,7 +326,7 @@ async function cmdStatus(args) {
   }
   // Printed from the same model the menu bar draws, so the two can never drift.
   for (const item of menuModel(status).items) {
-    if (item.separator) continue;
+    if (item.separator || item.submenu) continue;
     if (item.post || item.open || item.quit) continue;
     console.log(item.label);
   }
@@ -309,6 +351,64 @@ async function cmdConfig() {
   writeDefaultConfig();
   console.log(CONFIG_PATH);
   console.log(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  return 0;
+}
+
+function show(value) {
+  if (Array.isArray(value)) return value.length ? value.join(', ') : '(none)';
+  if (typeof value === 'boolean') return value ? 'on' : 'off';
+  return String(value);
+}
+
+/*
+ * The terminal view of the settings menu.
+ *
+ * A running daemon is asked to make the change, so it lands on the messages on
+ * screen right now and is written to disk once, by the process that owns it.
+ * With nothing running there is nobody to ask, so the file is edited directly
+ * and picked up at the next start.
+ */
+async function cmdSet(args) {
+  writeDefaultConfig();
+  const config = configFrom(args);
+  const [, key, ...rest] = args._;
+
+  if (!key) {
+    for (const [name, spec] of Object.entries(SETTINGS)) {
+      const choices = spec.choices ? spec.choices.map((c) => c.value).join(' | ') : spec.type;
+      console.log(`${name.padEnd(18)} ${show(config[name]).padEnd(28)} ${choices}`);
+    }
+    console.log('\nslacken set <name> <value>   (a list takes commas: slacken set ignoreChannels "#eng,#random")');
+    return 0;
+  }
+
+  const raw = rest.join(' ');
+  if (!raw) {
+    console.error(`usage: slacken set ${key} <value>`);
+    return 1;
+  }
+
+  let result;
+  try {
+    result = await daemon(config, 'POST', '/config', { [key]: raw });
+  } catch (err) {
+    // Nothing running to tell. Writing the file is the whole change.
+    const store = new ConfigStore();
+    result = store.update({ [key]: raw });
+    if (!result.errors.length) console.log(`(no daemon running; saved to ${CONFIG_PATH})`);
+  }
+
+  for (const problem of result.errors || []) console.error(problem.message);
+  if (result.errors?.length) return 1;
+
+  // Read back from whoever applied it. The daemon may have been told something
+  // different since this process read the file, and its answer is the truth.
+  const values = result.config || result.values || config;
+  if (!result.changed.length) {
+    console.log(`${key} is already ${show(values[key])}`);
+    return 0;
+  }
+  for (const name of result.changed) console.log(`${name} = ${show(values[name])}`);
   return 0;
 }
 

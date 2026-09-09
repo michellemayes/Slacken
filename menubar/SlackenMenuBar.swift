@@ -26,8 +26,48 @@ struct MenuItemSpec: Decodable {
     var enabled: Bool? = nil
     var key: String? = nil
     var post: String? = nil
+    /// Sent as the body of the POST. Decoded as raw JSON and passed straight
+    /// through: what a setting is worth is the daemon's business, not ours.
+    var body: AnyJSON? = nil
     var open: String? = nil
     var quit: Bool? = nil
+    /// Drawn with a checkmark. A settings item is told whether it is the one
+    /// in force; it never works that out for itself.
+    var checked: Bool? = nil
+    var submenu: [MenuItemSpec]? = nil
+}
+
+/// Just enough of a JSON value to carry a settings body from the daemon back
+/// to it untouched.
+enum AnyJSON: Decodable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([AnyJSON])
+    case object([String: AnyJSON])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let v = try? container.decode(Bool.self) { self = .bool(v) }
+        else if let v = try? container.decode(Double.self) { self = .number(v) }
+        else if let v = try? container.decode(String.self) { self = .string(v) }
+        else if let v = try? container.decode([AnyJSON].self) { self = .array(v) }
+        else if let v = try? container.decode([String: AnyJSON].self) { self = .object(v) }
+        else { self = .null }
+    }
+
+    var value: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let v): return v
+        case .number(let v): return v == v.rounded() && abs(v) < 1e15 ? Int(v) : v
+        case .string(let v): return v
+        case .array(let v): return v.map { $0.value }
+        case .object(let v): return v.mapValues { $0.value }
+        }
+    }
 }
 
 struct MenuSpec: Decodable {
@@ -60,7 +100,9 @@ final class Controller: NSObject, NSMenuDelegate {
     private let origin: String
     private let session: URLSession
     private var timer: Timer?
-    private var menuIsOpen = false
+    /// Counted rather than flagged: a submenu closing while its parent is
+    /// still open must not let the menu be rebuilt under the pointer.
+    private var openMenus = 0
 
     init(port: Int) {
         self.origin = "http://127.0.0.1:\(port)"
@@ -102,7 +144,7 @@ final class Controller: NSObject, NSMenuDelegate {
     /// is the part you can see without clicking.
     private func apply(_ spec: MenuSpec) {
         applyIcon(spec)
-        guard !menuIsOpen else { return }
+        guard openMenus == 0 else { return }
         menu.removeAllItems()
         for item in spec.items ?? [] {
             menu.addItem(build(item))
@@ -129,6 +171,19 @@ final class Controller: NSObject, NSMenuDelegate {
         if spec.separator == true { return NSMenuItem.separator() }
 
         let item = NSMenuItem(title: spec.label ?? "", action: nil, keyEquivalent: spec.key ?? "")
+        item.state = spec.checked == true ? .on : .off
+
+        if let children = spec.submenu {
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            // Delegated too, so opening a submenu counts as the menu being
+            // open and a refresh cannot rebuild it out from under the pointer.
+            submenu.delegate = self
+            for child in children { submenu.addItem(build(child)) }
+            item.submenu = submenu
+            return item
+        }
+
         let clickable = spec.post != nil || spec.open != nil || spec.quit == true
         if clickable {
             item.action = #selector(clicked(_:))
@@ -168,7 +223,13 @@ final class Controller: NSObject, NSMenuDelegate {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.httpBody = Data()
+        if let body = spec.body,
+           let encoded = try? JSONSerialization.data(withJSONObject: body.value, options: []) {
+            request.httpBody = encoded
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        } else {
+            request.httpBody = Data()
+        }
         session.dataTask(with: request) { [weak self] _, _, _ in
             // Draw the result of the click rather than assuming it, so the menu
             // can never disagree with the daemon about what actually happened.
@@ -179,12 +240,14 @@ final class Controller: NSObject, NSMenuDelegate {
     // MARK: NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
-        menuIsOpen = true
+        openMenus += 1
     }
 
     func menuDidClose(_ menu: NSMenu) {
-        menuIsOpen = false
-        refresh()
+        openMenus = max(0, openMenus - 1)
+        // Only once the whole stack is closed: redrawing on a submenu closing
+        // would move the item the pointer is still resting on.
+        if openMenus == 0 { refresh() }
     }
 }
 

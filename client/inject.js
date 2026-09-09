@@ -79,6 +79,10 @@
     channel: '[data-qa="channel_name"]',
     self: '[data-qa="user-button"]',
     composer: '[data-qa="message_input"], .ql-editor',
+    // Where the channel-ignore button goes. Slack has moved this header
+    // around between versions, so the first ancestor that matches wins and
+    // the channel name's own parent is the fallback.
+    header: '[data-qa="channel_header"], .p-view_header__text_container, .p-view_header',
   };
 
   const log = (...args) => { if (CONFIG.verbose) console.log('[slacken]', ...args); };
@@ -124,6 +128,21 @@
     .slacken-badge[data-kind="condensed"] .slacken-dot { background: #5b8def; }
     .slacken-action { opacity: .75; }
     .slacken-pending { opacity: .45; font-style: italic; }
+
+    /* The channel header button. Same pill as the badge, so the two read as
+       parts of one thing rather than as something Slack shipped. */
+    .slacken-channel {
+      display: inline-flex; align-items: center; gap: 5px;
+      margin: 0 0 0 8px; padding: 1px 8px; vertical-align: middle;
+      font-size: 11px; line-height: 17px; font-weight: 500;
+      color: inherit; opacity: .62;
+      background: transparent;
+      border: 1px solid rgba(127,127,127,.45); border-radius: 10px;
+      cursor: pointer; user-select: none;
+    }
+    .slacken-channel:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-channel[data-ignored="1"] .slacken-dot { background: #8d8d8d; }
+    .slacken-channel[data-busy="1"] { opacity: .35; pointer-events: none; }
   `;
 
   function ensureStyle() {
@@ -565,6 +584,96 @@
     });
   }
 
+  /* -------------------------------------------------------- channel button */
+
+  /*
+   * A button in Slack's channel header that takes the channel you are reading
+   * out of Slacken's way, and puts it back.
+   *
+   * It lives here rather than in the menu bar because this is the only place
+   * that knows which channel you mean. The daemon owns the list; the button
+   * asks it to change and then draws whatever came back, so the two can never
+   * disagree about whether a channel is ignored.
+   */
+  const BUTTON_CLASS = 'slacken-channel';
+
+  function buildChannelButton() {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = BUTTON_CLASS;
+
+    const dot = document.createElement('span');
+    dot.className = 'slacken-dot';
+    const label = document.createElement('span');
+    label.className = 'slacken-channel-label';
+    button.append(dot, label);
+
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      requestIgnore(button, button.dataset.channel, button.dataset.ignored !== '1');
+    });
+    return button;
+  }
+
+  let channelButton = null;
+
+  function ensureChannelButton(channel, ignored) {
+    // Nothing identifiable on screen — a preferences pane, or Slack still
+    // starting up. A button that cannot say which channel it means should not
+    // be offering to ignore one.
+    if (!channel) {
+      channelButton?.remove();
+      return;
+    }
+    const anchor = document.querySelector(SEL.channel);
+    if (!anchor) {
+      channelButton?.remove();
+      return;
+    }
+    const host = anchor.closest(SEL.header) || anchor.parentElement;
+    if (!host) return;
+
+    if (!channelButton) channelButton = buildChannelButton();
+    // Slack rebuilds its header on every channel switch, which takes the
+    // button with it. Putting it back is one append, and it happens inside the
+    // observer callback, so it is back before the frame is painted.
+    if (channelButton.parentElement !== host) host.appendChild(channelButton);
+
+    if (channelButton.dataset.channel !== channel) channelButton.dataset.channel = channel;
+    // A click in flight owns the button's wording until the daemon answers.
+    if (channelButton.dataset.busy === '1') return;
+
+    const flag = ignored ? '1' : '0';
+    if (channelButton.dataset.ignored !== flag) channelButton.dataset.ignored = flag;
+
+    const label = channelButton.querySelector('.slacken-channel-label');
+    const text = ignored ? 'Ignored by Slacken' : 'Ignore in Slacken';
+    if (label.textContent !== text) label.textContent = text;
+
+    const title = ignored
+      ? `Slacken is leaving ${channel} exactly as written — click to rewrite here again`
+      : `Stop Slacken rewriting anything in ${channel}`;
+    if (channelButton.title !== title) channelButton.title = title;
+  }
+
+  function requestIgnore(button, channel, ignored) {
+    if (!channel) return;
+    button.dataset.busy = '1';
+    ask({ op: 'ignore-channel', channel, ignored }).then((res) => {
+      if (Array.isArray(res.ignoreChannels)) CONFIG.ignoreChannels = res.ignoreChannels;
+      if (res.error) log('ignore failed', res.error);
+    }).catch((err) => {
+      log('ignore failed', err.message);
+    }).finally(() => {
+      delete button.dataset.busy;
+      // Whatever the answer was, the whole view is re-planned against it: an
+      // ignored channel has to give its originals back, and an un-ignored one
+      // has to be looked at again.
+      sweep();
+    });
+  }
+
   /* ------------------------------------------------------------ processing */
 
   function nearViewport(el) {
@@ -593,6 +702,13 @@
     const sig = hash(raw);
     const same = item.getAttribute(ATTR_HASH) === sig;
     const base = { item, body, sig, same };
+
+    // This channel is on the ignore list. Checked before the caches, not after
+    // the triage: a message we rewrote before the channel was ignored — or one
+    // a stored verdict would repaint after a reload — has to give its original
+    // back too, or ignoring a channel would only apply to what had not been
+    // read yet.
+    if (ctx.ignored) return { ...base, act: 'idle' };
 
     // Fast path: we have judged this exact text before, here or anywhere else.
     // No innerText, no layout, no call.
@@ -646,8 +762,7 @@
     const me = selfName();
     if ((me && sender === me)
       || matchesAny(CONFIG.selfNames, sender)
-      || matchesAny(CONFIG.ignoreSenders, sender)
-      || matchesAny(CONFIG.ignoreChannels, ctx.channel)) {
+      || matchesAny(CONFIG.ignoreSenders, sender)) {
       return { ...base, act: 'clear', state: 'skipped' };
     }
 
@@ -744,12 +859,17 @@
   const dirty = new Set();
 
   function flush() {
-    if (!dirty.size) return;
     ensureStyle();
+    // Worked out before the early return: switching to an empty channel makes
+    // nothing dirty, and the button still has to follow you there.
+    const channel = channelName();
+    const ctx = { channel, ignored: matchesAny(CONFIG.ignoreChannels, channel) };
+    ensureChannelButton(channel, ctx.ignored);
+
+    if (!dirty.size) return;
     const items = Array.from(dirty);
     dirty.clear();
 
-    const ctx = { channel: channelName() };
     const plans = [];
     // Read half.
     for (const item of items) {
@@ -885,7 +1005,11 @@
     sweep();
   };
 
-  window.__slackenRescan = () => {
+  // Every verdict we are holding was reached under settings that have just
+  // changed, so none of them answers the question being asked now. The stored
+  // copies go too, or a reload would repaint decisions made under the old
+  // rules.
+  function forget() {
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((item) => {
       item.removeAttribute(ATTR_STATE);
       item.removeAttribute(ATTR_HASH);
@@ -893,6 +1017,35 @@
     });
     verdicts.clear();
     sigs.clear();
+    revealed.clear();
+    try {
+      window.localStorage.removeItem(STORE_KEY);
+    } catch {
+      // Private mode, or storage turned off. Nothing to drop.
+    }
+  }
+
+  // Called by the daemon whenever a setting changes, wherever it was changed:
+  // the menu bar, the terminal, or the button in another Slack window.
+  window.__slackenSetConfig = (json) => {
+    let next;
+    try {
+      next = JSON.parse(json);
+    } catch {
+      return;
+    }
+    // Pausing has its own path, and its own careful handling of messages
+    // caught mid-verdict. It arrives here only because it rides along in the
+    // same payload.
+    delete next.paused;
+    Object.assign(CONFIG, next);
+    log('settings changed', CONFIG);
+    forget();
+    sweep();
+  };
+
+  window.__slackenRescan = () => {
+    forget();
     sweep();
   };
 

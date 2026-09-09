@@ -7,7 +7,11 @@
   the same code paths as the desktop app.
 -->
 <button data-qa="user-button" aria-label="User menu: Michelle Mayes">me</button>
-<div data-qa="channel_name">#eng-oncall</div>
+
+<!-- The channel header, where the ignore button hangs itself. -->
+<div class="p-view_header">
+  <div data-qa="channel_name">#eng-oncall</div>
+</div>
 
 <div class="c-virtual_list__scroll_container">
   <div data-qa="virtual-list-item" id="msg-heated">
