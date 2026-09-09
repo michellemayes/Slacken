@@ -15,6 +15,7 @@ import { History, formatEntry, HISTORY_PATH } from './history.js';
 import { loadToken, readToken } from './auth.js';
 import { CHANNEL_KEYS } from './settings.js';
 import { VERSION, checkForUpdate } from './version.js';
+import { resolveClaudeBin, notFoundMessage, spawnPath } from './claude-bin.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -145,6 +146,13 @@ async function run(store) {
   const config = store.values;
   const state = new State();
   const moderator = new Moderator(config, state);
+
+  // Found once, up front, and said out loud. A daemon started at login has
+  // almost no PATH, so which `claude` this is — or that there is not one — is
+  // the first thing you want from the log when nothing is being rewritten.
+  const claude = await resolveClaudeBin(config.claudeBin);
+  if (claude.path) console.log(`[slacken] claude: ${claude.path}`);
+  else console.error(`[slacken] ${notFoundMessage(config.claudeBin, claude.searched)}`);
   // Written by the same handler that logs to the terminal, because they are
   // two views of one thing: what Slacken did, as it did it.
   const history = new History({ config });
@@ -855,14 +863,30 @@ async function cmdDoctor(args) {
   const app = findSlackApp();
   checks.push(['Slack found', Boolean(app), app || `not in ${slackLocations()}`]);
 
+  // Not just "is it on PATH": the daemon looks in more places than a login
+  // shell's PATH, so this has to report on the same lookup the daemon does —
+  // and, when it comes up empty, on where that lookup went.
+  const claude = await resolveClaudeBin(config.claudeBin, { useCache: false });
   let claudeVersion = null;
-  try {
-    const { stdout } = await execFileAsync(config.claudeBin, ['--version'], { timeout: 10000 });
-    claudeVersion = stdout.trim();
-  } catch (err) {
-    claudeVersion = err.message;
+  if (claude.path) {
+    try {
+      const { stdout } = await execFileAsync(claude.path, ['--version'], {
+        timeout: 10000,
+        env: { ...process.env, PATH: spawnPath(claude.path) },
+      });
+      claudeVersion = stdout.trim();
+    } catch (err) {
+      claudeVersion = err.message;
+    }
   }
-  checks.push([`${config.claudeBin} on PATH`, Boolean(claudeVersion && /\d/.test(claudeVersion)), claudeVersion]);
+  const claudeOk = Boolean(claudeVersion && /\d/.test(claudeVersion));
+  checks.push([
+    `${config.claudeBin} runnable`,
+    claudeOk,
+    claude.path
+      ? `${claudeVersion} — ${claude.path}${claude.source === 'path' ? '' : ` (${claude.source})`}`
+      : notFoundMessage(config.claudeBin, claude.searched),
+  ]);
 
   // The check the menu bar's "N errors" line sends you here for. Everything
   // else can pass while the one call that matters — the flags this daemon

@@ -154,6 +154,14 @@ hands a job a useful `PATH`. The macOS job is marked `Interactive` rather than
 `Background`: it holds messages hidden while the model decides, so a throttled
 one is a delay you sit and watch.
 
+The daemon does the same lookup again every time it starts, and does not rely
+on the `PATH` it was handed: it checks that `PATH`, then the places the
+installers actually use (`~/.local/bin`, `~/.claude/local`, Homebrew,
+`/usr/local/bin`), then your login shell, which is where a `PATH` set by nvm,
+asdf or mise lives. If it still cannot find it — *Can't find claude* in the
+menu — `slacken doctor` prints every place it looked, and setting `claudeBin`
+to its full path in `~/.slacken/config.json` settles it.
+
 From then on the menu bar item is the interface — what has been changed, the
 pause, and the settings. Everything else is there when you want it:
 
@@ -526,7 +534,7 @@ offered anywhere that implies it can.
 | `cdpPort` | `9222` | Slack's debug port |
 | `httpPort` | `8787` | Loopback control API (`/status`, `/menubar`, `/config`, `/ignore`, `/pause`, `/stop`, `/moderate`) |
 | `targetUrlPattern` | `^https://([a-z0-9-]+\.)*slack\.com/` | Widen for a custom workspace domain |
-| `claudeBin` / `claudeArgs` | `claude` / `[]` | If `claude` lives somewhere unusual, or you want extra flags |
+| `claudeBin` / `claudeArgs` | `claude` / `[]` | Set `claudeBin` to a full path if `claude` lives somewhere the lookup does not find; `claudeArgs` for extra flags |
 
 ## Things worth knowing before you run this
 

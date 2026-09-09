@@ -110,7 +110,7 @@ jobs:
         run: |
           set -o pipefail
           slacken doctor | tee doctor.txt || true
-          grep -q "claude on PATH" doctor.txt
+          grep -q "claude runnable" doctor.txt
           slacken help | grep -q "slacken agent install"
 
       - name: Uninstall cleanly
