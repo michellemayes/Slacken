@@ -9,26 +9,35 @@ const INJECT_PATH = path.join(HERE, '..', 'client', 'inject.js');
 const BINDING = '__slackenAsk';
 
 export class Attacher {
-  constructor({ config, moderator, onEvent }) {
+  constructor({ config, moderator, state, onEvent }) {
     this.config = config;
     this.moderator = moderator;
+    this.state = state || null;
     this.onEvent = onEvent || (() => {});
     this.targetUrl = new RegExp(config.targetUrlPattern, 'i');
     this.sessions = new Map(); // target id -> CdpSession
     this.pollTimer = null;
     this.stopped = false;
+    this.unsubscribe = null;
   }
 
   source() {
     // Read on every injection so editing client/inject.js only needs a page
     // reload, not a daemon restart.
     const script = fs.readFileSync(INJECT_PATH, 'utf8');
-    const prelude = `window.__SLACKEN_CONFIG = ${JSON.stringify(pageConfig(this.config))};\n`;
+    const paused = Boolean(this.state?.paused);
+    const prelude = `window.__SLACKEN_CONFIG = ${JSON.stringify(pageConfig(this.config, { paused }))};\n`;
     return prelude + script;
   }
 
   start() {
     this.stopped = false;
+    // A window that attaches later picks the state up from the prelude above;
+    // windows already attached are told directly.
+    this.unsubscribe?.();
+    this.unsubscribe = this.state?.onChange((paused) => {
+      this.broadcastPaused(paused).catch(() => {});
+    });
     const tick = async () => {
       if (this.stopped) return;
       try {
@@ -44,8 +53,25 @@ export class Attacher {
     return tick();
   }
 
+  // Pausing has to reach the page, not just the daemon: the daemon going quiet
+  // would leave every message already rewritten on screen still rewritten.
+  async broadcastPaused(paused) {
+    const expression = `window.__slackenSetPaused && window.__slackenSetPaused(${paused ? 'true' : 'false'})`;
+    for (const session of this.sessions.values()) {
+      if (!session) continue;
+      try {
+        await session.send('Runtime.evaluate', { expression });
+      } catch {
+        // The window is going away; the poll loop will re-attach and the
+        // prelude will carry the current state.
+      }
+    }
+  }
+
   stop() {
     this.stopped = true;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
     if (this.pollTimer) clearTimeout(this.pollTimer);
     for (const session of this.sessions.values()) session.close();
     this.sessions.clear();

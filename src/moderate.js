@@ -21,8 +21,10 @@ const clean = (extra) => ({ ...CLEAN, ...extra });
  * accumulates, the sixth turn cost 4.7x the first.
  */
 export class Moderator {
-  constructor(config) {
+  constructor(config, state = null) {
     this.config = config;
+    // Optional: when present and paused, no message reaches the model.
+    this.state = state;
     this.cache = new Cache({
       ttlHours: config.cacheTtlHours,
       maxEntries: config.cacheMaxEntries,
@@ -40,7 +42,16 @@ export class Moderator {
     };
   }
 
+  get paused() {
+    return Boolean(this.state?.paused);
+  }
+
   async moderate({ text, sender, channel }) {
+    // Checked before the cache as well as before the model: while paused,
+    // Slacken hands back a verdict that changes nothing, so the words on
+    // screen are the ones that were actually written.
+    if (this.paused) return clean({ reason: 'paused' });
+
     const trimmed = (text || '').trim();
     if (!trimmed) return clean({ reason: 'empty' });
     if (trimmed.length > this.config.maxChars) return clean({ reason: 'too-long' });

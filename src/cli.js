@@ -8,6 +8,8 @@ import { createServer } from './server.js';
 import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning } from './launch.js';
 import { listTargets } from './cdp.js';
 import { installAgent, uninstallAgent, agentStatus, LOG_PATH } from './agent.js';
+import { State } from './state.js';
+import { MenuBar, menuModel } from './menubar.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +28,10 @@ const USAGE = `slacken - a calmer reading layer for Slack on macOS
   slacken doctor               Check the pieces this needs
   slacken config               Print the config file path and contents
 
+  slacken status               What the running daemon has done so far
+  slacken pause                Stop rewriting, and reveal what is on screen
+  slacken resume               Start rewriting again
+
   slacken agent install        Run automatically when you log in
   slacken agent uninstall      Stop running at login
   slacken agent status         Is the login agent installed and running?
@@ -43,6 +49,9 @@ export async function main(argv) {
     case 'test': return cmdTest(args);
     case 'doctor': return cmdDoctor(args);
     case 'config': return cmdConfig(args);
+    case 'status': return cmdStatus(args);
+    case 'pause': return cmdPause(args, true);
+    case 'resume': return cmdPause(args, false);
     case 'agent': return cmdAgent(args);
     case 'help':
     case '--help':
@@ -90,23 +99,39 @@ async function cmdAttach(args) {
 }
 
 async function run(config) {
-  const moderator = new Moderator(config);
+  const state = new State();
+  const moderator = new Moderator(config, state);
   const attacher = new Attacher({
     config,
     moderator,
+    state,
     onEvent: (event) => logEvent(event, config),
   });
 
   const server = await createServer({
     config,
     moderator,
+    state,
     getStatus: () => ({ attached: attacher.attachedCount }),
     reinject: () => attacher.reinjectAll(),
   });
 
   await attacher.start();
+
+  const menuBar = new MenuBar({ config, onEvent: (event) => logEvent(event, config) });
+  // The menu bar is how you notice a pause you left running yesterday, so it
+  // is worth starting even when nothing else has attached yet.
+  if (config.menuBar !== false) await menuBar.start();
+
   console.log(`[slacken] watching Slack (model ${config.model}, triage ${config.triageMode})`);
   console.log(`[slacken] control API on http://127.0.0.1:${config.httpPort}  ·  Cmd+Shift+U toggles all originals`);
+  if (state.paused) console.log('[slacken] currently PAUSED — nothing will be rewritten until you resume');
+
+  state.onChange((paused) => {
+    console.log(paused
+      ? '[slacken] paused — every message will be shown as written'
+      : '[slacken] resumed');
+  });
 
   await new Promise((resolve) => {
     const shutdown = () => {
@@ -114,6 +139,7 @@ async function run(config) {
       console.log(`\n[slacken] stopping — ${st.batched} messages in ${st.calls} calls, `
         + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
         + `$${st.costUsd.toFixed(4)}`);
+      menuBar.stop();
       attacher.stop();
       moderator.cache.flush();
       server.close();
@@ -133,9 +159,18 @@ function logEvent(event, config) {
     case 'detached':
       console.log('[slacken] window closed, waiting for it to come back');
       break;
+    case 'menubar-unavailable':
+      console.log(`[slacken] no menu bar item: ${event.message}`);
+      break;
+    case 'menubar-exited':
+      console.log(event.crashed
+        ? '[slacken] menu bar item gave up after repeated crashes; everything else is unaffected'
+        : '[slacken] menu bar item hidden (set menuBar to false to keep it that way)');
+      break;
     case 'attach-error':
     case 'poll-error':
     case 'moderate-error':
+    case 'menubar-error':
       console.warn(`[slacken] ${event.type}: ${event.message}`);
       break;
     case 'verdict': {
@@ -221,6 +256,55 @@ async function cmdAgent(args) {
   }
 }
 
+// `status`, `pause` and `resume` are thin clients for the running daemon: the
+// pause state lives in one place, and the menu bar item and the terminal are
+// two views of it rather than two copies.
+async function daemon(config, method, path) {
+  const url = `http://127.0.0.1:${config.httpPort}${path}`;
+  try {
+    const res = await fetch(url, { method, signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return await res.json();
+  } catch (err) {
+    const hint = /ECONNREFUSED|fetch failed/i.test(err.message)
+      ? `nothing is listening on 127.0.0.1:${config.httpPort}. Is 'slacken start' running?`
+      : err.message;
+    throw new Error(hint);
+  }
+}
+
+async function cmdStatus(args) {
+  const config = configFrom(args);
+  let status;
+  try {
+    status = await daemon(config, 'GET', '/status');
+  } catch (err) {
+    console.error(err.message);
+    return 1;
+  }
+  // Printed from the same model the menu bar draws, so the two can never drift.
+  for (const item of menuModel(status).items) {
+    if (item.separator) continue;
+    if (item.post || item.open || item.quit) continue;
+    console.log(item.label);
+  }
+  return 0;
+}
+
+async function cmdPause(args, paused) {
+  const config = configFrom(args);
+  try {
+    const res = await daemon(config, 'POST', paused ? '/pause' : '/resume');
+    console.log(res.paused
+      ? 'paused — Slacken will leave every message exactly as written'
+      : 'resumed — Slacken is rewriting again');
+    return 0;
+  } catch (err) {
+    console.error(err.message);
+    return 1;
+  }
+}
+
 async function cmdConfig() {
   writeDefaultConfig();
   console.log(CONFIG_PATH);
@@ -246,6 +330,19 @@ async function cmdDoctor(args) {
     claudeVersion = err.message;
   }
   checks.push([`${config.claudeBin} on PATH`, Boolean(claudeVersion && /\d/.test(claudeVersion)), claudeVersion]);
+
+  if (process.platform === 'darwin' && config.menuBar !== false) {
+    let swift = null;
+    try {
+      const { stdout } = await execFileAsync('swiftc', ['--version'], { timeout: 20000 });
+      swift = stdout.trim().split('\n')[0];
+    } catch {
+      swift = null;
+    }
+    // Informational: without swiftc there is no menu bar item, but everything
+    // else still works, so this is never a failure.
+    checks.push(['menu bar item', true, swift || 'no swiftc (run: xcode-select --install)']);
+  }
 
   const running = await isSlackRunning();
   const portOpen = await isDebugPortOpen(config.cdpPort);
