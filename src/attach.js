@@ -22,6 +22,24 @@ export class Attacher {
     this.pollTimer = null;
     this.stopped = false;
     this.unsubscribe = null;
+    // The last thing a page said about what it can see. Null until one says
+    // anything, which is not the same as a page that sees nothing.
+    this.health = null;
+  }
+
+  /*
+   * Has Slack's layout moved under us?
+   *
+   * A page that finds list items but no message bodies inside them is the
+   * signature of a renamed class: the list is still the list, and the thing we
+   * read the words out of is not there any more. Finding no list items at all
+   * is not evidence of anything — that is what an empty channel, a preferences
+   * pane and a loading window all look like.
+   */
+  get drifted() {
+    if (!this.health) return false;
+    if (Date.now() - this.health.at > 5 * 60_000) return false;
+    return this.health.items > 0 && this.health.bodies === 0;
   }
 
   source() {
@@ -154,6 +172,40 @@ export class Attacher {
       await this.handleIgnoreChannel(session, params, request);
       return;
     }
+    // Clicking a badge is the clearest thing a reader ever says about a
+    // rewrite, and it used to be said only to the page it happened in.
+    if (request.op === 'reveal') {
+      this.moderator.stats.reveals = (this.moderator.stats.reveals || 0) + 1;
+      this.onEvent({
+        type: 'reveal',
+        sender: request.sender,
+        channel: request.channel,
+        kind: request.kind,
+        note: request.note,
+      });
+      await this.reply(session, params.executionContextId, { id: request.id, ok: true });
+      return;
+    }
+    // What the page is finding. Slack's DOM is not a public API, and the only
+    // way to notice it has moved is to notice we have stopped finding things
+    // in it.
+    if (request.op === 'health') {
+      this.health = {
+        at: Date.now(),
+        items: Number(request.items) || 0,
+        bodies: Number(request.bodies) || 0,
+      };
+      await this.reply(session, params.executionContextId, { id: request.id, ok: true });
+      return;
+    }
+
+    // A notification body and a draft are the same question about a different
+    // piece of text, so they take the same path — counted separately only so
+    // the menu can say whether either is doing anything at all.
+    const stats = this.moderator.stats;
+    if (request.kind === 'notification') stats.notifications = (stats.notifications || 0) + 1;
+    if (request.kind === 'draft') stats.drafts = (stats.drafts || 0) + 1;
+
     const verdict = await this.moderator.moderate({
       text: request.text,
       sender: request.sender,
@@ -161,6 +213,7 @@ export class Attacher {
     });
     this.onEvent({
       type: 'verdict',
+      kind: request.kind || 'message',
       sender: request.sender,
       channel: request.channel,
       text: request.text,

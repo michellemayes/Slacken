@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { coerceAll, inList, withEntry } from './settings.js';
+import { coerceAll, coerceChannelPatch, inList, withEntry, channelKey, forChannel } from './settings.js';
 
 export const HOME_DIR = path.join(os.homedir(), '.slacken');
 export const CONFIG_PATH = path.join(HOME_DIR, 'config.json');
@@ -26,6 +26,9 @@ export const DEFAULTS = {
   claudeBin: 'claude',
   claudeArgs: [],
   requestTimeoutMs: 25000,
+  // How many times a failed call is tried again. Only failures that could
+  // plausibly go differently are retried; being signed out never is.
+  retries: 1,
 
   // Messages that render together travel as one `claude -p` call. Measured on
   // haiku with thinking off: 1/call is ~2.4s and $0.0031 a message, 8/call is
@@ -70,6 +73,29 @@ export const DEFAULTS = {
   // Senders and channels to leave completely untouched.
   ignoreSenders: [],
   ignoreChannels: [],
+  // Settings that differ in one channel: { "#eng-oncall": { "minSeverity": 3 } }.
+  // Edited with `slacken channel`, from the menu bar, or here by hand.
+  channelOverrides: {},
+
+  // Rewrite the body of a Slack notification before it is shown, rather than
+  // catching the message only once you are looking at the channel. Depends on
+  // Slack raising notifications from its renderer; the menu says how many have
+  // actually been seen, so you can tell whether it is doing anything.
+  rewriteNotifications: true,
+  // Look at what you are about to send, and offer a flatter wording if it
+  // reads sharp. Off by default: Slacken's whole promise is that it does not
+  // touch what you write, and this is the one thing that comes near it. It
+  // never edits or sends anything on its own even when it is on.
+  draftCheck: false,
+
+  // Append every rewrite, and every original you ask for back, to
+  // ~/.slacken/history.jsonl. Read it with `slacken history`.
+  historyEnabled: true,
+  historyMaxEntries: 2000,
+
+  // Ask GitHub once a day whether there is a newer Slacken. Off by default:
+  // nothing else here talks to anything but your own machine.
+  checkUpdates: false,
 
   cacheTtlHours: 168,
   cacheMaxEntries: 5000,
@@ -152,6 +178,53 @@ export class ConfigStore {
     return inList(this.values[key], value);
   }
 
+  /*
+   * Per-channel settings, edited one key at a time.
+   *
+   * Handed the whole map, two clients would overwrite each other's channels
+   * the way they would overwrite each other's ignore list, so this merges the
+   * patch into the channel that is named and leaves the rest of the map
+   * exactly as it was. A patch that empties a channel removes it: an entry
+   * that overrides nothing is not a setting, it is a name in a file.
+   */
+  setChannel(channel, patch) {
+    const name = String(channel ?? '').trim();
+    if (!name) {
+      return { changed: [], errors: [{ key: 'channelOverrides', message: 'no channel named' }], values: this.values };
+    }
+    const { values, errors } = coerceChannelPatch(patch);
+    if (errors.length) return { changed: [], errors, values: this.values };
+
+    const next = {};
+    let merged = false;
+    for (const [existing, current] of Object.entries(this.values.channelOverrides || {})) {
+      if (channelKey(existing) === channelKey(name)) {
+        // Keep the name it was first written under, so a channel does not
+        // change case in the file because of how it was typed today.
+        const combined = { ...current, ...values };
+        if (Object.keys(combined).length) next[existing] = combined;
+        merged = true;
+      } else {
+        next[existing] = current;
+      }
+    }
+    if (!merged && Object.keys(values).length) next[name] = values;
+    return this.update({ channelOverrides: next });
+  }
+
+  clearChannel(channel) {
+    const next = {};
+    for (const [existing, current] of Object.entries(this.values.channelOverrides || {})) {
+      if (channelKey(existing) !== channelKey(channel)) next[existing] = current;
+    }
+    return this.update({ channelOverrides: next });
+  }
+
+  // What is actually in force in one channel, overrides included.
+  forChannel(channel) {
+    return forChannel(this.values, channel);
+  }
+
   save(changed) {
     if (!this.persist) return;
     try {
@@ -190,7 +263,23 @@ function same(a, b) {
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((v, i) => v === b[i]);
   }
+  // The per-channel map arrives as a whole new object every time it is
+  // touched, so identity would report a change on every click.
+  if (isPlainObject(a) && isPlainObject(b)) {
+    return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+  }
   return a === b;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function sortKeys(value) {
+  if (!isPlainObject(value)) return value;
+  const out = {};
+  for (const key of Object.keys(value).sort()) out[key] = sortKeys(value[key]);
+  return out;
 }
 
 // Only the fields the injected page script needs to make triage decisions,
@@ -204,6 +293,11 @@ export function pageConfig(config, { paused = false } = {}) {
     condenseEnabled: config.condenseEnabled,
     condenseMinWords: config.condenseMinWords,
     maxChars: config.maxChars,
+    minSeverity: config.minSeverity,
+    condenseMaxRatio: config.condenseMaxRatio,
+    channelOverrides: config.channelOverrides || {},
+    rewriteNotifications: config.rewriteNotifications,
+    draftCheck: config.draftCheck,
     holdWhilePending: config.holdWhilePending,
     persistVerdicts: config.persistVerdicts,
     selfNames: config.selfNames,

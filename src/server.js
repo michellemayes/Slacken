@@ -1,6 +1,8 @@
 import http from 'node:http';
 import { menuModel } from './menubar.js';
-import { SETTINGS } from './settings.js';
+import { SETTINGS, CHANNEL_KEYS } from './settings.js';
+import { tokenFrom, tokenMatches } from './auth.js';
+import { errorHint } from './moderate.js';
 
 /*
  * Small loopback-only control surface.
@@ -15,11 +17,20 @@ import { SETTINGS } from './settings.js';
  *   POST /resume     start again
  *   POST /toggle     whichever of the two applies — what the menu bar clicks
  *   POST /moderate   rewrite one message, for `slacken test` and poking by hand
+ *   POST /channel    change, or clear, the settings for one channel
  *   GET  /inspect    what each attached window makes of the messages on screen
  *   POST /reinject   reload the page script without restarting the daemon
  *   POST /stop       shut the daemon down, the way Ctrl-C would
+ *
+ * Everything but /health needs the token from ~/.slacken/token, because
+ * loopback means "every process on this machine", not "only me". /health is
+ * left open and says nothing but that something is here: it is what a second
+ * `slacken start` uses to find the first one, and answering that with 401
+ * would turn "already running" into "something is wrong".
  */
-export function createServer({ config, moderator, state, store, getStatus, reinject, inspect, onStop }) {
+export function createServer({
+  config, moderator, state, store, getStatus, reinject, inspect, onStop, token = null,
+}) {
   const snapshot = () => ({
     paused: Boolean(state?.paused),
     pausedAt: state?.pausedAt ?? null,
@@ -29,6 +40,11 @@ export function createServer({ config, moderator, state, store, getStatus, reinj
     dailyBudgetUsd: config.dailyBudgetUsd,
     ...getStatus(),
     stats: moderator.stats,
+    // Named rather than counted: "3 errors" is not something anyone can act
+    // on, and "not signed in to Claude" is.
+    lastError: moderator.lastError
+      ? { ...moderator.lastError, hint: errorHint(moderator.lastError.kind, moderator.lastError.message) }
+      : null,
     // What the settings menu draws its checkmarks from.
     config: { ...config },
   });
@@ -41,8 +57,18 @@ export function createServer({ config, moderator, state, store, getStatus, reinj
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
 
+    // Deliberately narrow: that a Slacken is here, and whether it is currently
+    // changing anything. What it has read, what that cost and what it is set to
+    // are behind the token, because those are the answers worth having.
     if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, ...getStatus(), paused: Boolean(state?.paused), stats: moderator.stats });
+      return json(res, 200, { ok: true, slacken: true, paused: Boolean(state?.paused) });
+    }
+
+    if (!tokenMatches(token, tokenFrom(req))) {
+      return json(res, 401, {
+        error: 'this needs the token from ~/.slacken/token',
+        hint: 'slacken token prints it; the CLI and the menu bar item send it for you',
+      });
     }
 
     if (req.method === 'GET' && url.pathname === '/status') {
@@ -91,6 +117,34 @@ export function createServer({ config, moderator, state, store, getStatus, reinj
         ignored,
         value: body.value,
         [key]: config[key],
+      });
+    }
+
+    /*
+     * One channel's settings, merged rather than replaced.
+     *
+     * Separate from /config for the same reason /ignore is: this edits one
+     * entry in a map that other clients are also editing, and handing the
+     * whole map back and forth would let two Slack windows undo each other.
+     * A patch with no keys in it clears the channel entirely.
+     */
+    if (req.method === 'POST' && url.pathname === '/channel') {
+      const body = await readJson(req, res);
+      if (!body) return undefined;
+      if (!store) return json(res, 501, { error: 'this daemon cannot change settings' });
+      const channel = String(body.channel || '').trim();
+      if (!channel) return json(res, 400, { error: 'channel is required' });
+      const patch = body.settings && typeof body.settings === 'object' ? body.settings : {};
+      const result = Object.keys(patch).length || body.clear === true
+        ? (body.clear === true ? store.clearChannel(channel) : store.setChannel(channel, patch))
+        : { changed: [], errors: [{ key: 'settings', message: `nothing to set (${CHANNEL_KEYS.join(', ')})` }] };
+      return json(res, result.errors.length ? 400 : 200, {
+        ok: result.errors.length === 0,
+        changed: result.changed,
+        errors: result.errors,
+        channel,
+        settings: config.channelOverrides?.[channel] || null,
+        channelOverrides: config.channelOverrides,
       });
     }
 

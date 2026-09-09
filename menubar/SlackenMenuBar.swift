@@ -9,7 +9,12 @@
 //
 //  Built on demand by src/menubar.js:
 //      swiftc -O -o SlackenMenuBar SlackenMenuBar.swift
-//      ./SlackenMenuBar --port 8787
+//      SLACKEN_TOKEN=... ./SlackenMenuBar --port 8787
+//
+//  The control API is loopback-only, which keeps it off the network and not
+//  away from anything else running on this Mac, so every request carries the
+//  daemon's token. It arrives in the environment, not in argv, because argv is
+//  readable with `ps` and the environment of another user's process is not.
 //
 //  It exits when stdin closes, so it can never outlive the daemon that
 //  spawned it, even if that daemon is killed outright.
@@ -98,14 +103,16 @@ final class Controller: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let origin: String
+    private let token: String?
     private let session: URLSession
     private var timer: Timer?
     /// Counted rather than flagged: a submenu closing while its parent is
     /// still open must not let the menu be rebuilt under the pointer.
     private var openMenus = 0
 
-    init(port: Int) {
+    init(port: Int, token: String?) {
         self.origin = "http://127.0.0.1:\(port)"
+        self.token = token
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 4
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -128,11 +135,20 @@ final class Controller: NSObject, NSMenuDelegate {
         URL(string: origin + (path.hasPrefix("/") ? path : "/" + path))
     }
 
+    /// Every request, without exception: a menu drawn from an unauthenticated
+    /// answer would be a menu drawn from whatever else replied on that port.
+    private func request(_ endpoint: URL, method: String = "GET") -> URLRequest {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = method
+        if let token = token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        return request
+    }
+
     // MARK: Polling
 
     private func refresh() {
         guard let endpoint = url("/menubar") else { return }
-        session.dataTask(with: endpoint) { [weak self] data, _, _ in
+        session.dataTask(with: request(endpoint)) { [weak self] data, _, _ in
             guard let self = self else { return }
             let spec = data.flatMap { try? JSONDecoder().decode(MenuSpec.self, from: $0) }
             DispatchQueue.main.async { self.apply(spec ?? offlineSpec) }
@@ -221,8 +237,7 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         guard let path = spec.post, let endpoint = url(path) else { return }
 
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
+        var request = self.request(endpoint, method: "POST")
         if let body = spec.body,
            let encoded = try? JSONSerialization.data(withJSONObject: body.value, options: []) {
             request.httpBody = encoded
@@ -276,6 +291,6 @@ var controller: Controller?
 let app = NSApplication.shared
 // Accessory: a menu bar item, with no Dock tile and no menu bar of its own.
 _ = app.setActivationPolicy(.accessory)
-controller = Controller(port: parsePort())
+controller = Controller(port: parsePort(), token: ProcessInfo.processInfo.environment["SLACKEN_TOKEN"])
 exitWhenParentGoesAway()
 app.run()

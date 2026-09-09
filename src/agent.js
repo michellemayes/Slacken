@@ -13,6 +13,23 @@ const PLIST_DIR = path.join(os.homedir(), 'Library', 'LaunchAgents');
 export const PLIST_PATH = path.join(PLIST_DIR, `${LABEL}.plist`);
 export const LOG_PATH = path.join(HOME_DIR, 'agent.log');
 
+// systemd's equivalent, for the same job on Linux: start at login, restart on
+// a crash, and leave a deliberate stop stopped.
+export const UNIT_NAME = 'slacken.service';
+const UNIT_DIR = path.join(
+  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+  'systemd',
+  'user',
+);
+export const UNIT_PATH = path.join(UNIT_DIR, UNIT_NAME);
+
+// Where the agent lives on this platform, whatever kind of thing it is.
+export function agentPath() {
+  if (process.platform === 'darwin') return PLIST_PATH;
+  if (process.platform === 'linux') return UNIT_PATH;
+  return null;
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENTRY = path.join(HERE, '..', 'bin', 'slacken.js');
 
@@ -88,8 +105,59 @@ export async function buildPlist(config) {
 `;
 }
 
+/*
+ * The Linux half.
+ *
+ * A user unit rather than a system one: this drives the Slack you are logged
+ * in to, so it belongs to your session and not to the machine. `PATH=` is
+ * spelled out for the same reason it is in the plist — a login manager hands a
+ * unit almost nothing, and `claude` has to be findable.
+ */
+export async function buildUnit(config) {
+  const claudeDir = await resolveClaudeDir(config.claudeBin);
+  const pathEntries = [
+    claudeDir,
+    path.dirname(process.execPath),
+    path.join(os.homedir(), '.local', 'bin'),
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+  ].filter(Boolean);
+  const uniquePath = [...new Set(pathEntries)].join(':');
+
+  return `[Unit]
+Description=Slacken — a calmer reading layer for Slack
+Documentation=https://github.com/michellemayes/Slacken
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PATH=${uniquePath}
+ExecStart=${process.execPath} ${path.resolve(ENTRY)} start --force
+# on-failure, not always: a deliberate \`slacken stop\` is a decision, and
+# restarting it would be arguing with you. A crash is not a decision.
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:${LOG_PATH}
+StandardError=append:${LOG_PATH}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+async function systemctl(args) {
+  try {
+    const { stdout, stderr } = await execFileAsync('systemctl', ['--user', ...args]);
+    return { ok: true, out: (stdout + stderr).trim() };
+  } catch (err) {
+    return { ok: false, out: ((err.stdout || '') + (err.stderr || '') + err.message).trim() };
+  }
+}
+
 export function agentInstalled() {
-  return fs.existsSync(PLIST_PATH);
+  const file = agentPath();
+  return Boolean(file) && fs.existsSync(file);
 }
 
 async function launchctl(args) {
@@ -102,8 +170,10 @@ async function launchctl(args) {
 }
 
 export async function installAgent(config) {
+  if (process.platform === 'linux') return installUnit(config);
   if (process.platform !== 'darwin') {
-    throw new Error('LaunchAgents are a macOS feature; this is not macOS.');
+    throw new Error(`Slacken cannot install a login agent on ${process.platform}; `
+      + 'run `slacken start` from a terminal, or from your own startup scripts.');
   }
   fs.mkdirSync(PLIST_DIR, { recursive: true });
   fs.mkdirSync(HOME_DIR, { recursive: true });
@@ -121,7 +191,25 @@ export async function installAgent(config) {
   return { plist: PLIST_PATH, log: LOG_PATH };
 }
 
+async function installUnit(config) {
+  fs.mkdirSync(UNIT_DIR, { recursive: true });
+  fs.mkdirSync(HOME_DIR, { recursive: true });
+  fs.writeFileSync(UNIT_PATH, await buildUnit(config));
+
+  await systemctl(['daemon-reload']);
+  const res = await systemctl(['enable', '--now', UNIT_NAME]);
+  if (!res.ok) throw new Error(`systemd refused the unit: ${res.out.slice(0, 300)}`);
+  return { plist: UNIT_PATH, log: LOG_PATH };
+}
+
 export async function uninstallAgent() {
+  if (process.platform === 'linux') {
+    await systemctl(['disable', '--now', UNIT_NAME]);
+    const existed = fs.existsSync(UNIT_PATH);
+    if (existed) fs.unlinkSync(UNIT_PATH);
+    await systemctl(['daemon-reload']);
+    return { removed: existed, plist: UNIT_PATH };
+  }
   const domain = `gui/${process.getuid()}`;
   await launchctl(['bootout', `${domain}/${LABEL}`]);
   await launchctl(['unload', '-w', PLIST_PATH]);
@@ -134,7 +222,12 @@ export async function uninstallAgent() {
 // leaves launchd holding a loaded job with nothing running, because a clean
 // exit is not something KeepAlive restarts.
 export async function restartAgent() {
-  if (!fs.existsSync(PLIST_PATH)) throw new Error("no login agent is installed (run 'slacken agent install')");
+  if (!agentInstalled()) throw new Error("no login agent is installed (run 'slacken agent install')");
+  if (process.platform === 'linux') {
+    const res = await systemctl(['restart', UNIT_NAME]);
+    if (!res.ok) throw new Error(`systemd would not restart the unit: ${res.out.slice(0, 300)}`);
+    return { plist: UNIT_PATH, log: LOG_PATH };
+  }
   const domain = `gui/${process.getuid()}`;
   let res = await launchctl(['kickstart', '-k', `${domain}/${LABEL}`]);
   if (!res.ok) {
@@ -147,6 +240,21 @@ export async function restartAgent() {
 }
 
 export async function agentStatus() {
+  if (process.platform === 'linux') {
+    const installed = fs.existsSync(UNIT_PATH);
+    if (!installed) return { installed: false };
+    const state = await systemctl(['show', UNIT_NAME, '--property=MainPID', '--property=ExecMainStatus']);
+    const pid = state.out.match(/MainPID=(\d+)/)?.[1];
+    const exit = state.out.match(/ExecMainStatus=(\d+)/)?.[1];
+    return {
+      installed: true,
+      running: Boolean(pid) && pid !== '0',
+      pid: pid === '0' ? null : pid,
+      lastExit: exit && exit !== '0' ? exit : null,
+      plist: UNIT_PATH,
+      log: LOG_PATH,
+    };
+  }
   const installed = fs.existsSync(PLIST_PATH);
   if (!installed) return { installed: false };
   const res = await launchctl(['print', `gui/${process.getuid()}/${LABEL}`]);

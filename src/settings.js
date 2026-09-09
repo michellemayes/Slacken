@@ -117,6 +117,21 @@ export const SETTINGS = {
     label: 'Remember rewrites across reloads',
   },
 
+  rewriteNotifications: {
+    type: 'boolean',
+    label: 'Rewrite notifications too',
+  },
+
+  draftCheck: {
+    type: 'boolean',
+    label: 'Look at what I am about to send',
+  },
+
+  historyEnabled: {
+    type: 'boolean',
+    label: 'Keep a record of what changed',
+  },
+
   verbose: {
     type: 'boolean',
     label: 'Log every verdict',
@@ -141,7 +156,107 @@ export const SETTINGS = {
     label: 'Your own names',
     empty: 'Detected from Slack',
   },
+
+  /* ------------------------------------------------- channel by channel */
+
+  // A map of channel -> a patch of the settings above. Validated with the
+  // same rules as the global ones, because a per-channel setting that could
+  // mean something the global one cannot would be a second surface to learn.
+  channelOverrides: {
+    type: 'channelMap',
+    label: 'Per-channel settings',
+    empty: 'Same everywhere',
+  },
 };
+
+/*
+ * Not every setting can honestly differ per channel.
+ *
+ * These can: they are decisions about a particular conversation — how hard to
+ * look, how harsh is harsh enough, whether to condense at all. The rest are
+ * decisions about Slacken itself (which model, what it may spend, whether it
+ * holds a message while it thinks), and a channel is the wrong place to keep
+ * an answer to those.
+ */
+export const CHANNEL_KEYS = [
+  'triageMode',
+  'triageThreshold',
+  'minSeverity',
+  'condenseEnabled',
+  'condenseMinWords',
+  'maxChars',
+];
+
+// "#eng-oncall", "eng-oncall" and "#Eng-Oncall" are one channel.
+export function channelKey(channel) {
+  return String(channel ?? '').trim().replace(/^#/, '').toLowerCase();
+}
+
+// The settings in force for one channel: the global ones, with that channel's
+// overrides on top. Everything that decides a verdict reads this rather than
+// the config directly, so there is one answer to "what is in force here".
+export function forChannel(config, channel) {
+  const overrides = config?.channelOverrides;
+  if (!overrides || !channel) return config;
+  const wanted = channelKey(channel);
+  for (const [name, patch] of Object.entries(overrides)) {
+    if (channelKey(name) !== wanted) continue;
+    if (!patch || typeof patch !== 'object') continue;
+    return { ...config, ...pick(patch, CHANNEL_KEYS) };
+  }
+  return config;
+}
+
+/*
+ * What a cached verdict is an answer to.
+ *
+ * A verdict is stored already judged against the thresholds that were in force
+ * when it was made, so the text alone does not identify it: the same message
+ * in a channel set to soften only hostility is a different answer from the
+ * same message in a channel set to soften a slight edge. Keying the cache by
+ * this alongside the text means moving a threshold makes the old verdicts
+ * unreachable rather than wrong — and moving it back finds them again.
+ */
+export function gateSignature(config, channel) {
+  const c = forChannel(config, channel);
+  return [
+    c.minSeverity,
+    c.condenseEnabled ? 1 : 0,
+    c.condenseMinWords,
+    c.condenseMaxRatio,
+    c.maxChars,
+  ].join(':');
+}
+
+function pick(source, keys) {
+  const out = {};
+  for (const key of keys) if (source[key] !== undefined) out[key] = source[key];
+  return out;
+}
+
+/*
+ * A patch of per-channel settings, validated as a whole.
+ *
+ * An unknown setting is refused rather than stored: a typo that sat silently
+ * in the config file doing nothing would be worse than one that was refused
+ * the moment it was typed, and there is no way to tell them apart later.
+ */
+export function coerceChannelPatch(patch) {
+  const values = {};
+  const errors = [];
+  for (const [key, raw] of Object.entries(patch || {})) {
+    if (!CHANNEL_KEYS.includes(key)) {
+      errors.push({ key, message: `${key} cannot differ per channel (${CHANNEL_KEYS.join(', ')} can)` });
+      continue;
+    }
+    try {
+      values[key] = coerce(key, raw);
+    } catch (err) {
+      errors.push({ key, message: err.message });
+    }
+  }
+  return { values, errors };
+}
 
 // A rewrite is cached under the text that produced it, already judged against
 // the thresholds in force at the time. Changing one of those thresholds makes
@@ -217,6 +332,24 @@ export function coerce(key, raw) {
         out.push(text);
       }
       if (out.length > MAX_LIST) throw new Error(`${key} holds at most ${MAX_LIST} entries`);
+      return out;
+    }
+
+    case 'channelMap': {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error(`${key} is an object of channel -> settings`);
+      }
+      const out = {};
+      for (const [channel, patch] of Object.entries(raw)) {
+        const name = String(channel).trim();
+        if (!name) continue;
+        if (name.length > MAX_ENTRY) throw new Error(`${key} has a channel name that is too long`);
+        const { values, errors } = coerceChannelPatch(patch);
+        if (errors.length) throw new Error(`${name}: ${errors[0].message}`);
+        // A channel whose overrides are all gone is not an entry any more.
+        if (Object.keys(values).length) out[name] = values;
+      }
+      if (Object.keys(out).length > MAX_LIST) throw new Error(`${key} holds at most ${MAX_LIST} channels`);
       return out;
     }
 

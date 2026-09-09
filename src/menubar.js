@@ -5,7 +5,8 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { HOME_DIR, CONFIG_PATH } from './config.js';
-import { SETTINGS } from './settings.js';
+import { SETTINGS, CHANNEL_KEYS, forChannel } from './settings.js';
+import { HISTORY_PATH } from './history.js';
 import { LOG_PATH } from './agent.js';
 
 const execFileAsync = promisify(execFile);
@@ -44,16 +45,23 @@ export function menuModel(status) {
     dailyBudgetUsd = 0,
     stats = {},
     config = {},
+    lastError = null,
+    drifted = false,
   } = status || {};
 
   const seen = (stats.batched || 0) + (stats.cacheHits || 0);
   const rewrote = (stats.softened || 0) + (stats.condensed || 0);
 
+  // Drift outranks the count: a daemon happily watching three windows and
+  // finding nothing in any of them is the failure this line exists to catch,
+  // and "Watching 3 Slack windows" is exactly what it looks like otherwise.
   const headline = paused
     ? 'Paused — showing every message as written'
-    : attached > 0
-      ? `Watching ${count(attached, 'Slack window')}`
-      : 'Waiting for a Slack window';
+    : drifted
+      ? 'Not finding messages — Slack\'s layout may have changed'
+      : attached > 0
+        ? `Watching ${count(attached, 'Slack window')}`
+        : 'Waiting for a Slack window';
 
   const items = [
     { label: headline, enabled: false },
@@ -68,8 +76,21 @@ export function menuModel(status) {
     { label: `${money(stats.costUsd || 0)} today${dailyBudgetUsd > 0 ? ` of ${money(dailyBudgetUsd)}` : ''}`, enabled: false },
   ];
 
+  // How often you asked for the words back. The one number here that is about
+  // whether Slacken is getting it right rather than how much it is doing.
+  if (stats.reveals) {
+    items.push({ label: `${count(stats.reveals, 'original')} asked for back`, enabled: false });
+  }
+  // Only worth saying once there is any evidence either way: on a Slack that
+  // raises its notifications somewhere we cannot reach, this stays at zero and
+  // says so by being absent.
+  if (stats.notifications) {
+    items.push({ label: `${count(stats.notifications, 'notification')} checked before it arrived`, enabled: false });
+  }
+
   // Only worth a line when there is something to say.
-  if (stats.errors) items.push({ label: `${count(stats.errors, 'error')} — see the log`, enabled: false });
+  if (lastError?.hint) items.push({ label: lastError.hint, enabled: false });
+  else if (stats.errors) items.push({ label: `${count(stats.errors, 'error')} — see the log`, enabled: false });
 
   items.push(
     { separator: true },
@@ -77,13 +98,14 @@ export function menuModel(status) {
     { label: `Running for ${duration(uptimeMs)}`, enabled: false },
     { separator: true },
     { label: 'Settings', submenu: settingsMenu(config) },
+    { label: 'Recent changes…', open: HISTORY_PATH },
     { label: 'Open log…', open: LOG_PATH },
     { separator: true },
     { label: 'Hide menu bar item', quit: true },
   );
 
   return {
-    icon: paused ? ICON_PAUSED : attached > 0 ? ICON_RUNNING : ICON_IDLE,
+    icon: paused ? ICON_PAUSED : drifted || attached === 0 ? ICON_IDLE : ICON_RUNNING,
     // Drawn instead of the icon on a Mac too old for SF Symbols.
     fallback: paused ? 'Slacken ‖' : 'Slacken',
     tooltip: `Slacken — ${headline}`,
@@ -116,6 +138,7 @@ export function settingsMenu(config) {
     { label: 'Where it is left alone', enabled: false },
     list('ignoreChannels', config),
     list('ignoreSenders', config),
+    channels(config),
     { separator: true },
     { label: 'What it costs', enabled: false },
     choice('model', config),
@@ -123,6 +146,9 @@ export function settingsMenu(config) {
     { separator: true },
     toggle('holdWhilePending', config),
     toggle('persistVerdicts', config),
+    toggle('rewriteNotifications', config),
+    toggle('draftCheck', config),
+    toggle('historyEnabled', config),
     toggle('verbose', config),
     { separator: true },
     { label: 'Everything else…', open: CONFIG_PATH },
@@ -181,6 +207,75 @@ function list(key, config) {
   else items.push({ separator: true }, { label: 'Click one to stop ignoring it', enabled: false });
 
   return { label: `${spec.label}: ${entries.length || 'none'}`, submenu: items };
+}
+
+/*
+ * The channels that have been told to behave differently.
+ *
+ * A channel gets in here by being given a setting of its own, not by being
+ * read: a submenu of every channel you have ever opened would be a list of
+ * your Slack, drawn in the menu bar, which is nobody's idea of a settings
+ * screen. Each one carries the same choices as the global setting it
+ * overrides, so there is nothing new to learn, and a way back to the global
+ * answer, because an override you cannot remove is a trap.
+ */
+export function channels(config) {
+  const overrides = config.channelOverrides || {};
+  const names = Object.keys(overrides);
+
+  const items = names.map((name) => {
+    const effective = forChannel(config, name);
+    const own = overrides[name] || {};
+    return {
+      label: `${name} — ${summarise(own)}`,
+      submenu: [
+        ...CHANNEL_KEYS
+          .filter((key) => SETTINGS[key]?.choices)
+          .map((key) => channelChoice(name, key, effective, own)),
+        { separator: true },
+        {
+          label: 'Same as everywhere else',
+          post: '/channel',
+          body: { channel: name, clear: true },
+        },
+      ],
+    };
+  });
+
+  if (!items.length) {
+    items.push(
+      { label: SETTINGS.channelOverrides.empty, enabled: false },
+      { separator: true },
+      { label: 'slacken channel #name minSeverity 3', enabled: false },
+    );
+  }
+
+  return { label: `Per-channel settings: ${names.length || 'none'}`, submenu: items };
+}
+
+function channelChoice(channel, key, effective, own) {
+  const spec = SETTINGS[key];
+  const current = effective[key];
+  const known = spec.choices.find((c) => c.value === current);
+  return {
+    label: `${spec.label}: ${known ? known.short : format(current)}${own[key] === undefined ? ' (global)' : ''}`,
+    submenu: spec.choices.map((c) => ({
+      label: c.label,
+      checked: c.value === current,
+      post: '/channel',
+      body: { channel, settings: { [key]: c.value } },
+    })),
+  };
+}
+
+function summarise(own) {
+  const keys = Object.keys(own);
+  if (!keys.length) return 'nothing of its own';
+  return keys.map((key) => {
+    const spec = SETTINGS[key];
+    const choice = spec?.choices?.find((c) => c.value === own[key]);
+    return `${spec?.label || key}: ${choice ? choice.short : format(own[key])}`;
+  }).join(', ');
 }
 
 function format(value) {
@@ -260,8 +355,9 @@ function swiftcMessage(err) {
 const MAX_RESTARTS = 2;
 
 export class MenuBar {
-  constructor({ config, onEvent, restartDelayMs = 2000 }) {
+  constructor({ config, onEvent, token = null, restartDelayMs = 2000 }) {
     this.config = config;
+    this.token = token;
     this.onEvent = onEvent || (() => {});
     this.restartDelayMs = restartDelayMs;
     this.child = null;
@@ -290,6 +386,10 @@ export class MenuBar {
     // a daemon that is killed outright cannot leave an icon behind.
     this.child = spawn(binary, ['--port', String(this.config.httpPort)], {
       stdio: ['pipe', 'ignore', 'pipe'],
+      // The token goes in the environment rather than in argv, where `ps`
+      // would show it to every process on the machine — which is the thing
+      // the token exists to keep the control API away from.
+      env: { ...process.env, ...(this.token ? { SLACKEN_TOKEN: this.token } : {}) },
     });
     this.child.stderr.on('data', (d) => {
       this.onEvent({ type: 'menubar-error', message: String(d).trim() });
