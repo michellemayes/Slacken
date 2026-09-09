@@ -388,6 +388,13 @@
   /* -------------------------------------------------------------- rendering */
 
   const panels = new WeakMap(); // list item -> the panel we built for it
+  // Messages the reader has opened, keyed by content rather than by node. A
+  // reveal kept on the node dies the moment Slack re-renders the row — and
+  // revealing a condensed message swaps one line of rewrite for the whole
+  // original, which is the biggest height change on the page and the surest
+  // way to make the virtual list re-render it. Keyed by content, the reveal
+  // survives being re-rendered straight through it.
+  const revealed = new Set();
   let revealAll = false;
 
   function setAttr(el, name, value) {
@@ -462,7 +469,14 @@
   function toggle(item) {
     const body = bodyFor(item);
     if (!body) return;
-    setHold(item, body, item.getAttribute(ATTR_HOLD) === '0');
+    const key = panels.get(item)?.key;
+    const open = item.getAttribute(ATTR_HOLD) === '0';
+    if (key) {
+      if (open) revealed.delete(key);
+      else revealed.add(key);
+      while (revealed.size > MEMORY_MAX) revealed.delete(revealed.values().next().value);
+    }
+    setHold(item, body, open);
   }
 
   // Local triage already suspects this one, so hide it now rather than letting
@@ -489,8 +503,9 @@
     setHold(item, body, true);
   }
 
-  function applyVerdict(item, body, verdict, keepOpen) {
+  function applyVerdict(item, body, verdict, key) {
     const refs = ensurePanel(item, body);
+    refs.key = key;
 
     if (refs.panel.dataset.pending === '1') {
       delete refs.panel.dataset.pending;
@@ -515,7 +530,7 @@
     const label = actionLabel(verdict);
     if (refs.label.textContent !== label) refs.label.textContent = label;
 
-    setHold(item, body, !(keepOpen || revealAll));
+    setHold(item, body, !(revealAll || revealed.has(key)));
   }
 
   function clearItem(item, body) {
@@ -542,6 +557,7 @@
 
   function setAll(open) {
     revealAll = open;
+    if (!open) revealed.clear();
     document.querySelectorAll(`[${ATTR_STATE}="done"]`).forEach((item) => {
       if (!item.hasAttribute(ATTR_HOLD)) return;
       const body = bodyFor(item);
@@ -584,7 +600,7 @@
     const cached = knownKey ? verdicts.get(knownKey) : null;
     if (cached) {
       return cached.flagged && cached.rewrite
-        ? { ...base, act: 'apply', verdict: cached, state: 'done' }
+        ? { ...base, act: 'apply', verdict: cached, key: knownKey, state: 'done' }
         : { ...base, act: 'clear', state: 'clean' };
     }
 
@@ -613,7 +629,7 @@
     if (known) {
       link(sig, key);
       return known.flagged && known.rewrite
-        ? { ...base, act: 'apply', verdict: known, state: 'done' }
+        ? { ...base, act: 'apply', verdict: known, key, state: 'done' }
         : { ...base, act: 'clear', state: 'clean' };
     }
 
@@ -660,7 +676,7 @@
 
     if (p.act === 'apply') {
       setAttr(item, ATTR_STATE, 'done');
-      applyVerdict(item, body, p.verdict, p.same && item.getAttribute(ATTR_HOLD) === '0');
+      applyVerdict(item, body, p.verdict, p.key);
       return;
     }
 

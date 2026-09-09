@@ -335,6 +335,38 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.match(after.heated.rewrite, /^NEUTRAL\(/, 'the rewrite should still be up');
     });
 
+    await t.test('a revealed original stays revealed through a re-render', async () => {
+      // Condensed messages hit this hardest: revealing one swaps a line of
+      // rewrite for the whole original, which is the biggest height change on
+      // the page and the surest way to make the virtual list re-render the
+      // row. A reveal kept on the node would snap shut here.
+      for (const id of ['msg-heated', 'msg-slop']) {
+        await read(`document.querySelector('#${id} .slacken-badge').click()`);
+        const open = JSON.parse(await snapshot());
+        assert.equal(open[id === 'msg-heated' ? 'heated' : 'slop'].bodyVisible, true, `${id} should open`);
+
+        // The virtual list re-renders the row: same content, brand new nodes.
+        await read(`(() => {
+          const item = document.getElementById('${id}');
+          const fresh = item.cloneNode(true);
+          fresh.querySelectorAll('.slacken-panel').forEach((p) => p.remove());
+          ['data-slacken', 'data-slacken-hash', 'data-slacken-hold']
+            .forEach((a) => fresh.removeAttribute(a));
+          item.replaceWith(fresh);
+        })()`);
+
+        const after = await waitFor(`${id} re-rendered`, async () => {
+          const p = JSON.parse(await snapshot());
+          const m = p[id === 'msg-heated' ? 'heated' : 'slop'];
+          return m.state === 'done' ? m : null;
+        });
+        assert.equal(after.bodyVisible, true, `${id} must still be readable`);
+        assert.equal(after.action, 'hide original', 'the badge has to agree with what is on screen');
+
+        await read(`document.querySelector('#${id} .slacken-badge').click()`);
+      }
+    });
+
     await t.test('a re-render that drops our panel is repaired', async () => {
       await read(`document.querySelector('#msg-heated .slacken-panel').remove()`);
       const repaired = await waitFor('panel re-applied', async () => {

@@ -329,7 +329,8 @@ npm run test:fast   # skips the browser test
   destroys the panel is repaired from cache rather than by asking again, and a
   message body replaced underneath us is unreadable in the same task that
   replaced it — the flash guard, asserted before any observer or timer could
-  have run. It also covers the pause: every rewritten message flips back to
+  have run, and a revealed original survives the row being re-rendered
+  underneath it. It also covers the pause: every rewritten message flips back to
   what was written, a message that arrives during a pause is never triaged or
   sent, a verdict that lands after a pause has begun is thrown away rather than
   quietly applied later, and resuming picks up what the pause let through
