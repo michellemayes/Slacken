@@ -162,6 +162,7 @@ relaunches. On exit it prints what the session cost.
 | `config` | Print the config file path and contents |
 | `set [<name> <value>]` | List the settings you can change, or change one |
 | `status` | What the running daemon has done so far |
+| `inspect` | What Slacken makes of each message on screen, and why |
 | `pause` / `resume` | Stop and restart rewriting, without stopping the daemon |
 | `stop` | Stop the daemon itself, whether you started it or launchd did |
 | `agent install\|uninstall\|restart\|status\|logs` | Manage the login agent |
@@ -180,6 +181,29 @@ slacken set                          # every adjustable setting and its value
 slacken set triageMode always
 slacken set ignoreChannels "#deploys, #random"
 ```
+
+### When a message was left as written
+
+`slacken status` says what Slacken did. `slacken inspect` says what it decided
+not to do, message by message, reading the Slack window you are looking at
+right now:
+
+```
+#eng-oncall — 9 message(s) on screen
+  Ibrahim Diallo [thread reply]: Circling back on the audit with a quick rundown for visibility. As you
+    rewritten
+  Alex Kim: Migration 0042 adds a partial index on events.created_at and drops the
+    read as written; tone 0 of 2 needed, padding 0 of 1 needed, 56 words
+  Priya Nair: Hey team! I wanted to take a moment to circle back on the deployment
+    off screen; it gets looked at when you scroll to it
+```
+
+The last line of each entry is the answer: a message can go untouched because
+triage cleared it, because you wrote it, because the channel is ignored, or
+because it never scrolled into view. A message Slacken cannot find a body under
+is reported too, rather than passed over in silence — that is what a Slack
+layout this does not read yet looks like from the outside, and it is worth
+opening an issue over.
 
 ## The menu bar item
 

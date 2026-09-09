@@ -214,6 +214,8 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         hold: pick('msg-hold'),
         arrived: pick('msg-arrived'),
         inflight: pick('msg-inflight'),
+        broadcast: pick('msg-broadcast'),
+        bare: pick('msg-broadcast-bare'),
       });
     })()`);
 
@@ -256,6 +258,75 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.equal(state.slop.rewrite, 'CONDENSED to one sentence.');
       assert.equal(state.slop.label, 'condensed', 'the badge should say what it did');
       assert.ok(asked.some((a) => a.text.startsWith('Hey team! I wanted to take a moment')));
+    });
+
+    await t.test('a thread reply broadcast to the channel is condensed like any other', async () => {
+      const p = JSON.parse(await waitFor('the broadcast reply to be handled', async () => {
+        const raw = await snapshot();
+        return JSON.parse(raw).broadcast?.state === 'done' ? raw : null;
+      }));
+      assert.equal(p.broadcast.bodyState, 'hidden');
+      assert.equal(p.broadcast.rewrite, 'CONDENSED to one sentence.');
+    });
+
+    await t.test('the quoted parent of a thread reply is neither read nor rewritten', () => {
+      const reply = asked.find((a) => a.text.startsWith('Circling back on the audit'));
+      assert.ok(reply, 'the broadcast reply should have been sent for moderation');
+      assert.ok(
+        !reply.text.includes('replied to a thread'),
+        'Slack\'s own preamble is not something anyone wrote in this channel',
+      );
+      assert.ok(
+        !reply.text.includes('cashsearchone'),
+        'the quoted parent belongs to the thread, not to the message being rewritten',
+      );
+    });
+
+    await t.test('a thread reply with no message_content node is still read', async () => {
+      const p = JSON.parse(await waitFor('the bare-layout reply to be handled', async () => {
+        const raw = await snapshot();
+        return JSON.parse(raw).bare?.state === 'done' ? raw : null;
+      }));
+      assert.equal(p.bare.rewrite, 'CONDENSED to one sentence.');
+      const reply = asked.find((a) => a.text.startsWith('Wanted to reach out'));
+      assert.ok(reply, 'a layout we do not recognise must not swallow the message');
+      assert.equal(reply.sender, 'Ibrahim Diallo');
+    });
+
+    await t.test('the inspector says why a message was left as written', async () => {
+      const report = JSON.parse(await read(`JSON.stringify(window.__slackenInspect())`));
+      assert.equal(report.channel, '#eng-oncall');
+      assert.equal(report.missedCount, 0, 'every message in this layout should be accounted for');
+
+      const broadcast = report.rows.find((r) => r.head.startsWith('Circling back on the audit'));
+      assert.ok(broadcast, 'the broadcast reply should be in the report');
+      assert.equal(broadcast.threadReply, true, 'it should be recognised as a thread reply');
+
+      assert.ok(
+        !report.rows.some((r) => r.why.startsWith('no message body')),
+        'a day divider is not a message Slacken failed to read',
+      );
+
+      const dense = report.rows.find((r) => r.head.startsWith('Migration 0042'));
+      assert.match(
+        dense.why,
+        /read as written; tone \d+ of \d+ needed, padding \d+ of 1 needed/,
+        'a message left as written should say what it fell short of',
+      );
+    });
+
+    await t.test('the inspector counts messages in a layout it cannot read', async () => {
+      const missed = JSON.parse(await read(`(() => {
+        const row = document.createElement('div');
+        row.innerHTML = '<div data-qa="message_content"><div class="c-message_kit__blocks">'
+          + '<div class="p-rich_text_section">a shape we do not know</div></div></div>';
+        document.body.append(row);
+        const report = window.__slackenInspect();
+        row.remove();
+        return JSON.stringify({ count: report.missedCount, sample: report.missed[0] });
+      })()`));
+      assert.equal(missed.count, 1);
+      assert.match(missed.sample, /a shape we do not know/);
     });
 
     await t.test('a long but fact-dense message is left alone', () => {

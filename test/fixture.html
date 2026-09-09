@@ -90,6 +90,43 @@ retry(3, () => fetch(url, { timeout: 500 }))
     </div>
   </div>
 
+  <!--
+    A reply broadcast back into the channel. Slack puts a "replied to a thread:"
+    line quoting the parent above the reply, inside the same blocks, and the
+    quote is rich text like everything else: it has to stay out of both the
+    triage and the rewrite.
+  -->
+  <div data-qa="virtual-list-item" id="msg-broadcast">
+    <div data-qa="message_content">
+      <span data-qa="message_sender_name">Ibrahim Diallo</span>
+      <div class="c-message_kit__blocks">
+        <div class="c-message__broadcast_preamble_container">
+          <span class="c-message__broadcast_preamble">replied to a thread:</span>
+          <a class="c-message__broadcast_preamble_link" href="#"><div class="p-rich_text_section">the ddomain bug ran about nine days and cashsearchone was not the only campaign</div></a>
+        </div>
+        <div class="p-rich_text_section">Circling back on the audit with a quick rundown for visibility. As you may recall, we had flagged several areas worth a closer look, and after careful consideration I believe it would be helpful to walk through what we found before the next release. Happy to elaborate on any of it.</div>
+      </div>
+    </div>
+  </div>
+
+  <!--
+    The same reply in a layout with no message_content node. A row we cannot
+    find a body under is a row we never touch and never report on, which is
+    exactly how a thread reply goes quietly unread.
+  -->
+  <div data-qa="virtual-list-item" id="msg-broadcast-bare">
+    <div class="c-message_kit__gutter">
+      <span data-qa="message_sender_name">Ibrahim Diallo</span>
+      <div class="c-message__broadcast_preamble_container">
+        <span class="c-message__broadcast_preamble">replied to a thread:</span>
+        <a class="c-message__broadcast_preamble_link" href="#">the ddomain bug ran about nine days</a>
+      </div>
+      <div class="c-message_kit__blocks">
+        <div class="p-rich_text_section">Wanted to reach out and share a quick rundown of where the audit landed, for visibility. It is worth noting that only two websites were affected here, and that said, neither excluded domain shows up in any list change at all. Let me know if you have any questions.</div>
+      </div>
+    </div>
+  </div>
+
   <div data-qa="virtual-list-item" id="msg-divider">
     <div class="c-message_list__day_divider">Today</div>
   </div>
