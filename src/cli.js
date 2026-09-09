@@ -463,8 +463,8 @@ async function cmdAgent(args) {
       return 0;
     }
     case 'restart': {
-      await restartAgent();
-      console.log('restarted the login agent');
+      await restartAgent(config);
+      console.log('restarted the login agent, with the claude this shell can see');
       return 0;
     }
     case 'uninstall': {
@@ -853,6 +853,82 @@ async function cmdVersion(args) {
   return 0;
 }
 
+/*
+ * What the running daemon says about itself, checked against this process.
+ *
+ * Every check above this one is answered by the process you just typed the
+ * command into, and the process doing the work is a different one, started at
+ * login, with a PATH of its own and — after an upgrade — code of its own. That
+ * is the whole of "doctor says everything is fine and nothing is happening",
+ * so the two are compared here rather than each being reported as if it spoke
+ * for both.
+ */
+export function daemonChecks(status, claude, version = VERSION) {
+  const checks = [];
+  const mine = claude?.path || null;
+  const theirs = status.claude?.path || null;
+
+  // An upgrade replaces the files on disk. It does not replace the process,
+  // and a fix that is not in the running process has not been applied yet.
+  // No version at all means a daemon from before this line existed, which is
+  // the same answer: it is not the Slacken you installed.
+  if (status.version !== version) {
+    checks.push(['daemon is current', false,
+      `running ${status.version || 'a build too old to say'}, you have ${version}`
+      + ' — the running one is what answers your messages. Restart it: slacken agent restart']);
+  }
+
+  if (status.claude) {
+    if (theirs) {
+      checks.push([`daemon can run ${status.claude.bin}`, true,
+        `${theirs}${status.claude.source === 'path' ? '' : ` (${status.claude.source})`}`]);
+    } else if (mine) {
+      // The case this whole check exists for: claude is installed somewhere
+      // only a terminal's PATH knows about, so this process runs it happily
+      // and the daemon has never been able to.
+      checks.push([`daemon can run ${status.claude.bin}`, false,
+        `no — this shell finds it at ${mine}, the daemon does not.`
+        + ` It looked in: ${(status.claude.searched || []).join(', ')}.`
+        + ' Fix: slacken agent restart, which starts it with this claude on its PATH']);
+    } else {
+      checks.push([`daemon can run ${status.claude.bin}`, false,
+        `no, and neither can this — ${notFoundMessage(status.claude.bin, status.claude.searched)}`]);
+    }
+  }
+
+  if (status.lastError) {
+    const { kind, message } = status.lastError;
+    // Not `hint`: that one says "run: slacken doctor", which is fine on a menu
+    // and useless here, where it is the thing you already did.
+    const fixed = kind === 'missing' && theirs;
+    // A daemon too old to say where its claude is has already been told to
+    // restart, one line up. Sending it to the config file as well would be
+    // two fixes for one problem, and the wrong one first.
+    const detail = kind === 'missing' && !status.claude && mine
+      ? `${message} — but that is this daemon, not this shell, which runs it at ${mine};`
+        + ' restart the daemon and try again'
+      : doctorHint(kind, message);
+    checks.push(['last model call', Boolean(fixed),
+      fixed
+        ? `failed (${kind}), but the daemon can see claude now — the next message will use it`
+        : detail]);
+  }
+  return checks;
+}
+
+// The same failures errorHint names, said to someone who is already looking at
+// a full report and needs the next move rather than where to go for one.
+function doctorHint(kind, message) {
+  switch (kind) {
+    case 'auth': return 'not signed in to Claude — run: claude login';
+    case 'missing': return `${message} — set claudeBin in ~/.slacken/config.json`;
+    case 'rate-limit': return 'rate limited by the API — nothing to fix, it will catch up';
+    case 'overloaded': return 'the API was overloaded — nothing to fix, it will catch up';
+    case 'timeout': return `model calls are timing out — raise requestTimeoutMs, or use a smaller model (${message})`;
+    default: return String(message || 'model call failed');
+  }
+}
+
 async function cmdDoctor(args) {
   const config = configFrom(args);
   const checks = [];
@@ -962,7 +1038,7 @@ async function cmdDoctor(args) {
         + `${status.paused ? ' · PAUSED' : ''}`]);
       checks.push(['finding messages', !status.drifted,
         status.drifted ? "no — Slack's layout may have changed (see the README)" : 'yes']);
-      if (status.lastError) checks.push(['last model call', false, status.lastError.hint]);
+      checks.push(...daemonChecks(status, claude));
     } catch (err) {
       checks.push(['daemon', false, `running, but would not answer: ${err.message}`]);
     }

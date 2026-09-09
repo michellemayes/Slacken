@@ -10,9 +10,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  resolveClaudeBin, knownLocations, notFoundMessage, spawnPath, isRunnable, forgetResolved,
+  resolveClaudeBin, knownLocations, notFoundMessage, spawnPath, isRunnable, forgetResolved, noteFile,
 } from '../src/claude-bin.js';
 import { Moderator, classifyError, errorHint } from '../src/moderate.js';
+import { daemonChecks } from '../src/cli.js';
 
 function sandbox() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-bin-'));
@@ -177,4 +178,141 @@ test('a claude that is nowhere is reported as missing, not as a mystery', async 
   assert.equal(moderator.stats.retries, 0, 'looking again would look in the same places');
   assert.match(errorHint('missing'), /doctor/, 'the menu bar sends you somewhere that can explain');
   forgetResolved();
+});
+
+
+/*
+ * The note in ~/.slacken/claude.json.
+ *
+ * The case behind all of it: claude is inside some other app's bundle, so the
+ * terminal you installed from can run it and a daemon started at login has no
+ * way of ever hearing about it.
+ */
+
+// The one place a terminal finds claude and nothing else does.
+const IN_A_BUNDLE = path.join('Applications', 'cmux.app', 'Contents', 'Resources', 'bin', 'claude');
+
+test('where one Slacken found claude is where the next one looks', async () => {
+  const box = sandbox();
+  try {
+    const note = noteFile(box.home);
+    const claude = box.install(IN_A_BUNDLE);
+
+    // A terminal: claude is on the PATH, and that gets written down.
+    const inATerminal = await resolveClaudeBin('claude', {
+      useCache: false, home: box.home, note, env: bare({ PATH: path.dirname(claude) }),
+    });
+    assert.equal(inATerminal.source, 'path');
+    assert.equal(JSON.parse(fs.readFileSync(note, 'utf8')).path, claude);
+
+    // The daemon: launchd's PATH, no login shell, nothing in the usual places.
+    const atLogin = await resolveClaudeBin('claude', {
+      useCache: false, home: box.home, note, env: bare(),
+    });
+    assert.equal(atLogin.path, claude, 'the daemon could not have worked this out alone');
+    assert.equal(atLogin.source, 'remembered');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('a note pointing at a claude that has gone is not an answer', async () => {
+  const box = sandbox();
+  try {
+    const note = noteFile(box.home);
+    fs.mkdirSync(path.dirname(note), { recursive: true });
+    fs.writeFileSync(note, JSON.stringify({ bin: 'claude', path: path.join(box.home, 'gone', 'claude') }));
+
+    const found = await resolveClaudeBin('claude', {
+      useCache: false, home: box.home, note, env: bare(),
+    });
+    assert.equal(found.path, null, 'a stale note is worse than no note, so it does not win');
+    assert.ok(found.searched.includes(note), 'and it still says it looked there');
+  } finally {
+    box.cleanup();
+  }
+});
+
+test('a note written since makes a cached miss worth re-checking', async () => {
+  const box = sandbox();
+  try {
+    forgetResolved();
+    const note = noteFile(box.home);
+    const at = { home: box.home, note, env: bare() };
+
+    const miss = await resolveClaudeBin('claude', { ...at, now: 0 });
+    assert.equal(miss.path, null);
+
+    // What `slacken doctor` does in the other process: find it, and say so.
+    const claude = box.install(IN_A_BUNDLE);
+    await resolveClaudeBin('claude', {
+      useCache: false, home: box.home, note, env: bare({ PATH: path.dirname(claude) }),
+    });
+
+    const again = await resolveClaudeBin('claude', { ...at, now: 1000 });
+    assert.equal(again.path, claude, 'inside the miss TTL, but the answer has changed since');
+  } finally {
+    forgetResolved();
+    box.cleanup();
+  }
+});
+
+/*
+ * What `slacken doctor` makes of a daemon that disagrees with it.
+ */
+
+const daemonSaying = (extra = {}) => ({
+  version: '9.9.9',
+  claude: { bin: 'claude', path: '/Users/m/.local/bin/claude', source: 'known-location', searched: ['PATH'] },
+  ...extra,
+});
+
+const line = (checks, name) => checks.find(([label]) => label.startsWith(name));
+
+test('doctor never answers a question with "run: slacken doctor"', () => {
+  const checks = daemonChecks(
+    daemonSaying({ lastError: { kind: 'missing', message: 'could not run claude: not found', hint: errorHint('missing') } }),
+    { path: '/Users/m/.local/bin/claude' },
+    '9.9.9',
+  );
+  const [, , detail] = line(checks, 'last model call');
+  assert.doesNotMatch(detail, /slacken doctor/, 'you are reading the output of slacken doctor');
+});
+
+test('a daemon that cannot see the claude this shell can is named as the problem', () => {
+  const checks = daemonChecks(
+    daemonSaying({
+      claude: { bin: 'claude', path: null, source: null, searched: ['PATH', '/Users/m/.local/bin/claude'] },
+      lastError: { kind: 'missing', message: 'could not run claude: not found' },
+    }),
+    { path: '/Applications/cmux.app/Contents/Resources/bin/claude' },
+    '9.9.9',
+  );
+  const [, ok, detail] = line(checks, 'daemon can run claude');
+  assert.equal(ok, false, 'everything else passing is exactly the confusing part');
+  assert.match(detail, /cmux/, 'it has to say where this shell found it');
+  assert.match(detail, /slacken agent restart/, 'and what closes the gap');
+});
+
+test('a model call that failed for want of claude is not still failing once it is found', () => {
+  const checks = daemonChecks(
+    daemonSaying({ lastError: { kind: 'missing', message: 'could not run claude: not found' } }),
+    { path: '/Users/m/.local/bin/claude' },
+    '9.9.9',
+  );
+  const [, ok] = line(checks, 'last model call');
+  assert.equal(ok, true, 'the daemon can see claude now, so this is history');
+});
+
+test('a daemon still running yesterday\'s build says so', () => {
+  const older = daemonChecks(daemonSaying({ version: '0.1.0' }), { path: '/x/claude' }, '0.2.0');
+  assert.match(line(older, 'daemon is current')[2], /0\.1\.0.*0\.2\.0/);
+  assert.match(line(older, 'daemon is current')[2], /restart/, 'installing a fix does not apply it');
+
+  // Old enough not to report a version at all — the same answer.
+  const ancient = daemonChecks({ claude: null }, { path: '/x/claude' }, '0.2.0');
+  assert.equal(line(ancient, 'daemon is current')[1], false);
+
+  const current = daemonChecks(daemonSaying(), { path: '/x/claude' }, '9.9.9');
+  assert.equal(line(current, 'daemon is current'), undefined, 'nothing to say when it matches');
 });

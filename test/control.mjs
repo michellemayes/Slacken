@@ -19,6 +19,7 @@ import { DEFAULTS, ConfigStore, loadConfig } from '../src/config.js';
 import { coerce, coerceAll, withEntry, inList, invalidatesCache, forChannel, gateSignature } from '../src/settings.js';
 import { Attacher } from '../src/attach.js';
 import { loadToken, readToken, tokenMatches } from '../src/auth.js';
+import { VERSION } from '../src/version.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fake-claude.mjs');
@@ -223,6 +224,19 @@ test('/status reports what the daemon is doing', async () => {
     assert.equal(status.triageMode, DEFAULTS.triageMode);
     assert.equal(typeof status.uptimeMs, 'number');
     assert.equal(status.stats.calls, 0);
+  });
+});
+
+test('/status answers for itself, not for whoever is asking', async () => {
+  await withServer(async ({ get }) => {
+    const status = await get('/status');
+    // Both exist so that `slacken doctor` can compare them with its own: the
+    // process being asked is not the process asking, and the two disagreeing
+    // is the failure that otherwise looks like nothing happening at all.
+    assert.equal(status.version, VERSION, 'which Slacken is actually running');
+    assert.equal(status.claude.bin, FAKE, 'the claude this daemon was told to use');
+    assert.equal(status.claude.path, FAKE, 'and where this process, not the asker, finds it');
+    assert.ok(Array.isArray(status.claude.searched));
   });
 });
 

@@ -14,6 +14,13 @@
  * the installers actually use, then the login shell — which is where a PATH
  * set by nvm, asdf, mise or a hand-edited profile lives, and the only way to
  * find that out is to start one.
+ *
+ * And then write down the answer. A claude somewhere none of that reaches —
+ * inside another app's bundle, say — is found by the terminal you installed
+ * from and by nothing else, which is how `slacken doctor` comes to report a
+ * claude it can run while the daemon two feet away cannot find one. The note
+ * in ~/.slacken/claude.json is how the process that knows tells the one that
+ * does not, without either of them being restarted.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,6 +35,55 @@ const execFileAsync = promisify(execFile);
 const MISS_TTL_MS = 60_000;
 
 const memo = new Map();
+
+// Where one Slacken leaves the answer for the next one. Derived from `home`
+// rather than imported so that a test with its own home gets its own note.
+export const noteFile = (home = os.homedir()) => path.join(home, '.slacken', 'claude.json');
+
+function readNote(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// When the note was last written, or 0. One stat, so a cached miss can notice
+// that someone has since worked out where claude is.
+function noteStamp(file) {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function remembered(bin, file) {
+  const note = readNote(file);
+  if (!note || note.bin !== bin || typeof note.path !== 'string') return null;
+  // Verified, not trusted: claude may have been moved or uninstalled since,
+  // and a note pointing at nothing is worse than no note at all.
+  return isRunnable(note.path) ? note.path : null;
+}
+
+/*
+ * Leave the answer where a daemon with no PATH can read it.
+ *
+ * Only when it changes: the file's mtime is what tells another process its
+ * cached "not found" is worth re-checking, so rewriting the same answer every
+ * lookup would make that signal mean nothing.
+ */
+function remember(bin, found, file) {
+  try {
+    const note = readNote(file);
+    if (note && note.bin === bin && note.path === found) return;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ bin, path: found, at: Date.now() }) + '\n');
+  } catch {
+    // A read-only home, or no home at all. Everything still works; the next
+    // process just has to do its own looking.
+  }
+}
 
 export function isRunnable(file) {
   try {
@@ -111,17 +167,25 @@ export async function resolveClaudeBin(bin = 'claude', options = {}) {
     env = process.env,
     useCache = true,
     now = Date.now(),
+    note = noteFile(home),
   } = options;
 
   const cached = useCache ? memo.get(bin) : null;
-  if (cached && (cached.path || now - cached.at < MISS_TTL_MS)) return cached.result;
+  if (cached && cached.note === note) {
+    // A hit stays a hit. A miss is only reused while it is still plausibly
+    // true: it expires on its own, and it expires early if someone has
+    // written down where claude is since — which is one stat to find out,
+    // and the difference between `slacken doctor` fixing this and a restart.
+    if (cached.result.path) return cached.result;
+    if (now - cached.at < MISS_TTL_MS && noteStamp(note) <= cached.at) return cached.result;
+  }
 
-  const result = await lookUp(bin, { home, env });
-  if (useCache) memo.set(bin, { at: now, path: result.path, result });
+  const result = await lookUp(bin, { home, env, note });
+  if (useCache) memo.set(bin, { at: now, note, result });
   return result;
 }
 
-async function lookUp(bin, { home, env }) {
+async function lookUp(bin, { home, env, note }) {
   // A configured path is a decision, not a hint: if it is wrong, say so about
   // that path rather than quietly running some other claude instead.
   if (bin.includes('/') || bin.includes('\\')) {
@@ -131,18 +195,30 @@ async function lookUp(bin, { home, env }) {
 
   const searched = [];
 
+  const found = (file, source) => {
+    remember(bin, file, note);
+    return { path: file, source, searched };
+  };
+
   const onPath = onSearchPath(bin, env);
   searched.push('PATH');
-  if (onPath) return { path: onPath, source: 'path', searched };
+  if (onPath) return found(onPath, 'path');
 
   for (const file of knownLocations(bin, home)) {
     searched.push(file);
-    if (isRunnable(file)) return { path: file, source: 'known-location', searched };
+    if (isRunnable(file)) return found(file, 'known-location');
   }
+
+  // Before the login shell, because reading a file someone else already filled
+  // in beats starting a shell to work the same thing out again — and if what
+  // it names has since moved, it does not answer and the shell still runs.
+  const noted = remembered(bin, note);
+  searched.push(note);
+  if (noted) return { path: noted, source: 'remembered', searched };
 
   const fromShell = await fromLoginShell(bin, env);
   if (env.SHELL) searched.push(`${env.SHELL} -lc 'command -v ${bin}'`);
-  if (fromShell) return { path: fromShell, source: 'login-shell', searched };
+  if (fromShell) return found(fromShell, 'login-shell');
 
   return { path: null, source: null, searched };
 }

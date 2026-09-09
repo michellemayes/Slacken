@@ -157,10 +157,32 @@ one is a delay you sit and watch.
 The daemon does the same lookup again every time it starts, and does not rely
 on the `PATH` it was handed: it checks that `PATH`, then the places the
 installers actually use (`~/.local/bin`, `~/.claude/local`, Homebrew,
-`/usr/local/bin`), then your login shell, which is where a `PATH` set by nvm,
-asdf or mise lives. If it still cannot find it — *Can't find claude* in the
-menu — `slacken doctor` prints every place it looked, and setting `claudeBin`
-to its full path in `~/.slacken/config.json` settles it.
+`/usr/local/bin`), then `~/.slacken/claude.json`, then your login shell, which
+is where a `PATH` set by nvm, asdf or mise lives.
+
+`~/.slacken/claude.json` is how one Slacken tells the next one what it found.
+A `claude` that lives somewhere none of the rest reaches — inside another app's
+bundle, say — is findable by the terminal you installed from and by nothing
+else, which is how `slacken doctor` comes to report a `claude` it can run
+happily while the daemon has never once managed to. So every process that
+resolves `claude` writes the answer down, and a daemon holding a cached *not
+found* re-checks the moment that file changes: running `slacken doctor` is
+enough, no restart. `slacken agent restart` also rewrites the plist or unit
+before restarting, so the agent comes back with the `claude` your shell can
+see baked into its `PATH` — restarting a job with the same broken environment
+would be a fix that visibly does nothing.
+
+If it still cannot find it — *Can't find claude* in the menu — `slacken doctor`
+prints every place it looked, and setting `claudeBin` to its full path in
+`~/.slacken/config.json` settles it.
+
+`slacken doctor` also asks the running daemon what *it* sees, and reports the
+two answers separately. Every other line in that report is answered by the
+process you just typed the command into; the process doing the work is a
+different one, started at login, with a `PATH` of its own and — after an
+upgrade — code of its own. A daemon that cannot find `claude`, or that is
+still running the build from before you upgraded, is named as such rather than
+hidden behind a row of `ok`s that are true of the wrong process.
 
 From then on the menu bar item is the interface — what has been changed, the
 pause, and the settings. Everything else is there when you want it:
@@ -198,7 +220,7 @@ relaunches. On exit it prints what the session cost.
 | `launch [--force]` | Just relaunch Slack with the debug port open |
 | `attach [--verbose]` | Attach to a Slack that is already launched with the port |
 | `test "<message>"` | Rewrite one string and print the verdict — no Slack needed |
-| `doctor [--no-model]` | Check Slack, `claude`, one real model call, the debug port, and visible Slack windows |
+| `doctor [--no-model]` | Check Slack, `claude`, one real model call, the debug port, visible Slack windows, and what the running daemon can see |
 | `config` | Print the config file path and contents |
 | `set [<name> <value>]` | List the settings you can change, or change one |
 | `channel [<#name> <setting> <value>]` | What each channel does differently, or change one |
@@ -711,6 +733,7 @@ src/agent.js         the login agent: a LaunchAgent or a systemd user unit
 src/cdp.js           minimal Chrome DevTools Protocol client
 src/attach.js        attach to Slack windows, inject, serve binding calls
 src/moderate.js      batch, run claude -p, parse and gate the verdicts
+src/claude-bin.js    find claude from a process with no PATH, and note where
 src/state.js         paused or not, and today's spend, across restarts
 src/history.js       the record of what was changed, and what was asked back
 src/auth.js          the control API token
