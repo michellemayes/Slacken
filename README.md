@@ -50,15 +50,28 @@ survived. Taking the edge off must never take the facts with it.
    length and filler markers, so a long message dense with facts is left alone.
    Intensity triage looks for capitals, exclamation runs and urgency phrasing.
    Only what clears triage costs a model call.
-4. Anything suspected is hidden immediately behind a `checking…` placeholder,
-   so the original does not sit on screen while the model decides. It is
-   restored in full if the model finds nothing worth changing.
-5. The page asks the daemon through a CDP binding rather than `fetch`, so
+4. Anything suspected is hidden the moment triage suspects it, before the
+   frame is painted, so the original never gets on screen while the model
+   decides. The panel holds the message's height while it waits, so nothing
+   on the page jumps, and it stays wordless for the first 140ms — a cached
+   verdict beats that and swaps straight in, so a fast answer never flashes a
+   `checking…` placeholder on the way past. It is restored in full if the
+   model finds nothing worth changing.
+5. The hold is a CSS rule rooted at the list item rather than an attribute on
+   the message body, because Slack re-renders message bodies constantly and
+   anything written onto one dies with it. A body React has just re-created
+   arrives already hidden by the cascade, with no JavaScript in the way and so
+   no window to see through. Repairs — a panel Slack removed, a recycled list
+   item showing the wrong message — run synchronously inside the
+   MutationObserver callback, which the browser calls before it paints; the
+   panel is reconciled in place rather than torn down and rebuilt.
+6. The page asks the daemon through a CDP binding rather than `fetch`, so
    Slack's content security policy is not involved and no HTTP request leaves
    the page.
-6. Messages that arrive together are batched into one
+7. Messages that arrive together are batched into one
    `claude -p --output-format json` call. Verdicts are cached on disk by
-   message text, so re-reading a channel is free.
+   message text, so re-reading a channel is free, and kept in the renderer as
+   well so a reload repaints its rewrites without a round trip.
 
 ## Install
 
@@ -169,6 +182,7 @@ Two things measured and deliberately **not** used:
 | `condenseMinWords` | `45` | Shorter messages are never condensed |
 | `condenseMaxRatio` | `0.7` | A condense that is not at least this much shorter is discarded |
 | `holdWhilePending` | `true` | Hide a suspected message while the model decides, rather than after |
+| `persistVerdicts` | `true` | Keep rewrites in Slack's `localStorage` too, so a reload repaints instantly. `false` leaves nothing behind |
 | `selfNames` | `[]` | Fallback if your display name is not detected from the Slack UI |
 | `ignoreSenders` | `[]` | Never rewrite these people |
 | `ignoreChannels` | `[]` | Never rewrite in these channels |
@@ -232,8 +246,11 @@ npm run test:fast   # skips the browser test
   condensed, a long fact-dense one is left alone, a message with a code block
   never costs a call, a grouped follow-up inherits its sender, your own
   messages are skipped, a suspected message is hidden while the model decides
-  and restored if cleared, the reveal toggle works both ways, and a re-render
-  that destroys the panel is repaired from cache rather than by asking again.
+  and restored if cleared, the reveal toggle works both ways, a re-render that
+  destroys the panel is repaired from cache rather than by asking again, and a
+  message body replaced underneath us is unreadable in the same task that
+  replaced it — the flash guard, asserted before any observer or timer could
+  have run.
   It finds any Chromium on the machine and skips itself if there is none;
   `SLACKEN_TEST_CHROME` overrides the search.
 

@@ -171,12 +171,14 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         const panel = item.querySelector('.slacken-panel');
         return {
           state: item.getAttribute('data-slacken'),
+          hold: item.getAttribute('data-slacken-hold'),
           bodyState: body ? body.getAttribute('data-slacken-body') : null,
           bodyVisible: body ? body.offsetParent !== null : null,
           rewrite: panel ? panel.querySelector('.slacken-rewrite').textContent : null,
           action: panel ? (panel.querySelector('.slacken-action') || {}).textContent ?? null : null,
           label: panel ? (panel.querySelector('.slacken-badge span:nth-child(2)') || {}).textContent ?? null : null,
           pending: panel ? panel.dataset.pending === '1' : false,
+          reserved: panel ? panel.style.minHeight : null,
         };
       };
       return JSON.stringify({
@@ -249,10 +251,25 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       );
     });
 
-    await t.test('a suspected message is hidden while the model is still deciding', async () => {
+    await t.test('a suspected message is hidden the moment triage suspects it', async () => {
       assert.equal(state.hold.pending, true, 'the hold panel should be up');
       assert.equal(state.hold.bodyState, 'hidden', 'you should not be reading it yet');
-      assert.equal(state.hold.rewrite, 'checking…');
+      assert.equal(state.hold.bodyVisible, false);
+      assert.match(
+        state.hold.reserved,
+        /^\d+(\.\d+)?px$/,
+        'the hold should keep the message\'s height so the page does not jump',
+      );
+    });
+
+    await t.test('a hold that runs long says so, but only after a beat', async () => {
+      // Silence first: a cached verdict lands inside PENDING_LABEL_MS and swaps
+      // straight in, so a fast answer never flashes a placeholder on the way.
+      const placeholder = await waitFor('the placeholder to appear', async () => {
+        const p = JSON.parse(await snapshot());
+        return p.hold.rewrite === 'checking…' ? p.hold : null;
+      });
+      assert.equal(placeholder.bodyVisible, false, 'still not readable');
     });
 
     await t.test('a held message the model clears is restored in full', async () => {
@@ -278,6 +295,27 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.equal(after.heated.bodyState, 'hidden');
       assert.equal(after.heated.bodyVisible, false);
       assert.equal(after.heated.action, 'show original');
+    });
+
+    await t.test('a body Slack re-renders comes back already hidden', async () => {
+      // The flash this guards against: Slack replaces the message body, our
+      // attribute goes with it, and the original paints at full opacity until
+      // something notices. The hold lives on the list item, so the replacement
+      // is hidden by the cascade before it can be painted at all.
+      const visible = await read(`(() => {
+        const item = document.getElementById('msg-heated');
+        const body = item.querySelector('.c-message_kit__blocks');
+        const fresh = body.cloneNode(true);
+        fresh.removeAttribute('data-slacken-body');
+        body.replaceWith(fresh);
+        // Read back in the same task, before any observer or timer could run.
+        return fresh.offsetParent !== null;
+      })()`);
+      assert.equal(visible, false, 'the re-rendered original must never be readable');
+
+      const after = JSON.parse(await snapshot());
+      assert.equal(after.heated.hold, '1');
+      assert.match(after.heated.rewrite, /^NEUTRAL\(/, 'the rewrite should still be up');
     });
 
     await t.test('a re-render that drops our panel is repaired', async () => {
