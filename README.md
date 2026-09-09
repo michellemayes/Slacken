@@ -1,7 +1,6 @@
 # Slacken
 
-A calmer reading layer for Slack on macOS. Formerly SlackCensor — same
-project, renamed to Slacken.
+A calmer reading layer for Slack on macOS. Being bombarded with AI messages? Condense them and even out the tone of all of your team's Slack messages with a simple overlay.
 
 Incoming messages get rewritten in place, in the real desktop app, as you read
 them. Two things happen:
