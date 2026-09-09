@@ -58,6 +58,10 @@ export const DEFAULTS = {
   // the original sit on screen while the model answers. It is restored in full
   // if the model disagrees.
   holdWhilePending: true,
+  // Keep rewrites in the renderer's localStorage as well as on disk here, so a
+  // reload or a workspace switch repaints them without a round trip. Set false
+  // to leave nothing behind in Slack's own storage.
+  persistVerdicts: true,
 
   // Your own display names, so your messages are never rewritten. Usually
   // detected automatically from the Slack UI; this is the fallback.
@@ -102,6 +106,7 @@ export function pageConfig(config, { paused = false } = {}) {
     condenseMinWords: config.condenseMinWords,
     maxChars: config.maxChars,
     holdWhilePending: config.holdWhilePending,
+    persistVerdicts: config.persistVerdicts,
     selfNames: config.selfNames,
     ignoreSenders: config.ignoreSenders,
     ignoreChannels: config.ignoreChannels,

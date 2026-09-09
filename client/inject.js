@@ -7,8 +7,26 @@
  * neutral rewrite, and swaps the rewrite in with a badge that flips back to
  * the original text.
  *
- * The original DOM is never destroyed. It is hidden with an attribute we own
- * and revealed again on click.
+ * The original DOM is never destroyed. It is hidden and revealed again on
+ * click.
+ *
+ * Two rules keep the swap from flickering, and both matter more than they
+ * look:
+ *
+ *   1. The hold is a CSS rule rooted at the list item, not an attribute on
+ *      the message body. Slack re-renders the body constantly — hover,
+ *      reactions, read receipts, virtual-list recycling — and anything we
+ *      write onto the body dies with it. The list item survives, so a body
+ *      React has just re-created is already hidden by the cascade the moment
+ *      it lands. No JavaScript runs, so there is no window to see through.
+ *
+ *   2. Reconciliation is synchronous inside the MutationObserver callback,
+ *      which the browser runs before it paints. Repairing on a timer, however
+ *      short, guarantees the original gets at least one frame on screen.
+ *
+ * Everything else here follows from those two: the DOM is reconciled, never
+ * rebuilt, so a repair mutates text in place instead of tearing a panel down
+ * and putting a new one up.
  */
 (() => {
   if (window.__SLACKEN__) return;
@@ -21,6 +39,8 @@
     condenseMinWords: 45,
     maxChars: 4000,
     holdWhilePending: true,
+    persistVerdicts: true,
+    paused: false,
     selfNames: [],
     ignoreSenders: [],
     ignoreChannels: [],
@@ -29,9 +49,26 @@
   }, window.__SLACKEN_CONFIG || {});
 
   const ASK = '__slackenAsk';
+  // On the list item: what we decided, and the content we decided it about.
   const ATTR_STATE = 'data-slacken';
   const ATTR_HASH = 'data-slacken-hash';
+  // On the list item: '1' original hidden, '0' original revealed by the reader.
+  const ATTR_HOLD = 'data-slacken-hold';
+  // On the body, for older layouts the class-based hold rules do not reach.
   const ATTR_BODY = 'data-slacken-body';
+  const OUR_ATTRS = new Set([ATTR_STATE, ATTR_HASH, ATTR_HOLD, ATTR_BODY]);
+
+  // How long a hold stays silent before it admits to waiting. Under this, a
+  // cache hit lands first and the reader never sees a placeholder at all.
+  const PENDING_LABEL_MS = 140;
+  // Off-screen messages cost a model call for nothing, so they wait. Generous,
+  // because the margin is what buys a scroll its head start.
+  const VIEWPORT_MARGIN_PX = 800;
+  const SWEEP_MS = 2000;
+  const STORE_KEY = 'slacken:verdicts:v1';
+  const STORE_MAX = 400;
+  const STORE_TTL_MS = 24 * 3600 * 1000;
+  const MEMORY_MAX = 1500;
 
   const SEL = {
     item: '[data-qa="virtual-list-item"]',
@@ -54,7 +91,12 @@
 
   const STYLE_ID = 'slacken-style';
   const CSS = `
-    [${ATTR_BODY}="hidden"] { display: none !important; }
+    /* The hold hangs off the list item so that a message body Slack re-renders
+       arrives already hidden, rather than flashing until we notice. */
+    [${ATTR_HOLD}="1"] .c-message_kit__blocks,
+    [${ATTR_HOLD}="1"] .c-message__message_blocks,
+    [${ATTR_HOLD}="1"] [${ATTR_BODY}] { display: none !important; }
+
     .slacken-panel { margin: 2px 0 0; }
     .slacken-rewrite {
       line-height: 1.46668;
@@ -73,6 +115,7 @@
       cursor: pointer; user-select: none;
     }
     .slacken-badge:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-badge[hidden] { display: none; }
     .slacken-dot {
       width: 6px; height: 6px; border-radius: 50%;
       background: #d9a441; flex: 0 0 auto;
@@ -244,7 +287,8 @@
   }
 
   // Grouped consecutive messages only carry the sender name on the first one,
-  // so walk back through earlier list items until we find it.
+  // so walk back through earlier list items until we find it. Only worth doing
+  // for a message that has already cleared triage; it is the priciest read here.
   function senderFor(item) {
     let node = item;
     for (let i = 0; i < 40 && node; i += 1) {
@@ -283,13 +327,84 @@
     return list.some((entry) => needle === String(entry).toLowerCase());
   }
 
+  /* --------------------------------------------------------------- memory */
+
+  // Keyed by a hash of the message text, so the same message costs one call no
+  // matter how often it is re-rendered, recycled or scrolled past.
+  const verdicts = new Map();
+  // Cheap textContent hash -> verdict key. textContent needs no layout, so a
+  // repair pass can decide what to do without touching innerText at all.
+  const sigs = new Map();
+
+  const CLEAN = { flagged: false, rewrite: null };
+
+  function remember(key, verdict) {
+    verdicts.set(key, verdict);
+    while (verdicts.size > MEMORY_MAX) verdicts.delete(verdicts.keys().next().value);
+  }
+
+  function link(sig, key) {
+    sigs.set(sig, key);
+    while (sigs.size > MEMORY_MAX) sigs.delete(sigs.keys().next().value);
+  }
+
+  // Flagged verdicts survive a reload, so re-opening Slack repaints the
+  // rewrites immediately instead of walking every held message back through
+  // the daemon. Triage is cheap enough that clean verdicts are not worth a
+  // storage slot.
+  function loadStore() {
+    if (!CONFIG.persistVerdicts) return;
+    try {
+      const raw = JSON.parse(window.localStorage.getItem(STORE_KEY) || '{}');
+      const now = Date.now();
+      for (const [key, entry] of Object.entries(raw)) {
+        if (entry && now - entry.at < STORE_TTL_MS) remember(key, entry.v);
+      }
+    } catch {
+      // Private mode, a quota error, or a corrupt blob. Start empty.
+    }
+  }
+
+  let storeTimer = null;
+  function persistSoon() {
+    if (!CONFIG.persistVerdicts || storeTimer) return;
+    storeTimer = setTimeout(() => {
+      storeTimer = null;
+      try {
+        const out = {};
+        const at = Date.now();
+        const keys = Array.from(verdicts.keys()).slice(-STORE_MAX);
+        for (const key of keys) {
+          const v = verdicts.get(key);
+          if (v && v.flagged && v.rewrite) out[key] = { at, v };
+        }
+        window.localStorage.setItem(STORE_KEY, JSON.stringify(out));
+      } catch {
+        // Nothing here is worth failing a render over.
+      }
+    }, 2000);
+  }
+
   /* -------------------------------------------------------------- rendering */
 
-  const verdicts = new Map(); // text hash -> verdict, so re-renders are free
+  const panels = new WeakMap(); // list item -> the panel we built for it
+  // Messages the reader has opened, keyed by content rather than by node. A
+  // reveal kept on the node dies the moment Slack re-renders the row — and
+  // revealing a condensed message swaps one line of rewrite for the whole
+  // original, which is the biggest height change on the page and the surest
+  // way to make the virtual list re-render it. Keyed by content, the reveal
+  // survives being re-rendered straight through it.
+  const revealed = new Set();
+  let revealAll = false;
 
-  function rememberVerdict(key, verdict) {
-    verdicts.set(key, verdict);
-    if (verdicts.size > 800) verdicts.delete(verdicts.keys().next().value);
+  function setAttr(el, name, value) {
+    // Writing an identical value still fires the observer, which is how a
+    // reconcile loop starts. Every write here is conditional for that reason.
+    if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+  }
+
+  function dropAttr(el, name) {
+    if (el?.hasAttribute(name)) el.removeAttribute(name);
   }
 
   function actionLabel(verdict) {
@@ -298,77 +413,136 @@
     return 'softened';
   }
 
-  function clearPanels(item) {
-    item.querySelectorAll('.slacken-panel').forEach((el) => el.remove());
+  function ensurePanel(item, body) {
+    let refs = panels.get(item);
+    if (!refs) {
+      const panel = document.createElement('div');
+      panel.className = 'slacken-panel';
+      panel.dataset.open = '0';
+
+      const rewrite = document.createElement('div');
+      rewrite.className = 'slacken-rewrite';
+
+      const badge = document.createElement('button');
+      badge.type = 'button';
+      badge.className = 'slacken-badge';
+      const dot = document.createElement('span');
+      dot.className = 'slacken-dot';
+      const label = document.createElement('span');
+      label.className = 'slacken-label';
+      const action = document.createElement('span');
+      action.className = 'slacken-action';
+      action.textContent = 'show original';
+      badge.append(dot, label, action);
+
+      badge.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggle(item);
+      });
+
+      panel.append(rewrite, badge);
+      refs = { panel, rewrite, badge, label, action, labelTimer: null };
+      panels.set(item, refs);
+    }
+
+    // Put it back if Slack re-rendered over it. This runs inside the observer
+    // callback, so the repair lands before the frame is painted and the gap is
+    // never visible.
+    const parent = body.parentElement;
+    if (parent && (refs.panel.parentElement !== parent || refs.panel.previousElementSibling !== body)) {
+      parent.insertBefore(refs.panel, body.nextSibling);
+    }
+    return refs;
+  }
+
+  function setHold(item, body, on) {
+    setAttr(item, ATTR_HOLD, on ? '1' : '0');
+    if (body) setAttr(body, ATTR_BODY, on ? 'hidden' : 'shown');
+    const refs = panels.get(item);
+    if (!refs) return;
+    if (refs.panel.dataset.open !== (on ? '0' : '1')) refs.panel.dataset.open = on ? '0' : '1';
+    const action = on ? 'show original' : 'hide original';
+    if (refs.action.textContent !== action) refs.action.textContent = action;
+  }
+
+  function toggle(item) {
+    const body = bodyFor(item);
+    if (!body) return;
+    const key = panels.get(item)?.key;
+    const open = item.getAttribute(ATTR_HOLD) === '0';
+    if (key) {
+      if (open) revealed.delete(key);
+      else revealed.add(key);
+      while (revealed.size > MEMORY_MAX) revealed.delete(revealed.values().next().value);
+    }
+    setHold(item, body, open);
   }
 
   // Local triage already suspects this one, so hide it now rather than letting
-  // the hostile version sit on screen for the couple of seconds the model
-  // takes. Restored in full if the model disagrees.
-  function renderPending(item, body) {
-    clearPanels(item);
-    const panel = document.createElement('div');
-    panel.className = 'slacken-panel';
-    panel.dataset.open = '0';
-    panel.dataset.pending = '1';
-
-    const placeholder = document.createElement('div');
-    placeholder.className = 'slacken-rewrite slacken-pending';
-    placeholder.textContent = 'checking…';
-    panel.appendChild(placeholder);
-
-    body.setAttribute(ATTR_BODY, 'hidden');
-    body.parentElement?.insertBefore(panel, body.nextSibling);
+  // the hostile version sit on screen for the second or so the model takes.
+  // The panel holds the original's height while it waits, so nothing on the
+  // page moves, and it stays wordless for a beat: a cached verdict beats
+  // PENDING_LABEL_MS and swaps straight in with no placeholder in between.
+  function applyPending(item, body, height) {
+    const refs = ensurePanel(item, body);
+    const fresh = refs.panel.dataset.pending !== '1';
+    refs.panel.dataset.pending = '1';
+    if (!refs.badge.hidden) refs.badge.hidden = true;
+    refs.rewrite.classList.add('slacken-pending');
+    if (height && refs.panel.style.minHeight !== `${height}px`) {
+      refs.panel.style.minHeight = `${height}px`;
+    }
+    if (fresh) {
+      refs.rewrite.textContent = '';
+      clearTimeout(refs.labelTimer);
+      refs.labelTimer = setTimeout(() => {
+        if (refs.panel.dataset.pending === '1') refs.rewrite.textContent = 'checking…';
+      }, PENDING_LABEL_MS);
+    }
+    setHold(item, body, true);
   }
 
-  function restore(item, body) {
-    clearPanels(item);
-    body.removeAttribute(ATTR_BODY);
-  }
+  function applyVerdict(item, body, verdict, key) {
+    const refs = ensurePanel(item, body);
+    refs.key = key;
 
-  function render(item, body, verdict) {
-    // Drop any panel left over from a previous render of this message.
-    clearPanels(item);
+    if (refs.panel.dataset.pending === '1') {
+      delete refs.panel.dataset.pending;
+      clearTimeout(refs.labelTimer);
+      refs.panel.style.minHeight = '';
+      refs.rewrite.classList.remove('slacken-pending');
+    }
 
-    const panel = document.createElement('div');
-    panel.className = 'slacken-panel';
-    panel.dataset.open = '0';
+    if (refs.badge.hidden) refs.badge.hidden = false;
+    if (refs.rewrite.textContent !== verdict.rewrite) refs.rewrite.textContent = verdict.rewrite;
 
-    const rewrite = document.createElement('div');
-    rewrite.className = 'slacken-rewrite';
-    rewrite.textContent = verdict.rewrite;
-    panel.appendChild(rewrite);
+    const severity = String(verdict.severity ?? 2);
+    const kind = verdict.hostile ? 'softened' : 'condensed';
+    if (refs.badge.dataset.severity !== severity) refs.badge.dataset.severity = severity;
+    if (refs.badge.dataset.kind !== kind) refs.badge.dataset.kind = kind;
 
-    const badge = document.createElement('button');
-    badge.type = 'button';
-    badge.className = 'slacken-badge';
-    badge.dataset.severity = String(verdict.severity);
-    badge.dataset.kind = verdict.hostile ? 'softened' : 'condensed';
     const tones = (verdict.tone || []).join(', ');
-    badge.title = [verdict.note, tones && `(${tones})`].filter(Boolean).join(' ')
+    const title = [verdict.note, tones && `(${tones})`].filter(Boolean).join(' ')
       || 'Slacken rewrote this message';
+    if (refs.badge.title !== title) refs.badge.title = title;
 
-    const dot = document.createElement('span');
-    dot.className = 'slacken-dot';
-    const label = document.createElement('span');
-    label.textContent = actionLabel(verdict);
-    const action = document.createElement('span');
-    action.className = 'slacken-action';
-    action.textContent = 'show original';
-    badge.append(dot, label, action);
+    const label = actionLabel(verdict);
+    if (refs.label.textContent !== label) refs.label.textContent = label;
 
-    badge.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const open = panel.dataset.open === '1';
-      panel.dataset.open = open ? '0' : '1';
-      body.setAttribute(ATTR_BODY, open ? 'hidden' : 'shown');
-      action.textContent = open ? 'show original' : 'hide original';
-    });
+    setHold(item, body, !(revealAll || revealed.has(key)));
+  }
 
-    panel.appendChild(badge);
-    body.setAttribute(ATTR_BODY, 'hidden');
-    body.parentElement?.insertBefore(panel, body.nextSibling);
+  function clearItem(item, body) {
+    const refs = panels.get(item);
+    if (refs) {
+      clearTimeout(refs.labelTimer);
+      delete refs.panel.dataset.pending;
+      refs.panel.style.minHeight = '';
+      refs.panel.remove();
+    }
+    dropAttr(item, ATTR_HOLD);
+    dropAttr(body, ATTR_BODY);
   }
 
   // Pausing has to clear held messages as well as revealed ones, or a message
@@ -376,169 +550,307 @@
   // replace it.
   function releaseHolds() {
     document.querySelectorAll('.slacken-panel[data-pending]').forEach((panel) => {
-      const body = panel.previousElementSibling;
-      panel.remove();
-      if (body) body.removeAttribute(ATTR_BODY);
+      const item = panel.closest(SEL.item);
+      if (item) clearItem(item, bodyFor(item));
     });
   }
 
   function setAll(open) {
-    document.querySelectorAll('.slacken-panel:not([data-pending])').forEach((panel) => {
-      const badge = panel.querySelector('.slacken-badge');
-      const body = panel.previousElementSibling;
-      if (!badge || !body || !body.hasAttribute(ATTR_BODY)) return;
-      panel.dataset.open = open ? '1' : '0';
-      body.setAttribute(ATTR_BODY, open ? 'shown' : 'hidden');
-      const action = panel.querySelector('.slacken-action');
-      if (action) action.textContent = open ? 'hide original' : 'show original';
+    revealAll = open;
+    if (!open) revealed.clear();
+    document.querySelectorAll(`[${ATTR_STATE}="done"]`).forEach((item) => {
+      if (!item.hasAttribute(ATTR_HOLD)) return;
+      const body = bodyFor(item);
+      if (body) setHold(item, body, !open);
     });
   }
 
   /* ------------------------------------------------------------ processing */
 
-  const IGNORE_STATES = new Set(['clean', 'skipped', 'pending', 'error']);
-
-  function inViewport(el) {
+  function nearViewport(el) {
     const rect = el.getBoundingClientRect();
     if (rect.height === 0) return false;
-    return rect.bottom > -600 && rect.top < window.innerHeight + 600;
+    return rect.bottom > -VIEWPORT_MARGIN_PX
+      && rect.top < window.innerHeight + VIEWPORT_MARGIN_PX;
   }
 
-  async function processItem(item) {
-    if (paused) return;
-    if (item.closest(SEL.composer)) return;
+  /*
+   * Reconciliation runs in two halves on purpose. `plan` only reads the DOM
+   * and `commit` only writes it, so a batch of messages costs one layout
+   * instead of one per message. Interleaving the two is what makes a naive
+   * version of this slow enough to need a debounce — and a debounce is what
+   * puts the original on screen.
+   */
+  function plan(item, ctx) {
+    if (item.closest(SEL.composer)) return null;
 
     const body = bodyFor(item);
-    if (!body) return;
+    if (!body) return null;
+
+    const raw = body.textContent || '';
+    if (!raw.trim()) return null;
+
+    const sig = hash(raw);
+    const same = item.getAttribute(ATTR_HASH) === sig;
+    const base = { item, body, sig, same };
+
+    // Fast path: we have judged this exact text before, here or anywhere else.
+    // No innerText, no layout, no call.
+    const knownKey = sigs.get(sig);
+    const cached = knownKey ? verdicts.get(knownKey) : null;
+    if (cached) {
+      return cached.flagged && cached.rewrite
+        ? { ...base, act: 'apply', verdict: cached, key: knownKey, state: 'done' }
+        : { ...base, act: 'clear', state: 'clean' };
+    }
+
+    // Paused. Verdicts already on screen stay, revealed by setAll, so the badge
+    // still flips back; everything else is released and left unexamined, with
+    // no state stamped, so resuming gives it a fresh look.
+    if (paused) return { ...base, act: 'idle' };
+
+    // Second fast path: decisions that belong to this item rather than to the
+    // text, so they cannot live in the shared cache.
+    if (same) {
+      const state = item.getAttribute(ATTR_STATE);
+      if (state === 'pending') return { ...base, act: 'pending' };
+      if (state === 'skipped' || state === 'error') return { ...base, act: 'clear', state };
+    }
+
+    // Undecided, and off screen. Leave it completely alone — including its
+    // hash, so it gets a fresh look when it scrolls in.
+    if (!nearViewport(item)) return { ...base, act: 'idle' };
 
     const text = textFor(body);
-    if (!text) return;
-    if (text.length > CONFIG.maxChars) return;
+    if (!text || text.length > CONFIG.maxChars) return { ...base, act: 'clear', state: 'clean' };
 
     const key = hash(text);
-    const state = item.getAttribute(ATTR_STATE);
-
-    if (state && item.getAttribute(ATTR_HASH) === key) {
-      // Already handled. Re-apply if React blew our panel away.
-      if (state === 'done' && !item.querySelector('.slacken-panel')) {
-        const verdict = verdicts.get(key);
-        if (verdict) render(item, body, verdict);
-        else item.removeAttribute(ATTR_STATE);
-      }
-      // Safety net: never leave a message hidden behind a hold that ended.
-      if ((state === 'clean' || state === 'error') && body.hasAttribute(ATTR_BODY)) {
-        restore(item, body);
-      }
-      if (IGNORE_STATES.has(state)) return;
-      if (state === 'done') return;
-    }
-
-    item.setAttribute(ATTR_HASH, key);
-
-    const sender = senderFor(item);
-    const channel = channelName();
-    const me = selfName();
-
-    if ((me && sender === me)
-      || matchesAny(CONFIG.selfNames, sender)
-      || matchesAny(CONFIG.ignoreSenders, sender)
-      || matchesAny(CONFIG.ignoreChannels, channel)) {
-      item.setAttribute(ATTR_STATE, 'skipped');
-      return;
-    }
-
-    const cached = verdicts.get(key);
-    if (cached) {
-      if (cached.flagged) {
-        item.setAttribute(ATTR_STATE, 'done');
-        render(item, body, cached);
-      } else {
-        item.setAttribute(ATTR_STATE, 'clean');
-      }
-      return;
+    const known = verdicts.get(key);
+    if (known) {
+      link(sig, key);
+      return known.flagged && known.rewrite
+        ? { ...base, act: 'apply', verdict: known, key, state: 'done' }
+        : { ...base, act: 'clear', state: 'clean' };
     }
 
     if (!shouldAsk(text)) {
-      item.setAttribute(ATTR_STATE, 'clean');
-      return;
+      remember(key, CLEAN);
+      link(sig, key);
+      return { ...base, act: 'clear', state: 'clean' };
     }
     log('triage', heuristicScore(text), paddingScore(text), text.slice(0, 60));
 
-    item.setAttribute(ATTR_STATE, 'pending');
-    const held = CONFIG.holdWhilePending;
-    if (held) renderPending(item, body);
+    // Only now is the sender walk worth its cost, and a skip is per-sender so
+    // it never goes in the text-keyed cache.
+    const sender = senderFor(item);
+    const me = selfName();
+    if ((me && sender === me)
+      || matchesAny(CONFIG.selfNames, sender)
+      || matchesAny(CONFIG.ignoreSenders, sender)
+      || matchesAny(CONFIG.ignoreChannels, ctx.channel)) {
+      return { ...base, act: 'clear', state: 'skipped' };
+    }
 
-    let verdict;
-    try {
-      verdict = await ask({ text, sender, channel });
-    } catch (err) {
-      log('ask failed', err.message);
-      item.setAttribute(ATTR_STATE, 'error');
-      if (held && item.isConnected) restore(item, body);
+    return {
+      ...base,
+      act: 'ask',
+      key,
+      text,
+      sender,
+      channel: ctx.channel,
+      // Read the height now, in the read half, so the hold can keep the
+      // message's place without shifting the page.
+      height: CONFIG.holdWhilePending ? body.offsetHeight : 0,
+    };
+  }
+
+  function commit(p) {
+    const { item, body } = p;
+
+    if (p.act === 'idle') {
+      clearItem(item, body);
       return;
     }
 
-    if (verdict.error) log('daemon error', verdict.error);
+    setAttr(item, ATTR_HASH, p.sig);
 
-    // A verdict that lands after a pause began says nothing about the message,
-    // only about the pause. Remembering it would mean this message stayed
-    // unexamined for as long as the page lived, long after resuming.
-    if (paused || verdict.reason === 'paused') {
-      item.removeAttribute(ATTR_STATE);
-      item.removeAttribute(ATTR_HASH);
-      if (held && item.isConnected) restore(item, body);
+    if (p.act === 'apply') {
+      setAttr(item, ATTR_STATE, 'done');
+      applyVerdict(item, body, p.verdict, p.key);
       return;
     }
 
-    rememberVerdict(key, verdict);
-
-    // The virtual list may have recycled the node while we waited.
-    if (item.getAttribute(ATTR_HASH) !== key || !item.isConnected) return;
-
-    if (verdict.flagged && verdict.rewrite) {
-      item.setAttribute(ATTR_STATE, 'done');
-      render(item, body, verdict);
-    } else {
-      item.setAttribute(ATTR_STATE, 'clean');
-      if (held) restore(item, body);
+    if (p.act === 'pending') {
+      applyPending(item, body, 0);
+      return;
     }
+
+    if (p.act === 'ask') {
+      setAttr(item, ATTR_STATE, 'pending');
+      if (CONFIG.holdWhilePending) applyPending(item, body, p.height);
+      else clearItem(item, body);
+      startAsk(p);
+      return;
+    }
+
+    setAttr(item, ATTR_STATE, p.state || 'clean');
+    clearItem(item, body);
   }
 
-  function scan() {
-    ensureStyle();
-    const items = document.querySelectorAll(SEL.item);
-    for (const item of items) {
-      if (!inViewport(item)) continue;
-      processItem(item).catch((err) => log('process failed', err.message));
-    }
+  const inFlight = new Set();
+
+  // Every copy of this text on screen, not just the one that asked for it.
+  function itemsFor(sig) {
+    return Array.from(document.querySelectorAll(`[${ATTR_HASH}="${sig}"]`));
   }
 
-  let scanTimer = null;
-  function scheduleScan() {
-    if (scanTimer) return;
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      try {
-        scan();
-      } catch (err) {
-        log('scan failed', err.message);
+  function startAsk(p) {
+    if (inFlight.has(p.key)) return;
+    inFlight.add(p.key);
+
+    ask({ text: p.text, sender: p.sender, channel: p.channel }).then((verdict) => {
+      if (verdict.error) log('daemon error', verdict.error);
+
+      // A verdict that lands after a pause began says nothing about the
+      // message, only about the pause. Remembering it would leave this message
+      // unexamined for as long as the page lived, long after resuming.
+      if (paused || verdict.reason === 'paused') {
+        for (const item of itemsFor(p.sig)) {
+          dirty.add(item);
+          item.removeAttribute(ATTR_STATE);
+          item.removeAttribute(ATTR_HASH);
+        }
+        return;
       }
-    }, 250);
+
+      remember(p.key, verdict);
+      link(p.sig, p.key);
+      persistSoon();
+    }).catch((err) => {
+      log('ask failed', err.message);
+      // Never leave a message hidden behind a hold that will not lift.
+      for (const item of itemsFor(p.sig)) {
+        if (item.getAttribute(ATTR_STATE) === 'pending') setAttr(item, ATTR_STATE, 'error');
+      }
+    }).finally(() => {
+      inFlight.delete(p.key);
+      for (const item of itemsFor(p.sig)) dirty.add(item);
+      flush();
+    });
   }
 
-  const observer = new MutationObserver(scheduleScan);
-  observer.observe(document.documentElement, { childList: true, subtree: true });
-  window.addEventListener('scroll', scheduleScan, true);
+  /* ------------------------------------------------------------ scheduling */
+
+  const dirty = new Set();
+
+  function flush() {
+    if (!dirty.size) return;
+    ensureStyle();
+    const items = Array.from(dirty);
+    dirty.clear();
+
+    const ctx = { channel: channelName() };
+    const plans = [];
+    // Read half.
+    for (const item of items) {
+      if (!item.isConnected) continue;
+      try {
+        const p = plan(item, ctx);
+        if (p) plans.push(p);
+      } catch (err) {
+        log('plan failed', err.message);
+      }
+    }
+    // Write half.
+    for (const p of plans) {
+      try {
+        commit(p);
+      } catch (err) {
+        log('commit failed', err.message);
+      }
+    }
+  }
+
+  function refresh(selector) {
+    document.querySelectorAll(selector).forEach((item) => dirty.add(item));
+    flush();
+  }
+
+  function sweep() {
+    document.querySelectorAll(SEL.item).forEach((item) => dirty.add(item));
+    flush();
+  }
+
+  function collect(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.closest?.('.slacken-panel')) return;
+    const item = node.closest?.(SEL.item);
+    if (item) {
+      dirty.add(item);
+      return;
+    }
+    // A whole slice of the virtual list can land in one mutation.
+    node.querySelectorAll?.(SEL.item).forEach((el) => dirty.add(el));
+  }
+
+  const observer = new MutationObserver((records) => {
+    for (const rec of records) {
+      if (rec.type === 'attributes') {
+        // Our own attributes come back as records too. Re-planning the item is
+        // how a hold Slack stripped gets re-asserted; `plan` is idempotent, so
+        // an attribute that is already right ends the loop rather than
+        // extending it.
+        if (rec.target.nodeType === 1) collect(rec.target);
+        continue;
+      }
+      collect(rec.target);
+      rec.addedNodes.forEach(collect);
+    }
+    // Synchronous: MutationObserver callbacks run before the browser paints,
+    // which is the whole reason the original never gets a frame on screen.
+    flush();
+  });
+
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: Array.from(OUR_ATTRS),
+  });
+
+  // Scrolling reveals items that were already in the DOM but too far away to
+  // be worth a call. A frame callback, not a timer: it still lands before the
+  // paint that would show the original.
+  let frame = null;
+  function onScroll() {
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      try {
+        sweep();
+      } catch (err) {
+        log('sweep failed', err.message);
+      }
+    });
+  }
+  window.addEventListener('scroll', onScroll, { capture: true, passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+
   // Backstop: the virtual list sometimes settles without a mutation we see.
-  setInterval(scheduleScan, 3000);
+  setInterval(() => {
+    try {
+      ensureStyle();
+      sweep();
+    } catch (err) {
+      log('sweep failed', err.message);
+    }
+  }, SWEEP_MS);
 
   window.addEventListener('keydown', (event) => {
     if (!(event.metaKey && event.shiftKey)) return;
     if (event.key.toLowerCase() !== 'u') return;
     event.preventDefault();
-    const anyClosed = Array.from(document.querySelectorAll('.slacken-panel'))
-      .some((p) => p.dataset.open !== '1');
-    setAll(anyClosed);
+    setAll(!revealAll);
   });
 
   // Called by the daemon whenever the pause state changes, and once at
@@ -547,13 +859,19 @@
     const next = Boolean(on);
     if (next === paused) return;
     paused = next;
+
     if (paused) {
+      // A hold with no verdict coming is just a message you cannot read, so
+      // release those outright; rewrites already decided keep their badge and
+      // simply show the original.
       releaseHolds();
       setAll(true);
       log('paused: showing every original');
+      sweep();
       return;
     }
-    // Anything the pause left unexamined — or cleared only because we were
+
+    // Anything the pause left unexamined — or released only because we were
     // paused — deserves a second look. Messages already rewritten keep their
     // verdict, so resuming costs nothing for what was decided before.
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
@@ -564,18 +882,22 @@
     });
     setAll(false);
     log('resumed');
-    scheduleScan();
+    sweep();
   };
 
   window.__slackenRescan = () => {
-    document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
-      el.removeAttribute(ATTR_STATE);
-      el.removeAttribute(ATTR_HASH);
+    document.querySelectorAll(`[${ATTR_STATE}]`).forEach((item) => {
+      item.removeAttribute(ATTR_STATE);
+      item.removeAttribute(ATTR_HASH);
+      clearItem(item, bodyFor(item));
     });
     verdicts.clear();
-    scan();
+    sigs.clear();
+    sweep();
   };
 
-  scheduleScan();
+  loadStore();
+  ensureStyle();
+  sweep();
   log('page script ready', CONFIG);
 })();
