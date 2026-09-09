@@ -332,7 +332,11 @@ export function logEvent(event, config, report = SHARED_REPORT) {
         const who = `${event.sender || 'someone'} in ${event.channel || '?'}`;
         console.log(`[slacken] ${what} ${who}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
       } else if (config.verbose) {
-        console.log(`[slacken] left alone: ${JSON.stringify(event.text.slice(0, 60))}`);
+        // Paused is the one that matters most here: without it, a Slacken you
+        // forgot you paused reads exactly like a Slacken that read every
+        // message and found nothing worth changing.
+        const why = v.reason || (v.cached ? 'cached' : v.why) || 'nothing to change';
+        console.log(`[slacken] left alone (${why}): ${JSON.stringify(event.text.slice(0, 60))}`);
       }
       break;
     }

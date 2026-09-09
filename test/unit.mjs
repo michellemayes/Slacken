@@ -267,3 +267,55 @@ test('a verdict that never reached the model is not proof it recovered', () => {
   ], { report });
   assert.match(after[0], /the model is answering again — recovered after 1 failure/);
 });
+
+/* ----------------------------------------- why nothing happened to it */
+
+test('normalize names the gate that stopped a soften', () => {
+  const out = normalize({ ...SOFTEN, severity: 1 }, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /severity 1, below minSeverity 2/);
+});
+
+test('normalize names the length that stopped a condense', () => {
+  const out = normalize(CONDENSE, { minSeverity: 2, condenseMinWords: 45 }, 'far too short to bother');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /5 words, condensing starts at condenseMinWords 45/);
+});
+
+test('normalize names the ratio that stopped a condense', () => {
+  // 60 words in, a rewrite of 50 words back: over the 0.7 allowance.
+  const rewrite = Array(50).fill('still').join(' ');
+  const out = normalize({ ...CONDENSE, rewrite }, { condenseMinWords: 45, condenseMaxRatio: 0.7 }, PADDED);
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /the rewrite was 83% of the length, condenseMaxRatio allows 70%/);
+});
+
+test('normalize says so when the model simply saw nothing wrong', () => {
+  const out = normalize({ id: 'm0', hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null }, {}, 'Good morning!');
+  assert.equal(out.why, 'nothing to change');
+});
+
+test('normalize reports a flag that arrived with no rewrite', () => {
+  const out = normalize({ ...SOFTEN, rewrite: null }, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, false);
+  assert.match(out.why, /sent back no rewrite/);
+});
+
+test('a verdict that was rewritten carries no reason to explain', () => {
+  const out = normalize(SOFTEN, { minSeverity: 2 }, 'x');
+  assert.equal(out.flagged, true);
+  assert.equal(out.why, null);
+});
+
+test('the log distinguishes a paused Slacken from a quiet one', () => {
+  const lines = capture([
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], why: 'nothing to change' } },
+    // The one that used to be indistinguishable from the line above.
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], reason: 'paused' } },
+    { type: 'verdict', channel: 'c', text: 'Good morning!', verdict: { flagged: false, tone: [], cached: true } },
+  ], { config: { verbose: true } });
+
+  assert.match(lines[0], /left alone \(nothing to change\)/);
+  assert.match(lines[1], /left alone \(paused\)/);
+  assert.match(lines[2], /left alone \(cached\)/);
+});
