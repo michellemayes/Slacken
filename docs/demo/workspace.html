@@ -1,0 +1,260 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Slacken demo workspace</title>
+<!--
+  A styled stand-in for a Slack channel, used only to produce the images in the
+  README. It is not part of the product.
+
+  The selectors and nesting are the ones the page script actually reads, and
+  are kept identical to test/fixture.html, so `docs/demo/capture.mjs` can run
+  the real client/inject.js against this page and photograph what it does. The
+  paint is a stand-in; the badges, the hidden originals and the reveal toggle
+  in the images are all drawn by the real page script.
+-->
+<style>
+  :root {
+    --slack-aubergine: #3f0e40;
+    --slack-text: #1d1c1d;
+    --slack-muted: #616061;
+    --slack-rule: #e8e8e8;
+    --slack-font: Lato, "Helvetica Neue", Helvetica, "Liberation Sans", Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    background: #f4f4f4;
+    font-family: var(--slack-font);
+    color: var(--slack-text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The element the capture script clips to. */
+  #shot {
+    width: 1000px;
+    display: flex;
+    align-items: stretch;
+    overflow: hidden;
+    background: #fff;
+  }
+
+  /* ------------------------------------------------------------- sidebar */
+
+  .sidebar {
+    width: 232px;
+    flex: 0 0 232px;
+    background: var(--slack-aubergine);
+    color: rgba(255, 255, 255, .72);
+    font-size: 15px;
+    padding-bottom: 12px;
+  }
+
+  .workspace {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 50px;
+    padding: 0 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, .12);
+    color: #fff;
+    font-weight: 900;
+    font-size: 16px;
+  }
+
+  .workspace .glyph {
+    width: 20px; height: 20px; border-radius: 4px;
+    background: #fff; color: var(--slack-aubergine);
+    font-size: 12px; font-weight: 900;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  .rail { padding: 12px 0 0; }
+  .rail .group { padding: 8px 16px 2px; font-size: 13px; opacity: .7; }
+  .rail a {
+    display: block;
+    padding: 4px 16px;
+    text-decoration: none;
+    color: inherit;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rail a.current {
+    background: #1164a3;
+    color: #fff;
+    font-weight: 700;
+  }
+  .rail a .hash { opacity: .7; margin-right: 4px; }
+  .rail a.unread { color: #fff; font-weight: 700; }
+
+  /* ---------------------------------------------------------------- main */
+
+  .main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+
+  .channel-header {
+    height: 50px;
+    flex: 0 0 50px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--slack-rule);
+  }
+  .channel-header [data-qa="channel_name"] { font-weight: 900; font-size: 17px; }
+  .channel-header .members { color: var(--slack-muted); font-size: 13px; }
+
+  .messages {
+    flex: 1 1 auto;
+    overflow: hidden;
+    padding: 12px 0 8px;
+  }
+
+  .c-message_list__day_divider {
+    position: relative;
+    text-align: center;
+    margin: 4px 20px 12px;
+    color: var(--slack-muted);
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .c-message_list__day_divider::before {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; top: 50%;
+    border-top: 1px solid var(--slack-rule);
+  }
+  .c-message_list__day_divider span {
+    position: relative;
+    background: #fff;
+    border: 1px solid var(--slack-rule);
+    border-radius: 12px;
+    padding: 1px 12px;
+  }
+
+  [data-qa="virtual-list-item"] { padding: 7px 20px; }
+
+  [data-qa="message_content"] {
+    display: grid;
+    grid-template-columns: 36px 1fr;
+    column-gap: 8px;
+  }
+
+  .avatar {
+    grid-row: span 2;
+    width: 36px; height: 36px;
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 900; font-size: 13px;
+    margin-top: 2px;
+  }
+
+  .byline { line-height: 1.2; margin-bottom: 1px; }
+  [data-qa="message_sender_name"] { font-weight: 900; font-size: 15px; }
+  .byline time { color: var(--slack-muted); font-size: 12px; margin-left: 6px; }
+
+  .c-message_kit__blocks { grid-column: 2; }
+  .slacken-panel { grid-column: 2; }
+
+  .p-rich_text_section {
+    font-size: 15px;
+    line-height: 1.46668;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .composer {
+    flex: 0 0 auto;
+    margin: 8px 20px 16px;
+    border: 1px solid #b8b8b8;
+    border-radius: 8px;
+    padding: 9px 12px;
+    color: #8d8d8e;
+    font-size: 15px;
+  }
+</style>
+
+<button data-qa="user-button" aria-label="User menu: Michelle Mayes" hidden>me</button>
+
+<div id="shot">
+  <div class="sidebar">
+    <div class="workspace"><span class="glyph">A</span> Acme</div>
+    <nav class="rail">
+      <div class="group">Channels</div>
+      <a href="#"><span class="hash">#</span>announcements</a>
+      <a href="#" class="current"><span class="hash">#</span>eng-oncall</a>
+      <a href="#" class="unread"><span class="hash">#</span>incidents</a>
+      <a href="#"><span class="hash">#</span>platform</a>
+      <a href="#"><span class="hash">#</span>releases</a>
+      <div class="group">Direct messages</div>
+      <a href="#">Dana Wu</a>
+      <a href="#">Priya Nair</a>
+      <a href="#">Alex Kim</a>
+    </nav>
+  </div>
+
+  <div class="main">
+    <div class="channel-header">
+      <div data-qa="channel_name">#eng-oncall</div>
+      <div class="members">12 members</div>
+    </div>
+
+    <div class="messages c-virtual_list__scroll_container">
+      <div data-qa="virtual-list-item" id="msg-divider">
+        <div class="c-message_list__day_divider"><span>Today</span></div>
+      </div>
+
+      <div data-qa="virtual-list-item" id="msg-neutral">
+        <div data-qa="message_content">
+          <div class="avatar" style="background:#2e7d5b">SO</div>
+          <div class="byline"><span data-qa="message_sender_name">Sam Ortiz</span><time>10:02</time></div>
+          <div class="c-message_kit__blocks">
+            <div class="p-rich_text_section">Deploy is queued behind the migration, should land around 2pm.</div>
+          </div>
+        </div>
+      </div>
+
+      <div data-qa="virtual-list-item" id="msg-heated">
+        <div data-qa="message_content">
+          <div class="avatar" style="background:#8b3a62">DW</div>
+          <div class="byline"><span data-qa="message_sender_name">Dana Wu</span><time>10:04</time></div>
+          <div class="c-message_kit__blocks">
+            <div class="p-rich_text_section">WHY is the deploy STILL broken?? I have asked about this THREE times now. I need it fixed by 3pm today, this is completely unacceptable.</div>
+          </div>
+        </div>
+      </div>
+
+      <div data-qa="virtual-list-item" id="msg-slop">
+        <div data-qa="message_content">
+          <div class="avatar" style="background:#3d5a99">PN</div>
+          <div class="byline"><span data-qa="message_sender_name">Priya Nair</span><time>10:06</time></div>
+          <div class="c-message_kit__blocks">
+            <div class="p-rich_text_section">Hey team! I wanted to take a moment to circle back on the deployment pipeline discussion from earlier this week. As you may recall, we had identified several areas where there might be opportunities for improvement. After giving it considerable thought, I believe it would be beneficial for us to consider revisiting the retry logic before the next release. Let me know if you have any questions.</div>
+          </div>
+        </div>
+      </div>
+
+      <div data-qa="virtual-list-item" id="msg-dense">
+        <div data-qa="message_content">
+          <div class="avatar" style="background:#a0522d">AK</div>
+          <div class="byline"><span data-qa="message_sender_name">Alex Kim</span><time>10:11</time></div>
+          <div class="c-message_kit__blocks">
+            <div class="p-rich_text_section">Migration 0042 adds a partial index on events.created_at and drops the old composite. It locks the table for about 90 seconds on staging with 40M rows, so production will be closer to four minutes. I have scheduled it for the 2am window on Thursday and paged Dana as backup in case the rollback path is needed.</div>
+          </div>
+        </div>
+      </div>
+
+      <div data-qa="virtual-list-item" id="msg-mine">
+        <div data-qa="message_content">
+          <div class="avatar" style="background:#4a154b">MM</div>
+          <div class="byline"><span data-qa="message_sender_name">Michelle Mayes</span><time>10:14</time></div>
+          <div class="c-message_kit__blocks">
+            <div class="p-rich_text_section">URGENT: can someone confirm we are actually going to make the 3pm cutoff??</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer">Message #eng-oncall</div>
+  </div>
+</div>

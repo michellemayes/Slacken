@@ -13,19 +13,23 @@ Nothing is deleted and nothing is sent anywhere. Every rewrite carries a small
 badge, and one click brings the original back. A menu bar item shows what has
 been changed and pauses the whole thing.
 
-```
-┌────────────────────────────────────────────┐   ┌────────────────────────────────────────────┐
-│ Priya Nair  10:06                          │   │ Dana Wu  10:04                             │
-│ We should revisit the retry logic before   │   │ Deploy is still broken. I've asked for     │
-│ the next release.                          │   │ this three times. It needs to be fixed by  │
-│                                            │   │ 3pm today.                                 │
-│ ● condensed     show original              │   │ ● softened      show original              │
-└────────────────────────────────────────────┘   └────────────────────────────────────────────┘
-```
+![A Slack channel with two messages rewritten by Slacken, each carrying a badge
+reading "softened" or "condensed" and a "show original" link](docs/images/channel-rewritten.png)
 
-Left, the original was 66 words of circling back and taking a moment. Right,
-the original said the same thing in capitals — note that the 3pm deadline
-survived. Taking the edge off must never take the facts with it.
+Dana's message was written in capitals; Priya's was 66 words of circling back
+and taking a moment. Note what came through anyway: the 3pm deadline, the fact
+that it had been asked three times, the actual suggestion about retry logic.
+Taking the edge off must never take the facts with it.
+
+Note also what is *not* touched. Sam's message was already plain, so it never
+reached the model. Alex's is long but dense with facts, and length alone is
+never a reason to condense. The last message is mine — Slacken never rewrites
+what you wrote yourself, however you wrote it.
+
+Clicking a badge puts the original back, underneath the rewrite it replaced:
+
+![The same channel with one badge clicked, showing Dana's original message in
+capitals and the badge now reading "hide original"](docs/images/channel-revealed.png)
 
 ## How it works
 
@@ -135,26 +139,9 @@ While the daemon runs there is an item in the menu bar. It is the answer to the
 two questions this tool raises the moment you leave it running: *is it on right
 now*, and *how much of what I just read was not what was written*.
 
-```
-                                       ┌──────────────────────────────────┐
-                                       │  Watching 1 Slack window         │
-   ▐ 🗨  ▌ ◄────────────────────────    ├──────────────────────────────────┤
-                                       │  Pause                           │
-                                       ├──────────────────────────────────┤
-                                       │  8 messages rewritten of 50 read │
-                                       │  5 softened · 3 condensed        │
-                                       │  4 model calls · 38 from cache   │
-                                       │  $0.0104 today                   │
-                                       ├──────────────────────────────────┤
-                                       │  claude-haiku-4-5 · triage …     │
-                                       │  Running for 1 hour              │
-                                       ├──────────────────────────────────┤
-                                       │  Open config…                    │
-                                       │  Open log…                       │
-                                       ├──────────────────────────────────┤
-                                       │  Hide menu bar item              │
-                                       └──────────────────────────────────┘
-```
+![The Slacken menu bar item, open, listing what it is watching, a Pause item,
+counts of messages rewritten and model calls made, the running cost, and items
+to open the config and the log](docs/images/menu-bar.png)
 
 The icon dims whenever nothing is being changed — paused, or attached to no
 Slack window — so the state is readable without opening anything.
@@ -164,6 +151,12 @@ message already swapped out on screen flips back to what its sender actually
 wrote, held messages are released, and nothing is sent to the model until you
 resume. `slacken pause` and `slacken resume` do exactly the same thing from a
 terminal, and `slacken status` prints the same lines the menu shows.
+
+![The same channel while Slacken is paused: every message shown in full as its
+sender wrote it, with no badges](docs/images/channel-original.png)
+
+That is the channel at the top of this page, paused. No badges, no rewrites,
+nothing hidden — the messages exactly as their senders wrote them.
 
 A pause is written to `~/.slacken/state.json` and survives a restart. It has
 to: the login agent brings the daemon back whenever it exits, and a pause that
@@ -326,6 +319,26 @@ installs, exercises and uninstalls the installer on a real macOS runner, and
 builds the menu bar helper with `swiftc` there — the only way to find out
 whether AppKit code still compiles is to compile it.
 
+## The images above
+
+```sh
+npm run docs:images
+```
+
+They are regenerated rather than taken by hand, and nothing in them is a
+drawing of what the code does. `docs/demo/capture.mjs` serves the fake
+workspace in `docs/demo/workspace.html`, runs the real attach-and-inject path
+against a headless Chromium, and photographs the result — so every badge,
+hidden original and reveal toggle was drawn by the page script that ships. The
+menu image is rendered from the real `menuModel()` output, because that is
+where the wording and the counts are actually decided.
+
+Two things are staged: the channel, so nobody's real messages end up in a
+README, and the verdicts, which come from a stub rather than `claude -p` so
+that re-running this produces the same pictures instead of a fresh sample of
+the model. Editing the badge, the reveal or the menu and re-running is the
+fastest way to see the change.
+
 ## Layout
 
 ```
@@ -345,4 +358,5 @@ src/server.js        loopback control API
 src/config.js        defaults and ~/.slacken/config.json
 client/inject.js     the page script: find, triage, hold, replace, reveal
 menubar/             SlackenMenuBar.swift, the menu bar item itself
+docs/demo/           the fake workspace and capture script behind the images
 ```
