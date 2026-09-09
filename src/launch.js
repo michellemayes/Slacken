@@ -53,7 +53,7 @@ export async function quitSlack({ timeoutMs = 15000 } = {}) {
 
 export async function launchSlack({ cdpPort, force = false }) {
   if (process.platform !== 'darwin') {
-    throw new Error('SlackCensor launches the macOS Slack desktop app; this is not macOS.');
+    throw new Error('Slacken launches the macOS Slack desktop app; this is not macOS.');
   }
 
   if (await isDebugPortOpen(cdpPort)) {

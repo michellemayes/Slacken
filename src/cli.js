@@ -7,23 +7,29 @@ import { Attacher } from './attach.js';
 import { createServer } from './server.js';
 import { launchSlack, findSlackApp, isDebugPortOpen, isSlackRunning } from './launch.js';
 import { listTargets } from './cdp.js';
+import { installAgent, uninstallAgent, agentStatus, LOG_PATH } from './agent.js';
 
 const execFileAsync = promisify(execFile);
 
-const USAGE = `slackcensor - soften urgent or aggressive incoming Slack messages
+const USAGE = `slacken - a calmer reading layer for Slack on macOS
 
-  slackcensor start [--force] [--no-launch] [--always] [--verbose]
+  slacken start [--force] [--no-launch] [--always] [--verbose]
       Launch Slack with debugging enabled, attach, and moderate. Ctrl-C to stop.
       --force      quit an already-running Slack so it can be relaunched
       --no-launch  assume Slack is already listening on the debug port
-      --always     send every incoming message to the model, not just heated ones
+      --always     send every incoming message to the model, not just flagged ones
       --verbose    log each verdict
 
-  slackcensor launch [--force]     Relaunch Slack with the debug port open
-  slackcensor attach [--verbose]   Attach to an already-launched Slack
-  slackcensor test "<message>"     Moderate one string and print the verdict
-  slackcensor doctor               Check the pieces this needs
-  slackcensor config               Print the config file path and contents
+  slacken launch [--force]     Relaunch Slack with the debug port open
+  slacken attach [--verbose]   Attach to an already-launched Slack
+  slacken test "<message>"     Rewrite one string and print the verdict
+  slacken doctor               Check the pieces this needs
+  slacken config               Print the config file path and contents
+
+  slacken agent install        Run automatically when you log in
+  slacken agent uninstall      Stop running at login
+  slacken agent status         Is the login agent installed and running?
+  slacken agent logs           Print the login agent's recent output
 `;
 
 export async function main(argv) {
@@ -37,6 +43,7 @@ export async function main(argv) {
     case 'test': return cmdTest(args);
     case 'doctor': return cmdDoctor(args);
     case 'config': return cmdConfig(args);
+    case 'agent': return cmdAgent(args);
     case 'help':
     case '--help':
     case '-h':
@@ -62,10 +69,10 @@ async function cmdStart(args) {
 
   if (!args['no-launch']) {
     const result = await launchSlack({ cdpPort: config.cdpPort, force: Boolean(args.force) });
-    if (result.started) console.log(`[slackcensor] launched ${result.app} with --remote-debugging-port=${config.cdpPort}`);
-    else console.log(`[slackcensor] Slack already listening on ${config.cdpPort}`);
+    if (result.started) console.log(`[slacken] launched ${result.app} with --remote-debugging-port=${config.cdpPort}`);
+    else console.log(`[slacken] Slack already listening on ${config.cdpPort}`);
   } else if (!(await isDebugPortOpen(config.cdpPort))) {
-    console.error(`[slackcensor] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slackcensor launch' first.`);
+    console.error(`[slacken] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slacken launch' first.`);
     return 1;
   }
 
@@ -76,7 +83,7 @@ async function cmdAttach(args) {
   writeDefaultConfig();
   const config = configFrom(args);
   if (!(await isDebugPortOpen(config.cdpPort))) {
-    console.error(`[slackcensor] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slackcensor launch' first.`);
+    console.error(`[slacken] nothing listening on 127.0.0.1:${config.cdpPort}. Run 'slacken launch' first.`);
     return 1;
   }
   return run(config);
@@ -98,13 +105,13 @@ async function run(config) {
   });
 
   await attacher.start();
-  console.log(`[slackcensor] watching Slack (model ${config.model}, triage ${config.triageMode})`);
-  console.log(`[slackcensor] control API on http://127.0.0.1:${config.httpPort}  ·  Cmd+Shift+U toggles all originals`);
+  console.log(`[slacken] watching Slack (model ${config.model}, triage ${config.triageMode})`);
+  console.log(`[slacken] control API on http://127.0.0.1:${config.httpPort}  ·  Cmd+Shift+U toggles all originals`);
 
   await new Promise((resolve) => {
     const shutdown = () => {
       const st = moderator.stats;
-      console.log(`\n[slackcensor] stopping — ${st.batched} messages in ${st.calls} calls, `
+      console.log(`\n[slacken] stopping — ${st.batched} messages in ${st.calls} calls, `
         + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
         + `$${st.costUsd.toFixed(4)}`);
       attacher.stop();
@@ -121,15 +128,15 @@ async function run(config) {
 function logEvent(event, config) {
   switch (event.type) {
     case 'attached':
-      console.log(`[slackcensor] attached to ${event.title || event.target}`);
+      console.log(`[slacken] attached to ${event.title || event.target}`);
       break;
     case 'detached':
-      console.log('[slackcensor] window closed, waiting for it to come back');
+      console.log('[slacken] window closed, waiting for it to come back');
       break;
     case 'attach-error':
     case 'poll-error':
     case 'moderate-error':
-      console.warn(`[slackcensor] ${event.type}: ${event.message}`);
+      console.warn(`[slacken] ${event.type}: ${event.message}`);
       break;
     case 'verdict': {
       const v = event.verdict;
@@ -137,9 +144,9 @@ function logEvent(event, config) {
         const what = v.hostile && v.verbose ? 'softened + condensed'
           : v.verbose ? 'condensed' : 'softened';
         const who = `${event.sender || 'someone'} in ${event.channel || '?'}`;
-        console.log(`[slackcensor] ${what} ${who}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
+        console.log(`[slacken] ${what} ${who}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
       } else if (config.verbose) {
-        console.log(`[slackcensor] left alone: ${JSON.stringify(event.text.slice(0, 60))}`);
+        console.log(`[slacken] left alone: ${JSON.stringify(event.text.slice(0, 60))}`);
       }
       break;
     }
@@ -160,7 +167,7 @@ async function cmdLaunch(args) {
 async function cmdTest(args) {
   const text = args._.slice(1).join(' ');
   if (!text) {
-    console.error('usage: slackcensor test "the message text"');
+    console.error('usage: slacken test "the message text"');
     return 1;
   }
   const config = configFrom(args);
@@ -169,6 +176,49 @@ async function cmdTest(args) {
   moderator.cache.flush();
   console.log(JSON.stringify(verdict, null, 2));
   return 0;
+}
+
+async function cmdAgent(args) {
+  const config = configFrom(args);
+  const action = args._[1] || 'status';
+
+  switch (action) {
+    case 'install': {
+      const { plist, log } = await installAgent(config);
+      console.log(`installed ${plist}`);
+      console.log(`Slacken now starts at login. Output goes to ${log}`);
+      return 0;
+    }
+    case 'uninstall': {
+      const { removed, plist } = await uninstallAgent();
+      console.log(removed ? `removed ${plist}` : 'no login agent was installed');
+      return 0;
+    }
+    case 'status': {
+      const status = await agentStatus();
+      if (!status.installed) {
+        console.log("not installed (run 'slacken agent install')");
+        return 1;
+      }
+      console.log(`installed: ${status.plist}`);
+      console.log(`running:   ${status.running ? `yes (pid ${status.pid})` : 'no'}`);
+      if (status.lastExit && status.lastExit !== '0') console.log(`last exit: ${status.lastExit}`);
+      console.log(`log:       ${status.log}`);
+      return status.running ? 0 : 1;
+    }
+    case 'logs': {
+      if (!fs.existsSync(LOG_PATH)) {
+        console.log(`no log yet at ${LOG_PATH}`);
+        return 1;
+      }
+      const lines = fs.readFileSync(LOG_PATH, 'utf8').trimEnd().split('\n');
+      console.log(lines.slice(-Number(args.lines || 50)).join('\n'));
+      return 0;
+    }
+    default:
+      console.error(`unknown agent action: ${action} (install, uninstall, status, logs)`);
+      return 1;
+  }
 }
 
 async function cmdConfig() {
@@ -201,7 +251,7 @@ async function cmdDoctor(args) {
   const portOpen = await isDebugPortOpen(config.cdpPort);
   // Informational: `start` launches Slack itself, so "not running" is fine.
   checks.push(['Slack running', true, running ? 'yes' : 'no (start will launch it)']);
-  checks.push([`debug port ${config.cdpPort}`, portOpen, portOpen ? 'listening' : 'closed (run: slackcensor launch)']);
+  checks.push([`debug port ${config.cdpPort}`, portOpen, portOpen ? 'listening' : 'closed (run: slacken launch)']);
 
   if (portOpen) {
     try {
@@ -228,7 +278,7 @@ function parseArgs(argv) {
     if (arg.startsWith('--')) {
       const [key, inline] = arg.slice(2).split('=');
       if (inline !== undefined) out[key] = inline;
-      else if (argv[i + 1] && !argv[i + 1].startsWith('--') && ['port', 'sender', 'channel', 'model'].includes(key)) {
+      else if (argv[i + 1] && !argv[i + 1].startsWith('--') && ['port', 'sender', 'channel', 'model', 'lines'].includes(key)) {
         out[key] = argv[i + 1];
         i += 1;
       } else out[key] = true;

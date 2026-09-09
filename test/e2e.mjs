@@ -20,8 +20,29 @@ import { CdpSession, listTargets, devtoolsVersion } from '../src/cdp.js';
 import { DEFAULTS } from '../src/config.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CHROME = process.env.SLACKCENSOR_TEST_CHROME
-  || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+// Any Chromium will do. Checked in order so this runs unchanged on a dev Mac,
+// on CI, and in a container with only a Playwright browser installed.
+const CHROME_CANDIDATES = [
+  process.env.SLACKEN_TEST_CHROME,
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+].filter(Boolean);
+
+const CHROME = CHROME_CANDIDATES.find((p) => {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}) || (fs.existsSync('/opt/pw-browsers')
+  ? fs.readdirSync('/opt/pw-browsers')
+    .map((d) => path.join('/opt/pw-browsers', d, 'chrome-linux', 'chrome'))
+    .find((p) => fs.existsSync(p))
+  : null);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -51,7 +72,7 @@ function serveFixture() {
 // Picking a random port ourselves means occasionally attaching to a Chrome
 // left over from an earlier run, which fails in a confusing way.
 async function startChrome(url) {
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'slackcensor-test-'));
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-test-'));
   const child = spawn(CHROME, [
     '--headless=new',
     '--no-sandbox',
@@ -77,8 +98,8 @@ async function startChrome(url) {
 }
 
 test('injected script rewrites heated messages and leaves the rest alone', async (t) => {
-  if (!fs.existsSync(CHROME)) {
-    t.skip(`no chromium at ${CHROME}`);
+  if (!CHROME) {
+    t.skip(`no chromium found; tried ${CHROME_CANDIDATES.join(', ')}`);
     return;
   }
 
@@ -147,14 +168,14 @@ test('injected script rewrites heated messages and leaves the rest alone', async
         const item = document.getElementById(id);
         if (!item) return null;
         const body = item.querySelector('.c-message_kit__blocks');
-        const panel = item.querySelector('.slackcensor-panel');
+        const panel = item.querySelector('.slacken-panel');
         return {
-          state: item.getAttribute('data-slackcensor'),
-          bodyState: body ? body.getAttribute('data-slackcensor-body') : null,
+          state: item.getAttribute('data-slacken'),
+          bodyState: body ? body.getAttribute('data-slacken-body') : null,
           bodyVisible: body ? body.offsetParent !== null : null,
-          rewrite: panel ? panel.querySelector('.slackcensor-rewrite').textContent : null,
-          action: panel ? (panel.querySelector('.slackcensor-action') || {}).textContent ?? null : null,
-          label: panel ? (panel.querySelector('.slackcensor-badge span:nth-child(2)') || {}).textContent ?? null : null,
+          rewrite: panel ? panel.querySelector('.slacken-rewrite').textContent : null,
+          action: panel ? (panel.querySelector('.slacken-action') || {}).textContent ?? null : null,
+          label: panel ? (panel.querySelector('.slacken-badge span:nth-child(2)') || {}).textContent ?? null : null,
           pending: panel ? panel.dataset.pending === '1' : false,
         };
       };
@@ -246,13 +267,13 @@ test('injected script rewrites heated messages and leaves the rest alone', async
     });
 
     await t.test('clicking the badge reveals the original, clicking again hides it', async () => {
-      await read(`document.querySelector('#msg-heated .slackcensor-badge').click()`);
+      await read(`document.querySelector('#msg-heated .slacken-badge').click()`);
       let after = JSON.parse(await snapshot());
       assert.equal(after.heated.bodyState, 'shown');
       assert.equal(after.heated.bodyVisible, true);
       assert.equal(after.heated.action, 'hide original');
 
-      await read(`document.querySelector('#msg-heated .slackcensor-badge').click()`);
+      await read(`document.querySelector('#msg-heated .slacken-badge').click()`);
       after = JSON.parse(await snapshot());
       assert.equal(after.heated.bodyState, 'hidden');
       assert.equal(after.heated.bodyVisible, false);
@@ -260,7 +281,7 @@ test('injected script rewrites heated messages and leaves the rest alone', async
     });
 
     await t.test('a re-render that drops our panel is repaired', async () => {
-      await read(`document.querySelector('#msg-heated .slackcensor-panel').remove()`);
+      await read(`document.querySelector('#msg-heated .slacken-panel').remove()`);
       const repaired = await waitFor('panel re-applied', async () => {
         const parsed = JSON.parse(await snapshot());
         return parsed.heated.rewrite ? parsed.heated : null;

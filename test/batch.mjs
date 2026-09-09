@@ -17,7 +17,7 @@ const FAKE = path.join(HERE, 'fake-claude.mjs');
 const LONG = Array(60).fill('padding').join(' ');
 
 function setup(overrides = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slackcensor-batch-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slacken-batch-'));
   const log = path.join(dir, 'invocations.log');
   process.env.FAKE_CLAUDE_LOG = log;
   delete process.env.FAKE_CLAUDE_FAIL;

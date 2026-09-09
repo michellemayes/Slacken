@@ -130,7 +130,7 @@ export class Moderator {
 
     if (!verdicts) {
       this.stats.errors += 1;
-      if (this.config.verbose) console.warn(`[slackcensor] unparseable output: ${stdout.slice(0, 300)}`);
+      if (this.config.verbose) console.warn(`[slacken] unparseable output: ${stdout.slice(0, 300)}`);
       for (const item of batch) item.resolve(clean({ error: 'unparseable model output' }));
       return;
     }

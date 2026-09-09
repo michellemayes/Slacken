@@ -63,7 +63,7 @@ export class CdpSession {
       try {
         handler(params);
       } catch (err) {
-        console.warn(`[slackcensor] handler for ${method} threw: ${err.message}`);
+        console.warn(`[slacken] handler for ${method} threw: ${err.message}`);
       }
     }
   }

@@ -6,7 +6,7 @@ import { pageConfig } from './config.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INJECT_PATH = path.join(HERE, '..', 'client', 'inject.js');
-const BINDING = '__slackcensorAsk';
+const BINDING = '__slackenAsk';
 
 export class Attacher {
   constructor({ config, moderator, onEvent }) {
@@ -23,7 +23,7 @@ export class Attacher {
     // Read on every injection so editing client/inject.js only needs a page
     // reload, not a daemon restart.
     const script = fs.readFileSync(INJECT_PATH, 'utf8');
-    const prelude = `window.__SLACKCENSOR_CONFIG = ${JSON.stringify(pageConfig(this.config))};\n`;
+    const prelude = `window.__SLACKEN_CONFIG = ${JSON.stringify(pageConfig(this.config))};\n`;
     return prelude + script;
   }
 
@@ -123,7 +123,7 @@ export class Attacher {
   }
 
   async reply(session, contextId, payload) {
-    const expression = `window.__slackcensorResult && window.__slackcensorResult(${JSON.stringify(JSON.stringify(payload))})`;
+    const expression = `window.__slackenResult && window.__slackenResult(${JSON.stringify(JSON.stringify(payload))})`;
     try {
       await session.send('Runtime.evaluate', { expression, contextId });
     } catch {
@@ -143,7 +143,7 @@ export class Attacher {
       if (!session) continue;
       try {
         await session.send('Runtime.evaluate', {
-          expression: `window.__SLACKCENSOR__ = false; ${source}`,
+          expression: `window.__SLACKEN__ = false; ${source}`,
         });
       } catch {
         // Session is closing; the poll loop will re-attach.

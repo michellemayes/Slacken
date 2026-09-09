@@ -1,7 +1,7 @@
 import http from 'node:http';
 
 // Small loopback-only control surface: health, a one-off moderation endpoint
-// used by `slackcensor test`, and a re-inject hook for editing the page script.
+// used by `slacken test`, and a re-inject hook for editing the page script.
 export function createServer({ config, moderator, getStatus, reinject }) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');

@@ -1,5 +1,5 @@
 /*
- * SlackCensor page script.
+ * Slacken page script.
  *
  * Runs inside the Slack renderer. It finds rendered messages from other
  * people, triages them locally, asks the daemon (over a CDP binding, so no
@@ -11,8 +11,8 @@
  * and revealed again on click.
  */
 (() => {
-  if (window.__SLACKCENSOR__) return;
-  window.__SLACKCENSOR__ = true;
+  if (window.__SLACKEN__) return;
+  window.__SLACKEN__ = true;
 
   const CONFIG = Object.assign({
     triageMode: 'heuristic',
@@ -26,12 +26,12 @@
     ignoreChannels: [],
     requestTimeoutMs: 25000,
     verbose: false,
-  }, window.__SLACKCENSOR_CONFIG || {});
+  }, window.__SLACKEN_CONFIG || {});
 
-  const ASK = '__slackcensorAsk';
-  const ATTR_STATE = 'data-slackcensor';
-  const ATTR_HASH = 'data-slackcensor-hash';
-  const ATTR_BODY = 'data-slackcensor-body';
+  const ASK = '__slackenAsk';
+  const ATTR_STATE = 'data-slacken';
+  const ATTR_HASH = 'data-slacken-hash';
+  const ATTR_BODY = 'data-slacken-body';
 
   const SEL = {
     item: '[data-qa="virtual-list-item"]',
@@ -44,22 +44,22 @@
     composer: '[data-qa="message_input"], .ql-editor',
   };
 
-  const log = (...args) => { if (CONFIG.verbose) console.log('[slackcensor]', ...args); };
+  const log = (...args) => { if (CONFIG.verbose) console.log('[slacken]', ...args); };
 
   /* ---------------------------------------------------------------- styles */
 
-  const STYLE_ID = 'slackcensor-style';
+  const STYLE_ID = 'slacken-style';
   const CSS = `
     [${ATTR_BODY}="hidden"] { display: none !important; }
-    .slackcensor-panel { margin: 2px 0 0; }
-    .slackcensor-rewrite {
+    .slacken-panel { margin: 2px 0 0; }
+    .slacken-rewrite {
       line-height: 1.46668;
       font-size: 15px;
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .slackcensor-panel[data-open="1"] .slackcensor-rewrite { display: none; }
-    .slackcensor-badge {
+    .slacken-panel[data-open="1"] .slacken-rewrite { display: none; }
+    .slacken-badge {
       display: inline-flex; align-items: center; gap: 5px;
       margin-top: 3px; padding: 1px 8px;
       font-size: 11px; line-height: 17px; font-weight: 500;
@@ -68,15 +68,15 @@
       border: 1px solid rgba(127,127,127,.45); border-radius: 10px;
       cursor: pointer; user-select: none;
     }
-    .slackcensor-badge:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
-    .slackcensor-dot {
+    .slacken-badge:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-dot {
       width: 6px; height: 6px; border-radius: 50%;
       background: #d9a441; flex: 0 0 auto;
     }
-    .slackcensor-badge[data-severity="3"] .slackcensor-dot { background: #e01e5a; }
-    .slackcensor-badge[data-kind="condensed"] .slackcensor-dot { background: #5b8def; }
-    .slackcensor-action { opacity: .75; }
-    .slackcensor-pending { opacity: .45; font-style: italic; }
+    .slacken-badge[data-severity="3"] .slacken-dot { background: #e01e5a; }
+    .slacken-badge[data-kind="condensed"] .slacken-dot { background: #5b8def; }
+    .slacken-action { opacity: .75; }
+    .slacken-pending { opacity: .45; font-style: italic; }
   `;
 
   function ensureStyle() {
@@ -92,7 +92,7 @@
   let seq = 0;
   const pending = new Map();
 
-  window.__slackcensorResult = (json) => {
+  window.__slackenResult = (json) => {
     let msg;
     try {
       msg = JSON.parse(json);
@@ -295,7 +295,7 @@
   }
 
   function clearPanels(item) {
-    item.querySelectorAll('.slackcensor-panel').forEach((el) => el.remove());
+    item.querySelectorAll('.slacken-panel').forEach((el) => el.remove());
   }
 
   // Local triage already suspects this one, so hide it now rather than letting
@@ -304,12 +304,12 @@
   function renderPending(item, body) {
     clearPanels(item);
     const panel = document.createElement('div');
-    panel.className = 'slackcensor-panel';
+    panel.className = 'slacken-panel';
     panel.dataset.open = '0';
     panel.dataset.pending = '1';
 
     const placeholder = document.createElement('div');
-    placeholder.className = 'slackcensor-rewrite slackcensor-pending';
+    placeholder.className = 'slacken-rewrite slacken-pending';
     placeholder.textContent = 'checking…';
     panel.appendChild(placeholder);
 
@@ -327,29 +327,29 @@
     clearPanels(item);
 
     const panel = document.createElement('div');
-    panel.className = 'slackcensor-panel';
+    panel.className = 'slacken-panel';
     panel.dataset.open = '0';
 
     const rewrite = document.createElement('div');
-    rewrite.className = 'slackcensor-rewrite';
+    rewrite.className = 'slacken-rewrite';
     rewrite.textContent = verdict.rewrite;
     panel.appendChild(rewrite);
 
     const badge = document.createElement('button');
     badge.type = 'button';
-    badge.className = 'slackcensor-badge';
+    badge.className = 'slacken-badge';
     badge.dataset.severity = String(verdict.severity);
     badge.dataset.kind = verdict.hostile ? 'softened' : 'condensed';
     const tones = (verdict.tone || []).join(', ');
     badge.title = [verdict.note, tones && `(${tones})`].filter(Boolean).join(' ')
-      || 'SlackCensor rewrote this message';
+      || 'Slacken rewrote this message';
 
     const dot = document.createElement('span');
-    dot.className = 'slackcensor-dot';
+    dot.className = 'slacken-dot';
     const label = document.createElement('span');
     label.textContent = actionLabel(verdict);
     const action = document.createElement('span');
-    action.className = 'slackcensor-action';
+    action.className = 'slacken-action';
     action.textContent = 'show original';
     badge.append(dot, label, action);
 
@@ -368,13 +368,13 @@
   }
 
   function setAll(open) {
-    document.querySelectorAll('.slackcensor-panel:not([data-pending])').forEach((panel) => {
-      const badge = panel.querySelector('.slackcensor-badge');
+    document.querySelectorAll('.slacken-panel:not([data-pending])').forEach((panel) => {
+      const badge = panel.querySelector('.slacken-badge');
       const body = panel.previousElementSibling;
       if (!badge || !body || !body.hasAttribute(ATTR_BODY)) return;
       panel.dataset.open = open ? '1' : '0';
       body.setAttribute(ATTR_BODY, open ? 'shown' : 'hidden');
-      const action = panel.querySelector('.slackcensor-action');
+      const action = panel.querySelector('.slacken-action');
       if (action) action.textContent = open ? 'hide original' : 'show original';
     });
   }
@@ -404,7 +404,7 @@
 
     if (state && item.getAttribute(ATTR_HASH) === key) {
       // Already handled. Re-apply if React blew our panel away.
-      if (state === 'done' && !item.querySelector('.slackcensor-panel')) {
+      if (state === 'done' && !item.querySelector('.slacken-panel')) {
         const verdict = verdicts.get(key);
         if (verdict) render(item, body, verdict);
         else item.removeAttribute(ATTR_STATE);
@@ -509,12 +509,12 @@
     if (!(event.metaKey && event.shiftKey)) return;
     if (event.key.toLowerCase() !== 'u') return;
     event.preventDefault();
-    const anyClosed = Array.from(document.querySelectorAll('.slackcensor-panel'))
+    const anyClosed = Array.from(document.querySelectorAll('.slacken-panel'))
       .some((p) => p.dataset.open !== '1');
     setAll(anyClosed);
   });
 
-  window.__slackcensorRescan = () => {
+  window.__slackenRescan = () => {
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
       el.removeAttribute(ATTR_STATE);
       el.removeAttribute(ATTR_HASH);

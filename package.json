@@ -1,20 +1,20 @@
 {
-  "name": "slackcensor",
+  "name": "slacken",
   "version": "0.1.0",
   "private": true,
-  "description": "Softens overly urgent or aggressive incoming Slack messages in the macOS Slack desktop app, using claude -p.",
+  "description": "A calmer reading layer for the macOS Slack desktop app: condenses padded messages and evens out tone, using claude -p.",
   "type": "module",
   "bin": {
-    "slackcensor": "./bin/slackcensor.js"
+    "slacken": "./bin/slacken.js"
   },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node ./bin/slackcensor.js start",
-    "doctor": "node ./bin/slackcensor.js doctor",
-    "test": "node --test test/unit.mjs test/batch.mjs test/e2e.mjs",
-    "test:fast": "node --test test/unit.mjs test/batch.mjs"
+    "start": "node ./bin/slacken.js start",
+    "doctor": "node ./bin/slacken.js doctor",
+    "test": "node --test test/unit.mjs test/batch.mjs test/agent.mjs test/e2e.mjs",
+    "test:fast": "node --test test/unit.mjs test/batch.mjs test/agent.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

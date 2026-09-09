@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const HOME_DIR = path.join(os.homedir(), '.slackcensor');
+export const HOME_DIR = path.join(os.homedir(), '.slacken');
 export const CONFIG_PATH = path.join(HOME_DIR, 'config.json');
 
 export const DEFAULTS = {
@@ -11,7 +11,7 @@ export const DEFAULTS = {
   // Which DevTools page targets to inject into. Widen this if your workspace
   // lives on a custom domain.
   targetUrlPattern: '^https://([a-z0-9-]+\\.)*slack\\.com/',
-  // Local HTTP API, used by `slackcensor test` and health checks. Loopback only.
+  // Local HTTP API, used by `slacken test` and health checks. Loopback only.
   httpPort: 8787,
 
   // Which model does the rewriting. Haiku keeps it cheap and fast; messages
@@ -32,12 +32,12 @@ export const DEFAULTS = {
   // Stop calling the model once a day costs this much. 0 disables the cap.
   dailyBudgetUsd: 0,
 
-  // "heuristic" only asks the model about messages that already look heated or
-  // padded, which is most of what keeps this cheap. "always" sends everything.
+  // "heuristic" only asks the model about messages that already look intense
+  // or padded, which is most of what keeps this cheap. "always" sends everything.
   triageMode: 'heuristic',
   // Local score a message needs before a tone call is worth making.
   triageThreshold: 2,
-  // Model severity (0-3) required before hostile phrasing is replaced.
+  // Model severity (0-3) required before a tone rewrite is applied.
   minSeverity: 2,
 
   // Condensing only applies to messages at least this long...
@@ -50,8 +50,8 @@ export const DEFAULTS = {
   // Messages longer than this are left alone.
   maxChars: 4000,
   // Hide a message the moment local triage suspects it, rather than letting
-  // you read the hostile version for a second while the model answers. It is
-  // restored if the model disagrees.
+  // the original sit on screen while the model answers. It is restored in full
+  // if the model disagrees.
   holdWhilePending: true,
 
   // Your own display names, so your messages are never rewritten. Usually
@@ -72,7 +72,7 @@ export function loadConfig() {
     onDisk = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch (err) {
     if (err.code !== 'ENOENT') {
-      console.warn(`[slackcensor] ignoring unreadable ${CONFIG_PATH}: ${err.message}`);
+      console.warn(`[slacken] ignoring unreadable ${CONFIG_PATH}: ${err.message}`);
     }
   }
   return { ...DEFAULTS, ...onDisk };

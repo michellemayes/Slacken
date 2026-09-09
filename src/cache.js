@@ -63,7 +63,7 @@ export class Cache {
       fs.mkdirSync(HOME_DIR, { recursive: true });
       fs.writeFileSync(CACHE_PATH, JSON.stringify(Object.fromEntries(this.map)));
     } catch (err) {
-      console.warn(`[slackcensor] could not write cache: ${err.message}`);
+      console.warn(`[slacken] could not write cache: ${err.message}`);
     }
   }
 }
