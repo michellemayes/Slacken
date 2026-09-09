@@ -97,7 +97,13 @@
     [${ATTR_HOLD}="1"] .c-message__message_blocks,
     [${ATTR_HOLD}="1"] [${ATTR_BODY}] { display: none !important; }
 
-    .slacken-panel { margin: 2px 0 0; }
+    /* A column, so the badge is a block-level box with predictable margins
+       rather than an inline one whose baseline drags phantom descender space
+       under it. */
+    .slacken-panel {
+      display: flex; flex-direction: column; align-items: flex-start;
+      margin: 2px 0 0;
+    }
     .slacken-rewrite {
       line-height: 1.46668;
       font-size: 15px;
@@ -105,16 +111,23 @@
       word-break: break-word;
     }
     .slacken-panel[data-open="1"] .slacken-rewrite { display: none; }
+    /* Deliberately not a chip. Slack stacks its own bordered boxes directly
+       under a message — reaction pills 4px below, and a thread bar whose
+       hover box is pulled up over whatever precedes it — so a bordered badge
+       either reads as one more reaction or gets crossed by the thread bar's
+       outline. A dot and two words collide with neither, and the hover fill
+       hangs 6px left the way Slack's own hover boxes do, which keeps the
+       label itself flush with the message text above it. */
     .slacken-badge {
       display: inline-flex; align-items: center; gap: 5px;
-      margin-top: 3px; padding: 1px 8px;
-      font-size: 11px; line-height: 17px; font-weight: 500;
+      box-sizing: border-box; max-width: 100%;
+      margin: 4px 0 6px -6px; padding: 1px 6px;
+      font-size: 11px; line-height: 16px; font-weight: 500;
       color: inherit; opacity: .62;
-      background: transparent;
-      border: 1px solid rgba(127,127,127,.45); border-radius: 10px;
+      background: transparent; border: 0; border-radius: 7px;
       cursor: pointer; user-select: none;
     }
-    .slacken-badge:hover { opacity: 1; border-color: rgba(127,127,127,.8); }
+    .slacken-badge:hover { opacity: 1; background: rgba(127,127,127,.13); }
     .slacken-badge[hidden] { display: none; }
     .slacken-dot {
       width: 6px; height: 6px; border-radius: 50%;
