@@ -38,6 +38,11 @@
     condenseEnabled: true,
     condenseMinWords: 45,
     maxChars: 4000,
+    minSeverity: 2,
+    condenseMaxRatio: 0.7,
+    channelOverrides: {},
+    rewriteNotifications: true,
+    draftCheck: false,
     holdWhilePending: true,
     persistVerdicts: true,
     paused: false,
@@ -79,6 +84,21 @@
     channel: '[data-qa="channel_name"]',
     self: '[data-qa="user-button"]',
     composer: '[data-qa="message_input"], .ql-editor',
+    // The columns a message list can live in. A thread open beside a channel
+    // is two conversations on one screen, and they are not the same channel.
+    surface: [
+      '[data-qa="threads_flexpane"]',
+      '[data-qa="thread_view"]',
+      '[data-qa="slack_kit_scrollbar"][data-qa-thread]',
+      '.p-flexpane',
+      '.p-threads_flexpane',
+      '[data-qa="channel_view"]',
+      '.p-workspace__primary_view',
+      '.p-view_contents',
+    ].join(', '),
+    // What a surface calls itself, in the order the client has used over time.
+    surfaceChannel: '[data-qa="channel_name"], [data-qa="thread_channel_name"], .p-view_header__channel_title',
+    primary: '.p-workspace__primary_view, [data-qa="channel_view"]',
     // Where the channel-ignore button goes. Slack has moved this header
     // around between versions, so the first ancestor that matches wins and
     // the channel name's own parent is the fallback.
@@ -86,6 +106,52 @@
   };
 
   const log = (...args) => { if (CONFIG.verbose) console.log('[slacken]', ...args); };
+
+  /* ------------------------------------------------------- per channel */
+
+  /*
+   * A channel can be told to behave differently, and the page has to agree
+   * with the daemon about which channel that is — otherwise a message would
+   * be triaged under one set of rules and judged under another.
+   *
+   * The lookup folds case and a leading #, the way the daemon's does, so
+   * "#Eng-Oncall" and "eng-oncall" are one channel here too.
+   */
+  const CHANNEL_KEYS = [
+    'triageMode', 'triageThreshold', 'minSeverity',
+    'condenseEnabled', 'condenseMinWords', 'maxChars',
+  ];
+
+  function channelFold(name) {
+    return String(name ?? '').trim().replace(/^#/, '').toLowerCase();
+  }
+
+  const settingsCache = new Map();
+  function settingsFor(channel) {
+    const fold = channelFold(channel);
+    if (!fold) return CONFIG;
+    if (settingsCache.has(fold)) return settingsCache.get(fold);
+
+    let resolved = CONFIG;
+    const overrides = CONFIG.channelOverrides || {};
+    for (const [name, patch] of Object.entries(overrides)) {
+      if (channelFold(name) !== fold || !patch || typeof patch !== 'object') continue;
+      resolved = { ...CONFIG };
+      for (const key of CHANNEL_KEYS) if (patch[key] !== undefined) resolved[key] = patch[key];
+      break;
+    }
+    settingsCache.set(fold, resolved);
+    return resolved;
+  }
+
+  // What a remembered verdict is an answer to. The same words under a
+  // different threshold are a different answer, so they are a different key —
+  // which is also why a stored verdict cannot leak from a channel with its own
+  // settings into one without.
+  function gateFor(channel) {
+    const c = settingsFor(channel);
+    return `${c.minSeverity}:${c.condenseEnabled ? 1 : 0}:${c.condenseMinWords}:${c.condenseMaxRatio}:${c.maxChars}`;
+  }
 
   // Set from the daemon, which owns the pause state. While paused nothing is
   // asked about and nothing stays hidden: you read exactly what was written.
@@ -138,6 +204,25 @@
       background: #d9a441; flex: 0 0 auto;
     }
     .slacken-badge[data-severity="3"] .slacken-dot { background: #e01e5a; }
+
+    /* The draft bar. Above the composer rather than inside it, so nothing here
+       is ever part of what you are about to send. */
+    .slacken-draft {
+      margin: 0 0 6px; padding: 8px 10px;
+      border: 1px solid rgba(127,127,127,.28); border-radius: 8px;
+      background: rgba(127,127,127,.06);
+      font-size: 13px; line-height: 1.4;
+    }
+    .slacken-draft-head { opacity: .7; font-size: 11px; margin-bottom: 4px; }
+    .slacken-draft-text { white-space: pre-wrap; word-break: break-word; }
+    .slacken-draft-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .slacken-draft-button {
+      font: inherit; font-size: 12px; padding: 3px 10px;
+      border: 1px solid rgba(127,127,127,.35); border-radius: 6px;
+      background: transparent; color: inherit; cursor: pointer;
+    }
+    .slacken-draft-button:hover { background: rgba(127,127,127,.14); }
+    .slacken-draft-quiet { border-color: transparent; opacity: .7; }
     .slacken-badge[data-kind="condensed"] .slacken-dot { background: #5b8def; }
     .slacken-action { opacity: .75; }
     .slacken-pending { opacity: .45; font-style: italic; }
@@ -285,14 +370,14 @@
     return /```/.test(text) || /^\s{4,}\S/m.test(text);
   }
 
-  function paddingScore(text) {
-    if (!CONFIG.condenseEnabled) return 0;
+  function paddingScore(text, settings = CONFIG) {
+    if (!settings.condenseEnabled) return 0;
     if (hasCode(text)) return 0;
     // Mostly a bare link is not padding, it is a link.
     if (/^\s*<?https?:\/\/\S+>?\s*$/.test(text)) return 0;
 
     const words = wordCount(text);
-    if (words < CONFIG.condenseMinWords) return 0;
+    if (words < settings.condenseMinWords) return 0;
 
     let tells = 0;
     for (const re of AI_TELLS) if (re.test(text)) tells += 1;
@@ -302,9 +387,9 @@
     return tells;
   }
 
-  function shouldAsk(text) {
-    if (CONFIG.triageMode === 'always') return true;
-    return heuristicScore(text) >= CONFIG.triageThreshold || paddingScore(text) >= 1;
+  function shouldAsk(text, settings = CONFIG) {
+    if (settings.triageMode === 'always') return true;
+    return heuristicScore(text) >= settings.triageThreshold || paddingScore(text, settings) >= 1;
   }
 
   /* ------------------------------------------------------------ extraction */
@@ -319,11 +404,36 @@
     return cachedSelf;
   }
 
+  // The channel of the column you are actually reading, which is what the
+  // button in the header is about.
   function channelName() {
-    const el = document.querySelector(SEL.channel);
+    const primary = document.querySelector(SEL.primary);
+    const el = primary?.querySelector(SEL.surfaceChannel) || document.querySelector(SEL.channel);
     const name = el?.textContent?.trim();
     if (name) return name;
     return (document.title || '').split('|')[0].trim() || null;
+  }
+
+  /*
+   * Which channel is this particular message in?
+   *
+   * Asking the page once and using the answer for everything on it is wrong
+   * the moment a thread is open beside a channel, or two columns are: the
+   * messages in the flexpane belong to whatever channel the thread is in, and
+   * telling Slacken to leave #deploys alone has to mean the thread too.
+   *
+   * So the channel is read from the surface the message is in, memoised per
+   * surface for the length of one pass — the lookup is a querySelector inside
+   * a column, and a burst of forty messages must not cost forty of them.
+   */
+  function channelFor(item, memo) {
+    const surface = item.closest?.(SEL.surface);
+    if (!surface) return channelName();
+    if (memo?.has(surface)) return memo.get(surface);
+    const el = surface.querySelector(SEL.surfaceChannel);
+    const name = el?.textContent?.trim() || channelName();
+    memo?.set(surface, name);
+    return name;
   }
 
   // Grouped consecutive messages only carry the sender name on the first one,
@@ -509,7 +619,8 @@
   function toggle(item) {
     const body = bodyFor(item);
     if (!body) return;
-    const key = panels.get(item)?.key;
+    const refs = panels.get(item);
+    const key = refs?.key;
     const open = item.getAttribute(ATTR_HOLD) === '0';
     if (key) {
       if (open) revealed.delete(key);
@@ -517,6 +628,23 @@
       while (revealed.size > MEMORY_MAX) revealed.delete(revealed.values().next().value);
     }
     setHold(item, body, open);
+    // Opening one is the clearest thing a reader ever says about a rewrite —
+    // that they wanted the words. Closing it again says nothing, so only the
+    // opening is reported, and nothing waits on the answer.
+    if (!open) reportReveal(refs);
+  }
+
+  function reportReveal(refs) {
+    if (!refs) return;
+    ask({
+      op: 'reveal',
+      sender: refs.sender || null,
+      channel: refs.channel || null,
+      kind: refs.kind || null,
+    }).catch(() => {
+      // The daemon is restarting, or the page is going away. A count is not
+      // worth a word to anyone.
+    });
   }
 
   // Local triage already suspects this one, so hide it now rather than letting
@@ -543,9 +671,15 @@
     setHold(item, body, true);
   }
 
-  function applyVerdict(item, body, verdict, key) {
+  function applyVerdict(item, body, verdict, key, channel) {
     const refs = ensurePanel(item, body);
     refs.key = key;
+    // Kept so that clicking the badge can say what was revealed and where,
+    // rather than only that something was.
+    refs.channel = channel || refs.channel || null;
+    refs.sender = senderFor(item) || refs.sender || null;
+    refs.kind = verdict.hostile && verdict.verbose ? 'softened+condensed'
+      : verdict.verbose ? 'condensed' : 'softened';
 
     if (refs.panel.dataset.pending === '1') {
       delete refs.panel.dataset.pending;
@@ -598,6 +732,11 @@
   function setAll(open) {
     revealAll = open;
     if (!open) revealed.clear();
+    // Reported once rather than once per message: Cmd+Shift+U is one decision
+    // about the screen, and forty of them would drown the count it feeds.
+    if (open) {
+      ask({ op: 'reveal', kind: 'all' }).catch(() => {});
+    }
     document.querySelectorAll(`[${ATTR_STATE}="done"]`).forEach((item) => {
       if (!item.hasAttribute(ATTR_HOLD)) return;
       const body = bodyFor(item);
@@ -720,20 +859,26 @@
     const raw = body.textContent || '';
     if (!raw.trim()) return null;
 
+    // Read from the column this message is in rather than from the page: a
+    // thread open beside a channel is two conversations on one screen.
+    const channel = channelFor(item, ctx.memo);
+    const settings = settingsFor(channel);
     const sig = hash(raw);
+    const gate = gateFor(channel);
+    const skey = `${sig}|${gate}`;
     const same = item.getAttribute(ATTR_HASH) === sig;
-    const base = { item, body, sig, same };
+    const base = { item, body, sig, skey, channel, same };
 
     // This channel is on the ignore list. Checked before the caches, not after
     // the triage: a message we rewrote before the channel was ignored — or one
     // a stored verdict would repaint after a reload — has to give its original
     // back too, or ignoring a channel would only apply to what had not been
     // read yet.
-    if (ctx.ignored) return { ...base, act: 'idle' };
+    if (matchesAny(CONFIG.ignoreChannels, channel)) return { ...base, act: 'idle' };
 
     // Fast path: we have judged this exact text before, here or anywhere else.
     // No innerText, no layout, no call.
-    const knownKey = sigs.get(sig);
+    const knownKey = sigs.get(skey);
     const cached = knownKey ? verdicts.get(knownKey) : null;
     if (cached) {
       return cached.flagged && cached.rewrite
@@ -759,23 +904,23 @@
     if (!nearViewport(item)) return { ...base, act: 'idle' };
 
     const text = textFor(body);
-    if (!text || text.length > CONFIG.maxChars) return { ...base, act: 'clear', state: 'clean' };
+    if (!text || text.length > settings.maxChars) return { ...base, act: 'clear', state: 'clean' };
 
-    const key = hash(text);
+    const key = `${hash(text)}|${gate}`;
     const known = verdicts.get(key);
     if (known) {
-      link(sig, key);
+      link(skey, key);
       return known.flagged && known.rewrite
         ? { ...base, act: 'apply', verdict: known, key, state: 'done' }
         : { ...base, act: 'clear', state: 'clean' };
     }
 
-    if (!shouldAsk(text)) {
+    if (!shouldAsk(text, settings)) {
       remember(key, CLEAN);
-      link(sig, key);
+      link(skey, key);
       return { ...base, act: 'clear', state: 'clean' };
     }
-    log('triage', heuristicScore(text), paddingScore(text), text.slice(0, 60));
+    log('triage', heuristicScore(text), paddingScore(text, settings), text.slice(0, 60));
 
     // Only now is the sender walk worth its cost, and a skip is per-sender so
     // it never goes in the text-keyed cache.
@@ -793,7 +938,6 @@
       key,
       text,
       sender,
-      channel: ctx.channel,
       // Read the height now, in the read half, so the hold can keep the
       // message's place without shifting the page.
       height: CONFIG.holdWhilePending ? body.offsetHeight : 0,
@@ -812,7 +956,7 @@
 
     if (p.act === 'apply') {
       setAttr(item, ATTR_STATE, 'done');
-      applyVerdict(item, body, p.verdict, p.key);
+      applyVerdict(item, body, p.verdict, p.key, p.channel);
       return;
     }
 
@@ -833,16 +977,40 @@
     clearItem(item, body);
   }
 
-  const inFlight = new Set();
+  /*
+   * The calls in the air, and every copy of a message waiting on one.
+   *
+   * The same words can be on screen more than once — a message and its copy in
+   * a thread, the same announcement in two channels — and they are one
+   * question, so the second copy joins the first one's call rather than paying
+   * for its own. That makes the second copy something that has to be woken up
+   * when the answer lands: it never asked, so nothing else would tell it, and
+   * a message left in `pending` is a message you are being kept from reading.
+   * Which copies are waiting is therefore tracked rather than inferred from
+   * the DOM, because the thing they have in common is their words, and the
+   * signatures the DOM knows them by can differ by a line of whitespace.
+   */
+  const inFlight = new Map(); // verdict key -> the content signatures waiting on it
 
   // Every copy of this text on screen, not just the one that asked for it.
   function itemsFor(sig) {
     return Array.from(document.querySelectorAll(`[${ATTR_HASH}="${sig}"]`));
   }
 
+  function waitingItems(key, sig) {
+    const sigs = inFlight.get(key) || new Set([sig]);
+    const items = [];
+    for (const one of sigs) items.push(...itemsFor(one));
+    return items;
+  }
+
   function startAsk(p) {
-    if (inFlight.has(p.key)) return;
-    inFlight.add(p.key);
+    const waiting = inFlight.get(p.key);
+    if (waiting) {
+      waiting.add(p.sig);
+      return;
+    }
+    inFlight.set(p.key, new Set([p.sig]));
 
     ask({ text: p.text, sender: p.sender, channel: p.channel }).then((verdict) => {
       if (verdict.error) log('daemon error', verdict.error);
@@ -851,7 +1019,7 @@
       // message, only about the pause. Remembering it would leave this message
       // unexamined for as long as the page lived, long after resuming.
       if (paused || verdict.reason === 'paused') {
-        for (const item of itemsFor(p.sig)) {
+        for (const item of waitingItems(p.key, p.sig)) {
           dirty.add(item);
           item.removeAttribute(ATTR_STATE);
           item.removeAttribute(ATTR_HASH);
@@ -860,17 +1028,24 @@
       }
 
       remember(p.key, verdict);
-      link(p.sig, p.key);
+      link(p.skey, p.key);
       persistSoon();
     }).catch((err) => {
       log('ask failed', err.message);
       // Never leave a message hidden behind a hold that will not lift.
-      for (const item of itemsFor(p.sig)) {
+      for (const item of waitingItems(p.key, p.sig)) {
         if (item.getAttribute(ATTR_STATE) === 'pending') setAttr(item, ATTR_STATE, 'error');
       }
     }).finally(() => {
+      const items = waitingItems(p.key, p.sig);
       inFlight.delete(p.key);
-      for (const item of itemsFor(p.sig)) dirty.add(item);
+      for (const item of items) {
+        // `pending` is a state an item can only be talked out of: it is
+        // checked before the text is read, so a copy still wearing it would
+        // never look at the answer that has just arrived.
+        if (item.getAttribute(ATTR_STATE) === 'pending') item.removeAttribute(ATTR_STATE);
+        dirty.add(item);
+      }
       flush();
     });
   }
@@ -884,8 +1059,9 @@
     // Worked out before the early return: switching to an empty channel makes
     // nothing dirty, and the button still has to follow you there.
     const channel = channelName();
-    const ctx = { channel, ignored: matchesAny(CONFIG.ignoreChannels, channel) };
-    ensureChannelButton(channel, ctx.ignored);
+    // One lookup per column per pass, rather than one per message.
+    const ctx = { channel, memo: new Map() };
+    ensureChannelButton(channel, matchesAny(CONFIG.ignoreChannels, channel));
 
     if (!dirty.size) return;
     const items = Array.from(dirty);
@@ -987,12 +1163,367 @@
     }
   }, SWEEP_MS);
 
+  /*
+   * Say what is being found, so a Slack that has moved under us is noticeable.
+   *
+   * The failure this exists for is silent by construction: Slack renames a
+   * class, the page stops finding message bodies, and the daemon goes on
+   * reporting that it is watching three windows. List items with no bodies
+   * inside them is the signature — the list is still the list and the words
+   * are not where they were. Finding no list items at all is not evidence of
+   * anything, and is deliberately not reported as a problem.
+   */
+  const HEALTH_MS = 60_000;
+  function reportHealth() {
+    const items = document.querySelectorAll(SEL.item);
+    if (!items.length) return;
+    let bodies = 0;
+    for (const item of items) if (bodyFor(item)) bodies += 1;
+    ask({ op: 'health', items: items.length, bodies }).catch(() => {});
+  }
+  const healthTimer = setInterval(() => {
+    try {
+      reportHealth();
+    } catch (err) {
+      log('health failed', err.message);
+    }
+  }, HEALTH_MS);
+  healthTimer.unref?.();
+  // Once early, so a layout change is noticed in the first minute rather than
+  // after it.
+  setTimeout(() => {
+    try {
+      reportHealth();
+    } catch {
+      // Nothing here is worth failing a render over.
+    }
+  }, 4000);
+
   window.addEventListener('keydown', (event) => {
     if (!(event.metaKey && event.shiftKey)) return;
     if (event.key.toLowerCase() !== 'u') return;
     event.preventDefault();
     setAll(!revealAll);
   });
+
+  /* -------------------------------------------------------- notifications */
+
+  /*
+   * The message you actually get hit with first.
+   *
+   * Everything else here happens once you are looking at the channel. A
+   * notification arrives before that, in the corner of the screen, in full —
+   * which is the one place a calmer reading layer is least able to help and
+   * most needed. Slack raises its notifications from the renderer, so the
+   * constructor can be wrapped like anything else on the page.
+   *
+   * A suspected body is held rather than shown and corrected: raising the
+   * original and replacing it a second later would be strictly worse than not
+   * trying, because you would have read it by then. So the real notification
+   * is not created until the verdict lands, a stand-in stands in for it
+   * meanwhile, and a verdict that does not arrive within DEFER_MAX_MS gives
+   * up and raises the original — a notification that never arrives is a
+   * message you never knew about, which is the one outcome worse than a
+   * hostile banner.
+   *
+   * If a Slack build raises notifications from its main process instead, none
+   * of this runs and nothing breaks; the count in the menu bar stays at zero,
+   * which is how you can tell.
+   */
+  const DEFER_MAX_MS = 2500;
+
+  function channelFromTitle(title) {
+    const text = String(title || '');
+    const named = text.match(/#[^\s(),]+/);
+    if (named) return named[0];
+    const parens = text.match(/\(([^)]+)\)\s*$/);
+    return parens ? parens[1].trim() : channelName();
+  }
+
+  function installNotificationHook() {
+    const Native = window.Notification;
+    if (typeof Native !== 'function' || Native.__slacken) return;
+
+    // Deliberately not a class: a stand-in is returned instead of `this` for a
+    // held notification, which a class constructor cannot do.
+    function Slackened(title, options) {
+      const opts = options || {};
+      const body = typeof opts.body === 'string' ? opts.body.trim() : '';
+      if (paused || !CONFIG.rewriteNotifications || !body) return new Native(title, opts);
+
+      const channel = channelFromTitle(title);
+      if (matchesAny(CONFIG.ignoreChannels, channel) || matchesAny(CONFIG.ignoreSenders, title)) {
+        return new Native(title, opts);
+      }
+
+      const settings = settingsFor(channel);
+      const key = `${hash(body)}|${gateFor(channel)}`;
+      const known = verdicts.get(key);
+      if (known) {
+        return new Native(title, known.flagged && known.rewrite ? { ...opts, body: known.rewrite } : opts);
+      }
+      if (body.length > settings.maxChars || !shouldAsk(body, settings)) return new Native(title, opts);
+
+      const pending = new Deferred(Native, title, opts);
+      ask({ text: body, sender: String(title || ''), channel, kind: 'notification' })
+        .then((verdict) => {
+          if (verdict && !verdict.error && !verdict.reason) {
+            remember(key, verdict);
+            persistSoon();
+          }
+          pending.settle(verdict?.flagged && verdict.rewrite ? verdict.rewrite : null);
+        })
+        .catch(() => pending.settle(null));
+      return pending;
+    }
+
+    // Everything a page can legitimately ask the constructor about is the
+    // native one's business, not ours.
+    for (const name of ['permission', 'maxActions']) {
+      try {
+        Object.defineProperty(Slackened, name, { get: () => Native[name], configurable: true });
+      } catch {
+        // A locked-down build. The wrapper still works; this is only polish.
+      }
+    }
+    Slackened.requestPermission = (...args) => Native.requestPermission(...args);
+    Slackened.prototype = Native.prototype;
+    Slackened.__slacken = true;
+
+    try {
+      window.Notification = Slackened;
+    } catch (err) {
+      log('could not wrap Notification', err.message);
+    }
+  }
+
+  // Stands in for a notification that has not been raised yet: it remembers
+  // what was done to it and does the same to the real one when it appears.
+  class Deferred {
+    constructor(Native, title, options) {
+      this.Native = Native;
+      this.title = title;
+      this.options = options;
+      this.real = null;
+      this.closed = false;
+      this.listeners = [];
+      this.handlers = {};
+      // A notification that is never raised is a message you never heard
+      // about, so the wait has an end whatever happens upstream.
+      this.timer = setTimeout(() => this.settle(null), DEFER_MAX_MS);
+    }
+
+    settle(rewrite) {
+      if (this.real || this.closed) return;
+      clearTimeout(this.timer);
+      try {
+        this.real = new this.Native(
+          this.title,
+          rewrite ? { ...this.options, body: rewrite } : this.options,
+        );
+      } catch (err) {
+        log('notification refused', err.message);
+        return;
+      }
+      for (const [type, fn, opts] of this.listeners) this.real.addEventListener(type, fn, opts);
+      for (const [type, fn] of Object.entries(this.handlers)) this.real[type] = fn;
+    }
+
+    close() {
+      this.closed = true;
+      clearTimeout(this.timer);
+      if (this.real) this.real.close();
+    }
+
+    addEventListener(type, fn, opts) {
+      if (this.real) this.real.addEventListener(type, fn, opts);
+      else this.listeners.push([type, fn, opts]);
+    }
+
+    removeEventListener(type, fn, opts) {
+      if (this.real) this.real.removeEventListener(type, fn, opts);
+      else this.listeners = this.listeners.filter(([t, f]) => t !== type || f !== fn);
+    }
+
+    dispatchEvent(event) {
+      return this.real ? this.real.dispatchEvent(event) : false;
+    }
+  }
+
+  for (const type of ['onclick', 'onclose', 'onerror', 'onshow']) {
+    Object.defineProperty(Deferred.prototype, type, {
+      get() {
+        return this.real ? this.real[type] : this.handlers[type] || null;
+      },
+      set(fn) {
+        if (this.real) this.real[type] = fn;
+        else this.handlers[type] = fn;
+      },
+    });
+  }
+
+  installNotificationHook();
+
+  /* --------------------------------------------------------------- drafts */
+
+  /*
+   * The one thing here that looks at what you wrote.
+   *
+   * Off unless you turn it on, and even then it changes nothing: it offers a
+   * flatter wording above the composer and waits. Slacken's whole promise is
+   * that it does not touch what you write, and an editor that rewrote your
+   * message as you typed would break that promise whatever the wording came
+   * out like. Nothing is sent, nothing is replaced until you click, and the
+   * offer disappears the moment you dismiss it.
+   *
+   * Only tone is offered, never condensing: how long your own message is, is
+   * your business.
+   */
+  const DRAFT_DEBOUNCE_MS = 1200;
+  const DRAFT_MIN_WORDS = 6;
+  const drafts = new WeakMap(); // composer -> the bar we built for it
+  const dismissed = new Set();
+  let draftTimer = null;
+  let draftAsked = null;
+
+  function composerText(composer) {
+    return (composer.innerText || composer.textContent || '').trim();
+  }
+
+  function scheduleDraftCheck(composer) {
+    clearTimeout(draftTimer);
+    // On a pause, when it is off, or in a channel Slacken leaves alone, this
+    // is not a delay — it is nothing at all.
+    if (!CONFIG.draftCheck || paused) {
+      hideDraft(composer);
+      return;
+    }
+    draftTimer = setTimeout(() => {
+      try {
+        checkDraft(composer);
+      } catch (err) {
+        log('draft check failed', err.message);
+      }
+    }, DRAFT_DEBOUNCE_MS);
+  }
+
+  function checkDraft(composer) {
+    if (!composer.isConnected) return;
+    const text = composerText(composer);
+    if (wordCount(text) < DRAFT_MIN_WORDS || dismissed.has(hash(text))) {
+      hideDraft(composer);
+      return;
+    }
+
+    const channel = channelFor(composer, null);
+    if (matchesAny(CONFIG.ignoreChannels, channel)) return;
+    const settings = settingsFor(channel);
+    if (text.length > settings.maxChars) return;
+    // Only the tone half of triage: a long message of your own is not
+    // something to be talked out of.
+    if (heuristicScore(text) < settings.triageThreshold) {
+      hideDraft(composer);
+      return;
+    }
+    if (draftAsked === text) return;
+    draftAsked = text;
+
+    ask({ text, sender: 'you', channel, kind: 'draft' }).then((verdict) => {
+      if (composerText(composer) !== text) return;
+      if (verdict?.flagged && verdict.hostile && verdict.rewrite) showDraft(composer, text, verdict.rewrite);
+      else hideDraft(composer);
+    }).catch(() => {});
+  }
+
+  function showDraft(composer, original, rewrite) {
+    const anchor = composer.closest('[data-qa="message_input"]') || composer.parentElement;
+    if (!anchor) return;
+
+    let bar = drafts.get(composer);
+    if (!bar || !bar.root.isConnected) {
+      const root = document.createElement('div');
+      root.className = 'slacken-draft';
+
+      const head = document.createElement('div');
+      head.className = 'slacken-draft-head';
+      head.textContent = 'This reads sharp. A flatter way to say it:';
+
+      const suggestion = document.createElement('div');
+      suggestion.className = 'slacken-draft-text';
+
+      const actions = document.createElement('div');
+      actions.className = 'slacken-draft-actions';
+      const use = document.createElement('button');
+      use.type = 'button';
+      use.className = 'slacken-draft-button';
+      use.textContent = 'Use this';
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.className = 'slacken-draft-button slacken-draft-quiet';
+      dismiss.textContent = 'Leave it';
+      actions.append(use, dismiss);
+
+      root.append(head, suggestion, actions);
+      bar = { root, suggestion, use, dismiss, original, rewrite };
+      drafts.set(composer, bar);
+
+      use.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        replaceDraft(composer, bar.rewrite);
+        hideDraft(composer);
+      });
+      dismiss.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        dismissed.add(hash(bar.original));
+        while (dismissed.size > 200) dismissed.delete(dismissed.values().next().value);
+        hideDraft(composer);
+      });
+    }
+
+    bar.original = original;
+    bar.rewrite = rewrite;
+    if (bar.suggestion.textContent !== rewrite) bar.suggestion.textContent = rewrite;
+    if (bar.root.parentElement !== anchor.parentElement || bar.root.nextElementSibling !== anchor) {
+      anchor.parentElement?.insertBefore(bar.root, anchor);
+    }
+  }
+
+  function hideDraft(composer) {
+    const bar = drafts.get(composer);
+    if (bar?.root.isConnected) bar.root.remove();
+  }
+
+  /*
+   * Typed rather than assigned.
+   *
+   * Slack's composer is a rich text editor with its own model of what is in
+   * it, so writing textContent leaves the editor believing the old text is
+   * still there and the next keystroke puts it back. An insertText command is
+   * an edit the editor performs itself — which also means it lands in its
+   * undo stack, so Cmd-Z gives you your own words back.
+   */
+  function replaceDraft(composer, rewrite) {
+    composer.focus();
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand('insertText', false, rewrite);
+    } catch (err) {
+      log('could not replace the draft', err.message);
+    }
+  }
+
+  document.addEventListener('input', (event) => {
+    const target = event.target;
+    if (!target || target.nodeType !== 1) return;
+    const composer = target.closest?.(SEL.composer);
+    if (composer) scheduleDraftCheck(composer);
+  }, true);
 
   // Called by the daemon whenever the pause state changes, and once at
   // injection time via CONFIG.paused.
@@ -1039,6 +1570,9 @@
     verdicts.clear();
     sigs.clear();
     revealed.clear();
+    // The per-channel answers were worked out from the settings that have
+    // just moved.
+    settingsCache.clear();
     try {
       window.localStorage.removeItem(STORE_KEY);
     } catch {
@@ -1063,6 +1597,16 @@
     log('settings changed', CONFIG);
     forget();
     sweep();
+  };
+
+  // Asked for by the daemon, or by a test that would rather not wait a minute
+  // for the timer.
+  window.__slackenReportHealth = () => {
+    try {
+      reportHealth();
+    } catch (err) {
+      log('health failed', err.message);
+    }
   };
 
   window.__slackenRescan = () => {
