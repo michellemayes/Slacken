@@ -202,8 +202,9 @@ export class Attacher {
     // A notification body and a draft are the same question about a different
     // piece of text, so they take the same path — counted separately only so
     // the menu can say whether either is doing anything at all.
-    if (request.kind === 'notification') this.moderator.stats.notifications += 1;
-    if (request.kind === 'draft') this.moderator.stats.drafts += 1;
+    const stats = this.moderator.stats;
+    if (request.kind === 'notification') stats.notifications = (stats.notifications || 0) + 1;
+    if (request.kind === 'draft') stats.drafts = (stats.drafts || 0) + 1;
 
     const verdict = await this.moderator.moderate({
       text: request.text,

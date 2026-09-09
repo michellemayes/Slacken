@@ -809,7 +809,11 @@ test('the token is written once, kept private, and read back', () => {
       assert.equal(fs.statSync(file).mode & 0o077, 0, 'nobody else on this machine may read it');
     }
     assert.equal(tokenMatches(first, first), true);
-    assert.equal(tokenMatches(first, `${first.slice(0, -1)}0`), false);
+    // Changed rather than replaced with a fixed character: one time in
+    // sixteen a random hex token already ends in the character you picked,
+    // and a test that passes fifteen times in sixteen is worse than no test.
+    const wrong = first.slice(0, -1) + (first.endsWith('0') ? '1' : '0');
+    assert.equal(tokenMatches(first, wrong), false);
     assert.equal(tokenMatches(first, 'short'), false);
     assert.equal(tokenMatches(null, undefined), true, 'a daemon with no token asks for none');
   } finally {
