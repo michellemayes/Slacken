@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { HOME_DIR } from './config.js';
+import { writeFileAtomic } from './fsutil.js';
 
 export const STATE_PATH = path.join(HOME_DIR, 'state.json');
 
@@ -9,23 +10,12 @@ export function today() {
 }
 
 /*
- * The daemon state that is not configuration: whether Slacken is currently
- * allowed to change anything you read, and what today has cost so far.
- *
- * Both are written to disk because the login agent restarts the daemon
- * whenever it exits, and both mean something different if they are forgotten:
- *
- *   A pause that silently un-paused itself after a crash would be the worst
- *   kind of surprise — you would go on reading a rewritten feed believing you
- *   had turned it off. The menu bar item makes the persisted state visible, so
- *   a pause can never be forgotten either.
- *
- *   A daily budget that started again from zero at every restart would not be
- *   a daily budget. The agent restarts on a crash and at every login, so a
- *   $0.25 cap held only in memory is a $0.25 cap per restart — which is to say
- *   no cap at all on the day a Slack update makes the daemon fall over twice.
- *   The spend is written the moment a call reports what it cost, not on a
- *   timer, because the crash is exactly the case it exists for.
+ * Daemon state that is not configuration: whether Slacken is paused, and what
+ * today has cost. Both persist because the login agent restarts the daemon on
+ * every crash and login — a pause that silently lifted, or a daily budget that
+ * reset on each restart, would both be broken promises. Spend is written as
+ * soon as a call reports it, not on a timer, since a crash is the case it is
+ * for.
  */
 export class State {
   constructor({ file = STATE_PATH, persist = true } = {}) {
@@ -45,24 +35,20 @@ export class State {
       const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
       this.paused = Boolean(raw.paused);
       this.pausedAt = this.paused && Number.isFinite(raw.pausedAt) ? raw.pausedAt : null;
-      // A spend from a previous day is not this day's spend. Reading it as
-      // zero rather than dropping the field keeps yesterday's number out of
-      // today's budget without a separate rollover pass at startup.
+      // Spend from an earlier day does not count against today.
       if (typeof raw.day === 'string' && raw.day === today() && Number.isFinite(raw.costUsd)) {
         this.day = raw.day;
         this.costUsd = Math.max(0, raw.costUsd);
       }
     } catch {
-      // No state yet, or it is corrupt. Not paused, nothing spent, is the
-      // right default.
+      // Missing or corrupt: not paused, nothing spent.
     }
   }
 
   save() {
     if (!this.persist) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify({
+      writeFileAtomic(this.file, JSON.stringify({
         paused: this.paused,
         pausedAt: this.pausedAt,
         day: this.day,
@@ -73,8 +59,7 @@ export class State {
     }
   }
 
-  // Returns true if this actually changed anything, so callers can skip the
-  // work of telling every Slack window about a no-op.
+  // Returns whether anything changed, so callers can skip no-op broadcasts.
   setPaused(paused) {
     const next = Boolean(paused);
     if (next === this.paused) return false;
@@ -85,7 +70,7 @@ export class State {
       try {
         listener(next);
       } catch {
-        // A listener that throws must not stop the others being told.
+        // One bad listener must not stop the others hearing about it.
       }
     }
     return true;
@@ -101,10 +86,7 @@ export class State {
     return () => this.listeners.delete(listener);
   }
 
-  /* ------------------------------------------------------------- spending */
-
-  // Rolls the day over on read as well as on write, so a daemon left running
-  // past midnight is not still measuring yesterday.
+  // Rolls over on read too, so a daemon running past midnight starts afresh.
   get spentToday() {
     this.rollDay();
     return this.costUsd;

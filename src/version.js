@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HOME_DIR } from './config.js';
+import { writeFileAtomic } from './fsutil.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_PATH = path.join(HERE, '..', 'package.json');
@@ -20,14 +21,9 @@ function readVersion() {
 }
 
 /*
- * Is there a newer Slacken?
- *
- * Off unless `checkUpdates` is on, and worth being deliberate about: this is
- * the only thing in Slacken that opens a connection to anything but your own
- * machine. It sends nothing but the request itself, asks at most once a day
- * (the answer is stamped in ~/.slacken/update.json so a daemon restarted
- * twenty times does not ask twenty times), and nothing waits on it — a
- * check that fails is a check that did not happen.
+ * Is there a newer Slacken? Off unless `checkUpdates` is on: this is the only
+ * connection Slacken makes off your machine. At most once a day (stamped in
+ * ~/.slacken/update.json), and a failed check is silently skipped.
  */
 export async function checkForUpdate(config, { now = Date.now(), force = false } = {}) {
   if (!force && !config?.checkUpdates) return null;
@@ -60,15 +56,8 @@ function decorate(latest, url) {
   return { current: VERSION, latest, url, newer: compareVersions(latest, VERSION) > 0 };
 }
 
-/*
- * Newer, older or the same.
- *
- * Numeric where both sides are numeric, so 0.10.0 is newer than 0.9.0 rather
- * than alphabetically before it. A tag with a suffix — 0.3.0-rc1 — is a
- * release on its way rather than one that has arrived, so it ranks below the
- * plain version it is a candidate for, which is the one rule here that a
- * string comparison would get backwards.
- */
+// Numeric where both parts are numeric (0.10.0 > 0.9.0). A pre-release like
+// 0.3.0-rc1 ranks below the 0.3.0 it leads up to.
 export function compareVersions(a, b) {
   const left = String(a).split(/[.-]/);
   const right = String(b).split(/[.-]/);
@@ -102,10 +91,8 @@ function readStamp() {
 
 function writeStamp(stamp) {
   try {
-    fs.mkdirSync(HOME_DIR, { recursive: true });
-    fs.writeFileSync(STAMP_PATH, JSON.stringify(stamp) + '\n');
+    writeFileAtomic(STAMP_PATH, JSON.stringify(stamp) + '\n');
   } catch {
-    // Not being able to remember when we last asked is not worth a word to
-    // anyone; the worst case is asking again next time.
+    // Worst case, we ask again next time.
   }
 }

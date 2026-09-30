@@ -715,6 +715,12 @@ npm run test:fast   # skips the browser test
   shortened, that the file is capped keeping the newest, and that a line
   half-written by a daemon killed mid-append costs one line rather than the
   file.
+- `test/reliability.mjs` — failure paths: a control endpoint that throws
+  answers 500 and the daemon keeps serving, a devtools command that is never
+  answered times out rather than hanging the attach loop, a config file holding
+  nonsense falls back to the defaults key by key with a warning, a patch with a
+  bad value changes nothing, state files are replaced atomically, and the
+  history and agent log are kept to size.
 - `test/control.mjs` — pausing, settings, and the menu the menu bar item draws.
   Asserts that a pause survives a restart, that a paused Slacken makes no model
   call and caches nothing, that the control endpoints agree with each other,
@@ -761,6 +767,9 @@ npm run test:fast   # skips the browser test
   list, gives back every original on screen, and stops new messages there
   costing anything; clicking it again brings the rewrites back; and a setting
   changed on the daemon reaches the page and is acted on without a reload.
+  Reinjecting replaces the page script rather than running a second copy, a
+  window reloaded during a pause comes back paused, and a failed model call
+  leaves the message readable and is asked about again rather than remembered.
   The fixture has a thread open beside the channel, so it also asserts that a
   message in the thread is attributed to the thread's channel rather than the
   column beside it, and that a per-channel setting changes that channel and

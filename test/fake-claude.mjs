@@ -68,17 +68,28 @@ process.stdin.on('end', () => {
     verbose: item.text.split(/\s+/).length >= 45,
     tone: ['aggressive'],
     severity: 2,
-    rewrite: `REWRITTEN ${item.id}`,
+    rewrite: process.env.FAKE_CLAUDE_REWRITE || `REWRITTEN ${item.id}`,
     note: 'test',
   }));
 
-  process.stdout.write(JSON.stringify({
+  const envelope = Buffer.from(JSON.stringify({
     type: 'result',
     subtype: 'success',
     is_error: false,
     total_cost_usd: 0.0007,
     result: JSON.stringify({ verdicts }),
   }));
+
+  // Split the output in the middle of a multi-byte character, the way a pipe
+  // is free to, so a reader that decodes chunk by chunk gets it wrong.
+  if (process.env.FAKE_CLAUDE_SPLIT_UTF8 === '1') {
+    const firstWide = envelope.findIndex((byte) => byte >= 0x80);
+    const at = firstWide === -1 ? envelope.length : firstWide + 1;
+    process.stdout.write(envelope.subarray(0, at));
+    setTimeout(() => process.stdout.write(envelope.subarray(at)), 50);
+    return;
+  }
+  process.stdout.write(envelope);
 
   // The real claude prints the whole envelope and then takes its time going
   // away. Nothing worth waiting for happens in that window, which is the

@@ -628,8 +628,8 @@ function findItem(items, prefix) {
 }
 
 test('the settings menu shows what each setting is set to without opening it', () => {
-  const items = settingsMenu({ ...DEFAULTS, model: 'claude-opus-5', dailyBudgetUsd: 0.5 });
-  assert.equal(findItem(items, 'Model').label, 'Model: Opus 5');
+  const items = settingsMenu({ ...DEFAULTS, model: 'opus', dailyBudgetUsd: 0.5 });
+  assert.equal(findItem(items, 'Model').label, 'Model: Opus');
   assert.equal(findItem(items, 'Daily budget').label, 'Daily budget: $0.50');
   assert.equal(findItem(items, 'Look at:').label, 'Look at: flagged only');
 });

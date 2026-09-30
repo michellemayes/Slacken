@@ -27,6 +27,8 @@ function setup(overrides = {}, { state = null } = {}) {
   delete process.env.FAKE_CLAUDE_MESSAGE;
   delete process.env.FAKE_CLAUDE_UNPARSEABLE;
   delete process.env.FAKE_CLAUDE_LINGER_MS;
+  delete process.env.FAKE_CLAUDE_REWRITE;
+  delete process.env.FAKE_CLAUDE_SPLIT_UTF8;
 
   const moderator = new Moderator({
     ...DEFAULTS,
@@ -400,6 +402,57 @@ test('a successful verdict is still cached after a failure', async () => {
     assert.equal(invocations().length, 2, 'only the failure and the call that worked cost anything');
   } finally {
     delete process.env.FAKE_CLAUDE_FAIL;
+    cleanup();
+  }
+});
+
+test('a character split across two reads of the output arrives whole', async () => {
+  const { moderator, cleanup } = setup();
+  try {
+    process.env.FAKE_CLAUDE_REWRITE = 'café — naïve 👍';
+    process.env.FAKE_CLAUDE_SPLIT_UTF8 = '1';
+    const verdict = await moderator.moderate({ text: 'WHY IS THIS BROKEN' });
+    assert.equal(verdict.rewrite, 'café — naïve 👍');
+  } finally {
+    cleanup();
+  }
+});
+
+test('the same message asked about twice at once costs one call', async () => {
+  const { moderator, invocations, cleanup } = setup();
+  try {
+    const [a, b] = await Promise.all([
+      moderator.moderate({ text: 'THIS IS UNACCEPTABLE', channel: '#eng' }),
+      moderator.moderate({ text: 'THIS IS UNACCEPTABLE', channel: '#eng' }),
+    ]);
+    assert.equal(invocations().length, 1);
+    assert.equal(invocations()[0].count, 1, 'one copy of the text in the batch, not two');
+    assert.deepEqual(a, b);
+    assert.equal(moderator.stats.softened, 1, 'counted once');
+  } finally {
+    cleanup();
+  }
+});
+
+test('a batchSize of zero in the config does not stall the queue', async () => {
+  const { moderator, invocations, cleanup } = setup({ batchSize: 0, maxConcurrency: 0 });
+  try {
+    const verdict = await moderator.moderate({ text: 'WHY IS THIS BROKEN' });
+    assert.equal(verdict.flagged, true);
+    assert.equal(invocations().length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test('condensing switched off means no condensed rewrite, whatever the model says', async () => {
+  const { moderator, cleanup } = setup({ condenseEnabled: false });
+  try {
+    const verdict = await moderator.moderate({ text: LONG });
+    assert.equal(verdict.flagged, false);
+    assert.equal(verdict.verbose, false);
+    assert.match(verdict.why, /condenseEnabled/);
+  } finally {
     cleanup();
   }
 });

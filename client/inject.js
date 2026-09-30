@@ -1,36 +1,36 @@
 /*
- * Slacken page script.
+ * Slacken page script. Runs inside the Slack renderer: triages other people's
+ * messages locally, asks the daemon for a neutral rewrite over a CDP binding
+ * (no network request from the page, so Slack's CSP does not apply), and swaps
+ * the rewrite in with a badge that toggles back to the original. The original
+ * DOM is hidden, never destroyed.
  *
- * Runs inside the Slack renderer. It finds rendered messages from other
- * people, triages them locally, asks the daemon (over a CDP binding, so no
- * network request is made from the page and Slack's CSP is irrelevant) for a
- * neutral rewrite, and swaps the rewrite in with a badge that flips back to
- * the original text.
- *
- * The original DOM is never destroyed. It is hidden and revealed again on
- * click.
- *
- * Two rules keep the swap from flickering, and both matter more than they
- * look:
- *
- *   1. The hold is a CSS rule rooted at the list item, not an attribute on
- *      the message body. Slack re-renders the body constantly — hover,
- *      reactions, read receipts, virtual-list recycling — and anything we
- *      write onto the body dies with it. The list item survives, so a body
- *      React has just re-created is already hidden by the cascade the moment
- *      it lands. No JavaScript runs, so there is no window to see through.
- *
- *   2. Reconciliation is synchronous inside the MutationObserver callback,
- *      which the browser runs before it paints. Repairing on a timer, however
- *      short, guarantees the original gets at least one frame on screen.
- *
- * Everything else here follows from those two: the DOM is reconciled, never
- * rebuilt, so a repair mutates text in place instead of tearing a panel down
- * and putting a new one up.
+ * Two rules keep the swap from flickering:
+ *   1. The hold is a CSS rule rooted at the list item, not an attribute on the
+ *      body. Slack re-renders bodies constantly (hover, reactions, virtual-list
+ *      recycling) but the list item survives, so a re-created body is hidden by
+ *      the cascade the moment it lands, with no JS in between.
+ *   2. Reconciliation is synchronous in the MutationObserver callback, which
+ *      runs before paint. Repairing on any timer gives the original a frame.
+ * The DOM is reconciled in place, never torn down and rebuilt.
  */
 (() => {
-  if (window.__SLACKEN__) return;
+  // A newer copy (reinject, daemon restart) tears the older one down. A copy
+  // from before teardown existed cannot be replaced, so it is left to run.
+  if (window.__SLACKEN__ && typeof window.__slackenTeardown !== 'function') return;
+  window.__slackenTeardown?.();
   window.__SLACKEN__ = true;
+
+  // Everything this copy hooks into the page, undone by teardown.
+  const cleanups = [];
+  function listen(target, type, fn, options) {
+    target.addEventListener(type, fn, options);
+    cleanups.push(() => target.removeEventListener(type, fn, options));
+  }
+  function every(ms, fn) {
+    const timer = setInterval(fn, ms);
+    cleanups.push(() => clearInterval(timer));
+  }
 
   const CONFIG = Object.assign({
     triageMode: 'heuristic',
@@ -63,17 +63,17 @@
   const ATTR_BODY = 'data-slacken-body';
   const OUR_ATTRS = new Set([ATTR_STATE, ATTR_HASH, ATTR_HOLD, ATTR_BODY]);
 
-  // How long a hold stays silent before it admits to waiting. Under this, a
-  // cache hit lands first and the reader never sees a placeholder at all.
+  // Delay before a hold says "checking…"; a cache hit usually lands first.
   const PENDING_LABEL_MS = 140;
-  // Off-screen messages cost a model call for nothing, so they wait. Generous,
-  // because the margin is what buys a scroll its head start.
+  // Off-screen messages wait. A generous margin gives scrolling a head start.
   const VIEWPORT_MARGIN_PX = 800;
   const SWEEP_MS = 2000;
   const STORE_KEY = 'slacken:verdicts:v1';
   const STORE_MAX = 400;
   const STORE_TTL_MS = 24 * 3600 * 1000;
   const MEMORY_MAX = 1500;
+  // A failed call is not a verdict: the original is shown and retried after this.
+  const RETRY_FAILED_MS = 60_000;
 
   const SEL = {
     item: '[data-qa="virtual-list-item"]',
@@ -81,17 +81,14 @@
     blocks: '.c-message_kit__blocks, .c-message__message_blocks',
     rich: '.p-rich_text_section',
     sender: '[data-qa="message_sender_name"]',
-    // A reply broadcast back into the channel carries a "replied to a thread:"
-    // line quoting the message it answers. That preview is Slack's chrome and
-    // a copy of someone else's words, so it is neither what we read for triage
-    // nor what a rewrite may stand in for.
+    // A broadcast reply quotes its parent in a preamble. That is Slack chrome and
+    // someone else's words, so it is neither triaged nor replaced by a rewrite.
     preamble: '[data-qa="message_broadcast_preamble"], .c-message__broadcast_preamble_container,'
       + ' .c-message__broadcast_preamble, .c-message__broadcast_preamble_link',
     channel: '[data-qa="channel_name"]',
     self: '[data-qa="user-button"]',
     composer: '[data-qa="message_input"], .ql-editor',
-    // The columns a message list can live in. A thread open beside a channel
-    // is two conversations on one screen, and they are not the same channel.
+    // Columns a message list can live in. A thread beside a channel is its own surface.
     surface: [
       '[data-qa="threads_flexpane"]',
       '[data-qa="thread_view"]',
@@ -105,9 +102,8 @@
     // What a surface calls itself, in the order the client has used over time.
     surfaceChannel: '[data-qa="channel_name"], [data-qa="thread_channel_name"], .p-view_header__channel_title',
     primary: '.p-workspace__primary_view, [data-qa="channel_view"]',
-    // Where the channel-ignore button goes. Slack has moved this header
-    // around between versions, so the first ancestor that matches wins and
-    // the channel name's own parent is the fallback.
+    // Host for the channel-ignore button. Slack moves the header between versions:
+    // first matching ancestor wins, else the channel name's parent.
     header: '[data-qa="channel_header"], .p-view_header__text_container, .p-view_header',
   };
 
@@ -116,12 +112,8 @@
   /* ------------------------------------------------------- per channel */
 
   /*
-   * A channel can be told to behave differently, and the page has to agree
-   * with the daemon about which channel that is — otherwise a message would
-   * be triaged under one set of rules and judged under another.
-   *
-   * The lookup folds case and a leading #, the way the daemon's does, so
-   * "#Eng-Oncall" and "eng-oncall" are one channel here too.
+   * Per-channel overrides. Names fold case and a leading # exactly as the daemon
+   * does, so both sides agree on which rules a message falls under.
    */
   const CHANNEL_KEYS = [
     'triageMode', 'triageThreshold', 'minSeverity',
@@ -150,17 +142,14 @@
     return resolved;
   }
 
-  // What a remembered verdict is an answer to. The same words under a
-  // different threshold are a different answer, so they are a different key —
-  // which is also why a stored verdict cannot leak from a channel with its own
-  // settings into one without.
+  // Cache key suffix: the same text under different settings is a different
+  // verdict, so stored verdicts cannot leak between channels.
   function gateFor(channel) {
     const c = settingsFor(channel);
     return `${c.minSeverity}:${c.condenseEnabled ? 1 : 0}:${c.condenseMinWords}:${c.condenseMaxRatio}:${c.maxChars}`;
   }
 
-  // Set from the daemon, which owns the pause state. While paused nothing is
-  // asked about and nothing stays hidden: you read exactly what was written.
+  // Owned by the daemon. While paused nothing is asked about or held.
   let paused = Boolean(CONFIG.paused);
 
   /* ---------------------------------------------------------------- styles */
@@ -173,9 +162,7 @@
     [${ATTR_HOLD}="1"] .c-message__message_blocks,
     [${ATTR_HOLD}="1"] [${ATTR_BODY}] { display: none !important; }
 
-    /* A column, so the badge is a block-level box with predictable margins
-       rather than an inline one whose baseline drags phantom descender space
-       under it. */
+    /* A column, so the badge is a block box with no inline descender space. */
     .slacken-panel {
       display: flex; flex-direction: column; align-items: flex-start;
       margin: 2px 0 0;
@@ -187,13 +174,9 @@
       word-break: break-word;
     }
     .slacken-panel[data-open="1"] .slacken-rewrite { display: none; }
-    /* Deliberately not a chip. Slack stacks its own bordered boxes directly
-       under a message — reaction pills 4px below, and a thread bar whose
-       hover box is pulled up over whatever precedes it — so a bordered badge
-       either reads as one more reaction or gets crossed by the thread bar's
-       outline. A dot and two words collide with neither, and the hover fill
-       hangs 6px left the way Slack's own hover boxes do, which keeps the
-       label itself flush with the message text above it. */
+    /* Deliberately unbordered: Slack stacks reaction pills and the thread bar's
+       hover box right under a message, and a bordered badge reads as one of them
+       or collides with it. The -6px hover inset matches Slack's own. */
     .slacken-badge {
       display: inline-flex; align-items: center; gap: 5px;
       box-sizing: border-box; max-width: 100%;
@@ -211,8 +194,7 @@
     }
     .slacken-badge[data-severity="3"] .slacken-dot { background: #e01e5a; }
 
-    /* The draft bar. Above the composer rather than inside it, so nothing here
-       is ever part of what you are about to send. */
+    /* Above the composer, not inside it, so it is never part of what you send. */
     .slacken-draft {
       margin: 0 0 6px; padding: 8px 10px;
       border: 1px solid rgba(127,127,127,.28); border-radius: 8px;
@@ -233,12 +215,8 @@
     .slacken-action { opacity: .75; }
     .slacken-pending { opacity: .45; font-style: italic; }
 
-    /* The header button. Same dot, size and weight as the badge, so the two
-       read as parts of one thing — but bordered, which the badge deliberately
-       is not. The badge sits where Slack stacks reaction pills and thread
-       bars, and a border there reads as one of them; the header has no such
-       boxes, and without one this would read as a second line of header text
-       rather than as something you can press. */
+    /* Header button. Like the badge but bordered: the header has no pills to
+       be confused with, and it has to read as pressable. */
     .slacken-channel {
       display: inline-flex; align-items: center; gap: 5px;
       margin: 0 0 0 8px; padding: 1px 8px; vertical-align: middle;
@@ -262,12 +240,16 @@
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = CSS;
-    (document.head || document.documentElement).appendChild(style);
+    // Nothing to attach to yet at document start; the next flush tries again.
+    const parent = document.head || document.documentElement;
+    if (parent) parent.appendChild(style);
   }
 
   /* ------------------------------------------------------------- transport */
 
   let seq = 0;
+  // Ids are per copy, so a reply meant for a replaced copy never resolves ours.
+  const INSTANCE = Math.random().toString(36).slice(2, 8);
   const pending = new Map();
 
   window.__slackenResult = (json) => {
@@ -288,7 +270,7 @@
     if (typeof window[ASK] !== 'function') {
       return Promise.reject(new Error('binding missing'));
     }
-    const id = `r${++seq}`;
+    const id = `${INSTANCE}-${++seq}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
@@ -341,9 +323,7 @@
     return score;
   }
 
-  // Padding tells. Length alone is not one: a long message dense with facts is
-  // worth reading in full. What earns a condense is length plus the shape of
-  // writing that is mostly throat-clearing.
+  // Padding tells. Length alone does not earn a condense; length plus these does.
   const AI_TELLS = [
     /\bi hope (this|you|we)\b/i,
     /\b(just )?wanted to (reach out|take a moment|circle back|flag|check in|follow up|share)\b/i,
@@ -410,8 +390,7 @@
     return cachedSelf;
   }
 
-  // The channel of the column you are actually reading, which is what the
-  // button in the header is about.
+  // Channel of the primary column, which the header button refers to.
   function channelName() {
     const primary = document.querySelector(SEL.primary);
     const el = primary?.querySelector(SEL.surfaceChannel) || document.querySelector(SEL.channel);
@@ -421,16 +400,9 @@
   }
 
   /*
-   * Which channel is this particular message in?
-   *
-   * Asking the page once and using the answer for everything on it is wrong
-   * the moment a thread is open beside a channel, or two columns are: the
-   * messages in the flexpane belong to whatever channel the thread is in, and
-   * telling Slacken to leave #deploys alone has to mean the thread too.
-   *
-   * So the channel is read from the surface the message is in, memoised per
-   * surface for the length of one pass — the lookup is a querySelector inside
-   * a column, and a burst of forty messages must not cost forty of them.
+   * Channel of the column the message is in, not of the page: a thread open
+   * beside a channel belongs to the thread's channel. Memoised per surface for
+   * one pass so a burst of messages does not cost a querySelector each.
    */
   function channelFor(item, memo) {
     const surface = item.closest?.(SEL.surface);
@@ -442,9 +414,8 @@
     return name;
   }
 
-  // Grouped consecutive messages only carry the sender name on the first one,
-  // so walk back through earlier list items until we find it. Only worth doing
-  // for a message that has already cleared triage; it is the priciest read here.
+  // Grouped messages only name the sender on the first, so walk back. This is
+  // the priciest read here, so it runs only after triage.
   function senderFor(item) {
     let node = item;
     for (let i = 0; i < 40 && node; i += 1) {
@@ -459,10 +430,8 @@
     return Boolean(el.closest(SEL.preamble));
   }
 
-  // The content node is where a message body normally lives, but a thread
-  // reply shown in the channel does not always have one, so the list item
-  // itself is the fallback scope rather than a reason to give up: a message we
-  // cannot find a body for is a message we silently never touch.
+  // A broadcast thread reply may have no content node; fall back to the list
+  // item rather than silently never touching the message.
   function bodyFor(item) {
     const scope = item.querySelector(SEL.content) || item;
     const blocks = Array.from(scope.querySelectorAll(SEL.blocks)).find((el) => !inPreamble(el));
@@ -474,12 +443,10 @@
 
   function richSections(body) {
     return Array.from(body.querySelectorAll(SEL.rich))
-      // The quoted parent of a broadcast reply is rich text too, and it sits
-      // inside the same blocks the reply does.
+      // Skip the quoted parent of a broadcast reply.
       .filter((el) => !inPreamble(el))
-      // A list item's section nests inside another in some layouts. Keeping
-      // both would hand the model the same sentence twice and score its
-      // padding on the duplicate.
+      // Some layouts nest list-item sections; keep the outer one only, or the text
+      // is sent twice and its padding scored twice.
       .filter((el, _i, all) => !all.some((other) => other !== el && other.contains(el)));
   }
 
@@ -487,9 +454,8 @@
     const sections = richSections(body);
     if (sections.length) return sections.map((el) => el.innerText).join('\n').trim();
     if (!body.querySelector(SEL.preamble)) return body.innerText.trim();
-    // No rich text to pick from and a preamble in the way: read a copy with
-    // the preamble cut out. Detached, so innerText falls back to textContent,
-    // which is close enough for a path this rare.
+    // No rich text and a preamble in the way: read a detached copy without it.
+    // innerText degrades to textContent there, which is fine for a rare path.
     const copy = body.cloneNode(true);
     copy.querySelectorAll(SEL.preamble).forEach((el) => el.remove());
     return copy.innerText?.trim() || copy.textContent.trim();
@@ -509,14 +475,29 @@
 
   /* --------------------------------------------------------------- memory */
 
-  // Keyed by a hash of the message text, so the same message costs one call no
-  // matter how often it is re-rendered, recycled or scrolled past.
+  // Keyed by a hash of the text, so re-renders and recycling cost one call.
   const verdicts = new Map();
-  // Cheap textContent hash -> verdict key. textContent needs no layout, so a
-  // repair pass can decide what to do without touching innerText at all.
+  // textContent hash -> verdict key. textContent needs no layout, so a repair
+  // pass never touches innerText.
   const sigs = new Map();
 
   const CLEAN = { flagged: false, rewrite: null };
+
+  const failures = new Map(); // verdict key -> when the call for it failed
+  const failedItems = new WeakMap(); // list item -> the key its call failed for
+
+  function failedRecently(key) {
+    const at = failures.get(key);
+    if (at === undefined) return false;
+    if (Date.now() - at < RETRY_FAILED_MS) return true;
+    failures.delete(key);
+    return false;
+  }
+
+  function markFailed(key) {
+    failures.set(key, Date.now());
+    while (failures.size > MEMORY_MAX) failures.delete(failures.keys().next().value);
+  }
 
   function remember(key, verdict) {
     verdicts.set(key, verdict);
@@ -528,10 +509,8 @@
     while (sigs.size > MEMORY_MAX) sigs.delete(sigs.keys().next().value);
   }
 
-  // Flagged verdicts survive a reload, so re-opening Slack repaints the
-  // rewrites immediately instead of walking every held message back through
-  // the daemon. Triage is cheap enough that clean verdicts are not worth a
-  // storage slot.
+  // Flagged verdicts persist so a reload repaints rewrites without the daemon.
+  // Clean verdicts are cheap to recompute and not stored.
   function loadStore() {
     if (!CONFIG.persistVerdicts) return;
     try {
@@ -548,38 +527,37 @@
   let storeTimer = null;
   function persistSoon() {
     if (!CONFIG.persistVerdicts || storeTimer) return;
-    storeTimer = setTimeout(() => {
-      storeTimer = null;
-      try {
-        const out = {};
-        const at = Date.now();
-        const keys = Array.from(verdicts.keys()).slice(-STORE_MAX);
-        for (const key of keys) {
-          const v = verdicts.get(key);
-          if (v && v.flagged && v.rewrite) out[key] = { at, v };
-        }
-        window.localStorage.setItem(STORE_KEY, JSON.stringify(out));
-      } catch {
-        // Nothing here is worth failing a render over.
+    storeTimer = setTimeout(persistNow, 2000);
+  }
+
+  function persistNow() {
+    clearTimeout(storeTimer);
+    storeTimer = null;
+    if (!CONFIG.persistVerdicts) return;
+    try {
+      const out = {};
+      const at = Date.now();
+      const keys = Array.from(verdicts.keys()).slice(-STORE_MAX);
+      for (const key of keys) {
+        const v = verdicts.get(key);
+        if (v && v.flagged && v.rewrite) out[key] = { at, v };
       }
-    }, 2000);
+      window.localStorage.setItem(STORE_KEY, JSON.stringify(out));
+    } catch {
+      // Private mode or a full quota; nothing worth failing a render over.
+    }
   }
 
   /* -------------------------------------------------------------- rendering */
 
   const panels = new WeakMap(); // list item -> the panel we built for it
-  // Messages the reader has opened, keyed by content rather than by node. A
-  // reveal kept on the node dies the moment Slack re-renders the row — and
-  // revealing a condensed message swaps one line of rewrite for the whole
-  // original, which is the biggest height change on the page and the surest
-  // way to make the virtual list re-render it. Keyed by content, the reveal
-  // survives being re-rendered straight through it.
+  // Revealed messages, keyed by content rather than node: revealing is a large
+  // height change that often makes the virtual list re-render the row.
   const revealed = new Set();
   let revealAll = false;
 
   function setAttr(el, name, value) {
-    // Writing an identical value still fires the observer, which is how a
-    // reconcile loop starts. Every write here is conditional for that reason.
+    // Identical writes still fire the observer and start a reconcile loop.
     if (el.getAttribute(name) !== value) el.setAttribute(name, value);
   }
 
@@ -626,9 +604,8 @@
       panels.set(item, refs);
     }
 
-    // Put it back if Slack re-rendered over it. This runs inside the observer
-    // callback, so the repair lands before the frame is painted and the gap is
-    // never visible.
+    // Re-attach if Slack re-rendered over it. Runs in the observer callback, so
+    // it lands before paint.
     const parent = body.parentElement;
     if (parent && (refs.panel.parentElement !== parent || refs.panel.previousElementSibling !== body)) {
       parent.insertBefore(refs.panel, body.nextSibling);
@@ -658,9 +635,7 @@
       while (revealed.size > MEMORY_MAX) revealed.delete(revealed.values().next().value);
     }
     setHold(item, body, open);
-    // Opening one is the clearest thing a reader ever says about a rewrite —
-    // that they wanted the words. Closing it again says nothing, so only the
-    // opening is reported, and nothing waits on the answer.
+    // Only opening is reported (the reader wanted the original); fire and forget.
     if (!open) reportReveal(refs);
   }
 
@@ -672,16 +647,13 @@
       channel: refs.channel || null,
       kind: refs.kind || null,
     }).catch(() => {
-      // The daemon is restarting, or the page is going away. A count is not
-      // worth a word to anyone.
+      // Daemon restarting or page unloading; not worth reporting.
     });
   }
 
-  // Local triage already suspects this one, so hide it now rather than letting
-  // the hostile version sit on screen for the second or so the model takes.
-  // The panel holds the original's height while it waits, so nothing on the
-  // page moves, and it stays wordless for a beat: a cached verdict beats
-  // PENDING_LABEL_MS and swaps straight in with no placeholder in between.
+  // Triage suspects this one, so hide it while the model runs. The panel keeps
+  // the original's height so nothing moves, and stays blank for
+  // PENDING_LABEL_MS so a cached verdict swaps in with no placeholder.
   function applyPending(item, body, height) {
     const refs = ensurePanel(item, body);
     const fresh = refs.panel.dataset.pending !== '1';
@@ -704,8 +676,7 @@
   function applyVerdict(item, body, verdict, key, channel) {
     const refs = ensurePanel(item, body);
     refs.key = key;
-    // Kept so that clicking the badge can say what was revealed and where,
-    // rather than only that something was.
+    // Kept for the reveal report.
     refs.channel = channel || refs.channel || null;
     refs.sender = senderFor(item) || refs.sender || null;
     refs.kind = verdict.hostile && verdict.verbose ? 'softened+condensed'
@@ -749,9 +720,7 @@
     dropAttr(body, ATTR_BODY);
   }
 
-  // Pausing has to clear held messages as well as revealed ones, or a message
-  // caught mid-verdict would stay behind "checking…" with nothing coming to
-  // replace it.
+  // Pausing must also release pending holds, or they sit on "checking…" forever.
   function releaseHolds() {
     document.querySelectorAll('.slacken-panel[data-pending]').forEach((panel) => {
       const item = panel.closest(SEL.item);
@@ -762,8 +731,7 @@
   function setAll(open) {
     revealAll = open;
     if (!open) revealed.clear();
-    // Reported once rather than once per message: Cmd+Shift+U is one decision
-    // about the screen, and forty of them would drown the count it feeds.
+    // Cmd+Shift+U is reported once, not once per message.
     if (open) {
       ask({ op: 'reveal', kind: 'all' }).catch(() => {});
     }
@@ -777,13 +745,9 @@
   /* -------------------------------------------------------- channel button */
 
   /*
-   * A button in Slack's channel header that takes the channel you are reading
-   * out of Slacken's way, and puts it back.
-   *
-   * It lives here rather than in the menu bar because this is the only place
-   * that knows which channel you mean. The daemon owns the list; the button
-   * asks it to change and then draws whatever came back, so the two can never
-   * disagree about whether a channel is ignored.
+   * Header button that ignores or un-ignores the current channel. It lives here
+   * because only the page knows which channel you mean; the daemon owns the list
+   * and the button draws whatever it returns.
    */
   const BUTTON_CLASS = 'slacken-channel';
 
@@ -809,9 +773,7 @@
   let channelButton = null;
 
   function ensureChannelButton(channel, ignored) {
-    // Nothing identifiable on screen — a preferences pane, or Slack still
-    // starting up. A button that cannot say which channel it means should not
-    // be offering to ignore one.
+    // Nothing identifiable on screen (preferences, startup): no button.
     if (!channel) {
       channelButton?.remove();
       return;
@@ -825,9 +787,8 @@
     if (!host) return;
 
     if (!channelButton) channelButton = buildChannelButton();
-    // Slack rebuilds its header on every channel switch, which takes the
-    // button with it. Putting it back is one append, and it happens inside the
-    // observer callback, so it is back before the frame is painted.
+    // Slack rebuilds the header on channel switch. Re-appended in the observer
+    // callback, so it is back before paint.
     if (channelButton.parentElement !== host) host.appendChild(channelButton);
 
     if (channelButton.dataset.channel !== channel) channelButton.dataset.channel = channel;
@@ -857,9 +818,8 @@
       log('ignore failed', err.message);
     }).finally(() => {
       delete button.dataset.busy;
-      // Whatever the answer was, the whole view is re-planned against it: an
-      // ignored channel has to give its originals back, and an un-ignored one
-      // has to be looked at again.
+      // Re-plan everything: an ignored channel must restore its originals, and an
+      // un-ignored one needs checking again.
       sweep();
     });
   }
@@ -874,11 +834,9 @@
   }
 
   /*
-   * Reconciliation runs in two halves on purpose. `plan` only reads the DOM
-   * and `commit` only writes it, so a batch of messages costs one layout
-   * instead of one per message. Interleaving the two is what makes a naive
-   * version of this slow enough to need a debounce — and a debounce is what
-   * puts the original on screen.
+   * `plan` only reads the DOM and `commit` only writes it, so a batch costs one
+   * layout rather than one per message. Interleaving them is slow enough to need
+   * a debounce, and a debounce lets the original paint.
    */
   function plan(item, ctx) {
     if (item.closest(SEL.composer)) return null;
@@ -889,8 +847,7 @@
     const raw = body.textContent || '';
     if (!raw.trim()) return null;
 
-    // Read from the column this message is in rather than from the page: a
-    // thread open beside a channel is two conversations on one screen.
+    // Per column, not per page: a thread beside a channel may be another channel.
     const channel = channelFor(item, ctx.memo);
     const settings = settingsFor(channel);
     const sig = hash(raw);
@@ -899,15 +856,11 @@
     const same = item.getAttribute(ATTR_HASH) === sig;
     const base = { item, body, sig, skey, channel, same };
 
-    // This channel is on the ignore list. Checked before the caches, not after
-    // the triage: a message we rewrote before the channel was ignored — or one
-    // a stored verdict would repaint after a reload — has to give its original
-    // back too, or ignoring a channel would only apply to what had not been
-    // read yet.
+    // Ignored channel. Checked before the caches so earlier rewrites and stored
+    // verdicts give their originals back too.
     if (matchesAny(CONFIG.ignoreChannels, channel)) return { ...base, act: 'idle' };
 
-    // Fast path: we have judged this exact text before, here or anywhere else.
-    // No innerText, no layout, no call.
+    // Fast path: this exact text was judged before. No innerText, layout or call.
     const knownKey = sigs.get(skey);
     const cached = knownKey ? verdicts.get(knownKey) : null;
     if (cached) {
@@ -916,21 +869,22 @@
         : { ...base, act: 'clear', state: 'clean' };
     }
 
-    // Paused. Verdicts already on screen stay, revealed by setAll, so the badge
-    // still flips back; everything else is released and left unexamined, with
-    // no state stamped, so resuming gives it a fresh look.
+    // Paused: verdicts on screen stay (revealed by setAll); everything else is
+    // released with no state stamped, so resuming examines it afresh.
     if (paused) return { ...base, act: 'idle' };
 
-    // Second fast path: decisions that belong to this item rather than to the
-    // text, so they cannot live in the shared cache.
+    // Per-item decisions, which cannot live in the text-keyed cache.
     if (same) {
       const state = item.getAttribute(ATTR_STATE);
       if (state === 'pending') return { ...base, act: 'pending' };
-      if (state === 'skipped' || state === 'error') return { ...base, act: 'clear', state };
+      if (state === 'skipped') return { ...base, act: 'clear', state };
+      if (state === 'error' && failedRecently(failedItems.get(item))) {
+        return { ...base, act: 'clear', state };
+      }
     }
 
-    // Undecided, and off screen. Leave it completely alone — including its
-    // hash, so it gets a fresh look when it scrolls in.
+    // Undecided and off screen: leave it alone, hash included, so it is looked at
+    // afresh when it scrolls in.
     if (!nearViewport(item)) return { ...base, act: 'idle' };
 
     const text = textFor(body);
@@ -950,10 +904,10 @@
       link(skey, key);
       return { ...base, act: 'clear', state: 'clean' };
     }
+    if (failedRecently(key)) return { ...base, act: 'clear', state: 'error', key };
     log('triage', heuristicScore(text), paddingScore(text, settings), text.slice(0, 60));
 
-    // Only now is the sender walk worth its cost, and a skip is per-sender so
-    // it never goes in the text-keyed cache.
+    // Sender walk only now. Skips are per sender, so never cached by text.
     const sender = senderFor(item);
     const me = selfName();
     if ((me && sender === me)
@@ -968,8 +922,7 @@
       key,
       text,
       sender,
-      // Read the height now, in the read half, so the hold can keep the
-      // message's place without shifting the page.
+      // Measured in the read half so the hold can keep the message's height.
       height: CONFIG.holdWhilePending ? body.offsetHeight : 0,
     };
   }
@@ -980,27 +933,21 @@
   }
 
   /*
-   * Read-only account of what Slacken makes of one row on screen, for
-   * `slacken inspect`. It answers the question the badge cannot: not what
-   * happened to a message, but why nothing did. Nothing here writes to the DOM
-   * or to the caches, so looking never changes the answer.
+   * Read-only account of one row for `slacken inspect`, mainly why nothing
+   * happened to it. Writes nothing to the DOM or caches.
    */
   function diagnose(item) {
     const sender = senderFor(item);
     const threadReply = Boolean(item.querySelector(SEL.preamble));
-    // Read where the row is, not where the page is: a thread open beside a
-    // channel is a different conversation with possibly different settings,
-    // and a report that answered for the wrong one would be worse than none.
+    // Per row, not per page: a thread beside a channel may have other settings.
     const channel = channelFor(item, null);
     const settings = settingsFor(channel);
     const row = { sender, channel, threadReply, state: item.getAttribute(ATTR_STATE) };
 
     const body = bodyFor(item);
     if (!body) {
-      // A day divider or a join notice is a row with nothing in it to read,
-      // not a message we failed on. Marked as chrome so the report can drop it
-      // — a row that looks like a message and still has no body is the one
-      // worth showing, because it is a layout this does not know.
+      // Day dividers and join notices have no body and are marked chrome. A
+      // message-like row with no body is kept: it means an unknown layout.
       const looksLikeMessage = Boolean(item.querySelector(`${SEL.content}, ${SEL.blocks}`) || threadReply);
       return { ...row, chrome: !looksLikeMessage, why: 'no message body found under this row' };
     }
@@ -1013,16 +960,14 @@
 
     const known = verdicts.get(`${hash(text)}|${gateFor(channel)}`);
     if (known && known.flagged && known.rewrite) return { ...row, why: 'rewritten' };
-    // The CLEAN object itself, rather than a verdict shaped like it, is the
-    // one triage cleared without asking. Saying which of the two happened is
-    // the difference between "the model saw no problem" and "the model never
-    // saw it", and only the second one is a setting you can change.
+    // CLEAN itself (not a verdict shaped like it) means triage cleared it and the
+    // model never saw it, which is something a setting can change.
     if (known === CLEAN) return { ...row, why: `read as written; ${triageLine(text, settings)}` };
     if (known) return { ...row, why: 'the model read it and left it as written' };
     if (matchesAny(CONFIG.ignoreChannels, channel)) return { ...row, why: 'channel is on the ignore list' };
     if (paused) return { ...row, why: 'paused' };
     if (row.state === 'pending') return { ...row, why: 'waiting on the model' };
-    if (row.state === 'error') return { ...row, why: 'the model call failed' };
+    if (row.state === 'error') return { ...row, why: 'the model call failed; it is asked again after a minute' };
 
     const me = selfName();
     if ((me && sender === me) || matchesAny(CONFIG.selfNames, sender)) return { ...row, why: 'written by you' };
@@ -1065,21 +1010,16 @@
     }
 
     setAttr(item, ATTR_STATE, p.state || 'clean');
+    if (p.state === 'error' && p.key) failedItems.set(item, p.key);
     clearItem(item, body);
   }
 
   /*
-   * The calls in the air, and every copy of a message waiting on one.
-   *
-   * The same words can be on screen more than once — a message and its copy in
-   * a thread, the same announcement in two channels — and they are one
-   * question, so the second copy joins the first one's call rather than paying
-   * for its own. That makes the second copy something that has to be woken up
-   * when the answer lands: it never asked, so nothing else would tell it, and
-   * a message left in `pending` is a message you are being kept from reading.
-   * Which copies are waiting is therefore tracked rather than inferred from
-   * the DOM, because the thing they have in common is their words, and the
-   * signatures the DOM knows them by can differ by a line of whitespace.
+   * Calls in flight, and the content signatures waiting on each. The same text
+   * on screen twice (a thread copy, a cross-post) shares one call, so the other
+   * copies must be woken explicitly when it lands or they stay pending. Tracked
+   * here rather than read from the DOM because copies with the same verdict key
+   * can have signatures that differ by whitespace.
    */
   const inFlight = new Map(); // verdict key -> the content signatures waiting on it
 
@@ -1103,12 +1043,18 @@
     }
     inFlight.set(p.key, new Set([p.sig]));
 
-    ask({ text: p.text, sender: p.sender, channel: p.channel }).then((verdict) => {
-      if (verdict.error) log('daemon error', verdict.error);
+    // Never leave a message hidden behind a hold that will not lift.
+    const fail = () => {
+      markFailed(p.key);
+      for (const item of waitingItems(p.key, p.sig)) {
+        if (item.getAttribute(ATTR_STATE) === 'pending') setAttr(item, ATTR_STATE, 'error');
+        failedItems.set(item, p.key);
+      }
+    };
 
-      // A verdict that lands after a pause began says nothing about the
-      // message, only about the pause. Remembering it would leave this message
-      // unexamined for as long as the page lived, long after resuming.
+    ask({ text: p.text, sender: p.sender, channel: p.channel }).then((verdict) => {
+      // A verdict landing during a pause says nothing about the message. Caching
+      // it would leave the message unexamined after resuming.
       if (paused || verdict.reason === 'paused') {
         for (const item of waitingItems(p.key, p.sig)) {
           dirty.add(item);
@@ -1118,22 +1064,26 @@
         return;
       }
 
+      // The daemon could not judge it (claude failing, budget reached). Not
+      // remembered, so it is retried after RETRY_FAILED_MS.
+      if (verdict.error) {
+        log('daemon error', verdict.error);
+        fail();
+        return;
+      }
+
       remember(p.key, verdict);
       link(p.skey, p.key);
       persistSoon();
     }).catch((err) => {
       log('ask failed', err.message);
-      // Never leave a message hidden behind a hold that will not lift.
-      for (const item of waitingItems(p.key, p.sig)) {
-        if (item.getAttribute(ATTR_STATE) === 'pending') setAttr(item, ATTR_STATE, 'error');
-      }
+      fail();
     }).finally(() => {
       const items = waitingItems(p.key, p.sig);
       inFlight.delete(p.key);
       for (const item of items) {
-        // `pending` is a state an item can only be talked out of: it is
-        // checked before the text is read, so a copy still wearing it would
-        // never look at the answer that has just arrived.
+        // `pending` is checked before the text is read, so it must be cleared or
+        // this copy never sees the answer.
         if (item.getAttribute(ATTR_STATE) === 'pending') item.removeAttribute(ATTR_STATE);
         dirty.add(item);
       }
@@ -1147,8 +1097,7 @@
 
   function flush() {
     ensureStyle();
-    // Worked out before the early return: switching to an empty channel makes
-    // nothing dirty, and the button still has to follow you there.
+    // Before the early return: the button must follow a switch to an empty channel.
     const channel = channelName();
     // One lookup per column per pass, rather than one per message.
     const ctx = { channel, memo: new Map() };
@@ -1204,31 +1153,31 @@
   const observer = new MutationObserver((records) => {
     for (const rec of records) {
       if (rec.type === 'attributes') {
-        // Our own attributes come back as records too. Re-planning the item is
-        // how a hold Slack stripped gets re-asserted; `plan` is idempotent, so
-        // an attribute that is already right ends the loop rather than
-        // extending it.
+        // Our own attributes come back too. Re-planning re-asserts a hold Slack
+        // stripped; `plan` is idempotent, so a correct attribute ends the loop.
         if (rec.target.nodeType === 1) collect(rec.target);
         continue;
       }
       collect(rec.target);
       rec.addedNodes.forEach(collect);
     }
-    // Synchronous: MutationObserver callbacks run before the browser paints,
-    // which is the whole reason the original never gets a frame on screen.
+    // Synchronous: observer callbacks run before paint, so the original never
+    // gets a frame.
     flush();
   });
 
-  observer.observe(document.documentElement, {
+  // The document rather than <html>: on a new document this runs before
+  // <html> exists, and observing null would throw and stop the script here.
+  observer.observe(document, {
     childList: true,
     subtree: true,
     attributes: true,
     attributeFilter: Array.from(OUR_ATTRS),
   });
+  cleanups.push(() => observer.disconnect());
 
-  // Scrolling reveals items that were already in the DOM but too far away to
-  // be worth a call. A frame callback, not a timer: it still lands before the
-  // paint that would show the original.
+  // Scrolling brings already-rendered items into range. rAF rather than a timer,
+  // so it still lands before paint.
   let frame = null;
   function onScroll() {
     if (frame) return;
@@ -1241,28 +1190,22 @@
       }
     });
   }
-  window.addEventListener('scroll', onScroll, { capture: true, passive: true });
-  window.addEventListener('resize', onScroll, { passive: true });
+  listen(window, 'scroll', onScroll, { capture: true, passive: true });
+  listen(window, 'resize', onScroll, { passive: true });
 
   // Backstop: the virtual list sometimes settles without a mutation we see.
-  setInterval(() => {
+  every(SWEEP_MS, () => {
     try {
       ensureStyle();
       sweep();
     } catch (err) {
       log('sweep failed', err.message);
     }
-  }, SWEEP_MS);
+  });
 
   /*
-   * Say what is being found, so a Slack that has moved under us is noticeable.
-   *
-   * The failure this exists for is silent by construction: Slack renames a
-   * class, the page stops finding message bodies, and the daemon goes on
-   * reporting that it is watching three windows. List items with no bodies
-   * inside them is the signature — the list is still the list and the words
-   * are not where they were. Finding no list items at all is not evidence of
-   * anything, and is deliberately not reported as a problem.
+   * Report list items against bodies found: items without bodies usually mean a
+   * renamed class. No items is not reported, as an empty channel looks the same.
    */
   const HEALTH_MS = 60_000;
   function reportHealth() {
@@ -1272,27 +1215,21 @@
     for (const item of items) if (bodyFor(item)) bodies += 1;
     ask({ op: 'health', items: items.length, bodies }).catch(() => {});
   }
-  const healthTimer = setInterval(() => {
+  function safeReportHealth() {
     try {
       reportHealth();
     } catch (err) {
       log('health failed', err.message);
     }
-  }, HEALTH_MS);
-  healthTimer.unref?.();
-  // Once early, so a layout change is noticed in the first minute rather than
-  // after it.
-  setTimeout(() => {
-    try {
-      reportHealth();
-    } catch {
-      // Nothing here is worth failing a render over.
-    }
-  }, 4000);
+  }
+  every(HEALTH_MS, safeReportHealth);
+  // Once early, so a layout change is noticed in the first minute.
+  const firstHealth = setTimeout(safeReportHealth, 4000);
+  cleanups.push(() => clearTimeout(firstHealth));
 
-  window.addEventListener('keydown', (event) => {
+  listen(window, 'keydown', (event) => {
     if (!(event.metaKey && event.shiftKey)) return;
-    if (event.key.toLowerCase() !== 'u') return;
+    if (String(event.key || '').toLowerCase() !== 'u') return;
     event.preventDefault();
     setAll(!revealAll);
   });
@@ -1300,26 +1237,12 @@
   /* -------------------------------------------------------- notifications */
 
   /*
-   * The message you actually get hit with first.
-   *
-   * Everything else here happens once you are looking at the channel. A
-   * notification arrives before that, in the corner of the screen, in full —
-   * which is the one place a calmer reading layer is least able to help and
-   * most needed. Slack raises its notifications from the renderer, so the
-   * constructor can be wrapped like anything else on the page.
-   *
-   * A suspected body is held rather than shown and corrected: raising the
-   * original and replacing it a second later would be strictly worse than not
-   * trying, because you would have read it by then. So the real notification
-   * is not created until the verdict lands, a stand-in stands in for it
-   * meanwhile, and a verdict that does not arrive within DEFER_MAX_MS gives
-   * up and raises the original — a notification that never arrives is a
-   * message you never knew about, which is the one outcome worse than a
-   * hostile banner.
-   *
-   * If a Slack build raises notifications from its main process instead, none
-   * of this runs and nothing breaks; the count in the menu bar stays at zero,
-   * which is how you can tell.
+   * Slack raises notifications from the renderer, so the constructor can be
+   * wrapped. A suspect notification is held behind a Deferred stand-in until the
+   * verdict lands, as correcting it after it has been read is pointless. The wait
+   * is capped at DEFER_MAX_MS, then the original is raised: a lost notification
+   * is worse than a hostile one. If a Slack build raises notifications from its
+   * main process, none of this runs and the menu bar count stays at zero.
    */
   const DEFER_MAX_MS = 2500;
 
@@ -1335,8 +1258,7 @@
     const Native = window.Notification;
     if (typeof Native !== 'function' || Native.__slacken) return;
 
-    // Deliberately not a class: a stand-in is returned instead of `this` for a
-    // held notification, which a class constructor cannot do.
+    // Not a class: it returns a stand-in instead of `this` for held notifications.
     function Slackened(title, options) {
       const opts = options || {};
       const body = typeof opts.body === 'string' ? opts.body.trim() : '';
@@ -1368,8 +1290,7 @@
       return pending;
     }
 
-    // Everything a page can legitimately ask the constructor about is the
-    // native one's business, not ours.
+    // Static members defer to the native constructor.
     for (const name of ['permission', 'maxActions']) {
       try {
         Object.defineProperty(Slackened, name, { get: () => Native[name], configurable: true });
@@ -1383,13 +1304,16 @@
 
     try {
       window.Notification = Slackened;
+      cleanups.push(() => {
+        if (window.Notification === Slackened) window.Notification = Native;
+      });
     } catch (err) {
       log('could not wrap Notification', err.message);
     }
   }
 
-  // Stands in for a notification that has not been raised yet: it remembers
-  // what was done to it and does the same to the real one when it appears.
+  // Stand-in for a held notification. Records listeners and handlers and
+  // replays them onto the real one when it is raised.
   class Deferred {
     constructor(Native, title, options) {
       this.Native = Native;
@@ -1399,8 +1323,7 @@
       this.closed = false;
       this.listeners = [];
       this.handlers = {};
-      // A notification that is never raised is a message you never heard
-      // about, so the wait has an end whatever happens upstream.
+      // Always raise it eventually, whatever happens upstream.
       this.timer = setTimeout(() => this.settle(null), DEFER_MAX_MS);
     }
 
@@ -1458,17 +1381,9 @@
   /* --------------------------------------------------------------- drafts */
 
   /*
-   * The one thing here that looks at what you wrote.
-   *
-   * Off unless you turn it on, and even then it changes nothing: it offers a
-   * flatter wording above the composer and waits. Slacken's whole promise is
-   * that it does not touch what you write, and an editor that rewrote your
-   * message as you typed would break that promise whatever the wording came
-   * out like. Nothing is sent, nothing is replaced until you click, and the
-   * offer disappears the moment you dismiss it.
-   *
-   * Only tone is offered, never condensing: how long your own message is, is
-   * your business.
+   * The only feature that reads what you write. Off by default, and it only
+   * offers a flatter wording above the composer: nothing is sent or replaced
+   * until you click. Tone only, never condensing.
    */
   const DRAFT_DEBOUNCE_MS = 1200;
   const DRAFT_MIN_WORDS = 6;
@@ -1483,8 +1398,7 @@
 
   function scheduleDraftCheck(composer) {
     clearTimeout(draftTimer);
-    // On a pause, when it is off, or in a channel Slacken leaves alone, this
-    // is not a delay — it is nothing at all.
+    // Off or paused: hide now rather than schedule.
     if (!CONFIG.draftCheck || paused) {
       hideDraft(composer);
       return;
@@ -1510,8 +1424,7 @@
     if (matchesAny(CONFIG.ignoreChannels, channel)) return;
     const settings = settingsFor(channel);
     if (text.length > settings.maxChars) return;
-    // Only the tone half of triage: a long message of your own is not
-    // something to be talked out of.
+    // Tone only: the length of your own message is not flagged.
     if (heuristicScore(text) < settings.triageThreshold) {
       hideDraft(composer);
       return;
@@ -1587,13 +1500,9 @@
   }
 
   /*
-   * Typed rather than assigned.
-   *
-   * Slack's composer is a rich text editor with its own model of what is in
-   * it, so writing textContent leaves the editor believing the old text is
-   * still there and the next keystroke puts it back. An insertText command is
-   * an edit the editor performs itself — which also means it lands in its
-   * undo stack, so Cmd-Z gives you your own words back.
+   * insertText rather than setting textContent: Slack's editor keeps its own
+   * model and would restore the old text on the next keystroke. It also leaves
+   * the change on the undo stack.
    */
   function replaceDraft(composer, rewrite) {
     composer.focus();
@@ -1609,16 +1518,15 @@
     }
   }
 
-  document.addEventListener('input', (event) => {
+  listen(document, 'input', (event) => {
     const target = event.target;
     if (!target || target.nodeType !== 1) return;
     const composer = target.closest?.(SEL.composer);
     if (composer) scheduleDraftCheck(composer);
   }, true);
 
-  // What `slacken inspect` reads. `missed` is the important number: message
-  // bodies on the page that no list item of ours contains, which is what a
-  // Slack layout we do not recognise looks like from here.
+  // Read by `slacken inspect`. `missed` counts message bodies outside any list
+  // item, which is what an unrecognised Slack layout looks like.
   window.__slackenInspect = () => {
     const items = Array.from(document.querySelectorAll(SEL.item));
     const missed = Array.from(document.querySelectorAll(`${SEL.content}, ${SEL.blocks}`))
@@ -1643,17 +1551,15 @@
     };
   };
 
-  // Called by the daemon whenever the pause state changes, and once at
-  // injection time via CONFIG.paused.
+  // Called by the daemon on pause changes; the initial state is CONFIG.paused.
   window.__slackenSetPaused = (on) => {
     const next = Boolean(on);
     if (next === paused) return;
     paused = next;
 
     if (paused) {
-      // A hold with no verdict coming is just a message you cannot read, so
-      // release those outright; rewrites already decided keep their badge and
-      // simply show the original.
+      // Release pending holds (no verdict is coming). Decided rewrites keep their
+      // badge and show the original.
       releaseHolds();
       setAll(true);
       log('paused: showing every original');
@@ -1661,9 +1567,8 @@
       return;
     }
 
-    // Anything the pause left unexamined — or released only because we were
-    // paused — deserves a second look. Messages already rewritten keep their
-    // verdict, so resuming costs nothing for what was decided before.
+    // Re-examine anything the pause left unexamined or released. Decided messages
+    // keep their verdicts.
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((el) => {
       const state = el.getAttribute(ATTR_STATE);
       if (state === 'done' || state === 'skipped') return;
@@ -1675,10 +1580,8 @@
     sweep();
   };
 
-  // Every verdict we are holding was reached under settings that have just
-  // changed, so none of them answers the question being asked now. The stored
-  // copies go too, or a reload would repaint decisions made under the old
-  // rules.
+  // Settings changed, so every verdict is stale. Stored copies go too, or a
+  // reload would repaint decisions made under the old rules.
   function forget() {
     document.querySelectorAll(`[${ATTR_STATE}]`).forEach((item) => {
       item.removeAttribute(ATTR_STATE);
@@ -1688,8 +1591,7 @@
     verdicts.clear();
     sigs.clear();
     revealed.clear();
-    // The per-channel answers were worked out from the settings that have
-    // just moved.
+    failures.clear();
     settingsCache.clear();
     try {
       window.localStorage.removeItem(STORE_KEY);
@@ -1698,8 +1600,7 @@
     }
   }
 
-  // Called by the daemon whenever a setting changes, wherever it was changed:
-  // the menu bar, the terminal, or the button in another Slack window.
+  // Called by the daemon on any settings change (menu bar, CLI, another window).
   window.__slackenSetConfig = (json) => {
     let next;
     try {
@@ -1707,9 +1608,7 @@
     } catch {
       return;
     }
-    // Pausing has its own path, and its own careful handling of messages
-    // caught mid-verdict. It arrives here only because it rides along in the
-    // same payload.
+    // Pause has its own path (__slackenSetPaused); it only rides along here.
     delete next.paused;
     Object.assign(CONFIG, next);
     log('settings changed', CONFIG);
@@ -1717,19 +1616,40 @@
     sweep();
   };
 
-  // Asked for by the daemon, or by a test that would rather not wait a minute
-  // for the timer.
-  window.__slackenReportHealth = () => {
-    try {
-      reportHealth();
-    } catch (err) {
-      log('health failed', err.message);
-    }
-  };
+  // For the daemon, or a test that would rather not wait for the timer.
+  window.__slackenReportHealth = safeReportHealth;
 
   window.__slackenRescan = () => {
     forget();
     sweep();
+  };
+
+  // Restore the page as Slack drew it and unhook everything. Verdicts persist in
+  // localStorage, so the replacement repaints without asking again.
+  window.__slackenTeardown = () => {
+    persistNow();
+    for (const undo of cleanups.splice(0)) {
+      try {
+        undo();
+      } catch {
+        // Keep undoing the rest.
+      }
+    }
+    if (frame) cancelAnimationFrame(frame);
+    clearTimeout(draftTimer);
+    for (const waiter of pending.values()) clearTimeout(waiter.timer);
+    pending.clear();
+    document.querySelectorAll(`[${ATTR_STATE}], [${ATTR_HOLD}]`).forEach((item) => {
+      item.removeAttribute(ATTR_STATE);
+      item.removeAttribute(ATTR_HASH);
+      clearItem(item, bodyFor(item));
+    });
+    document.querySelectorAll(`[${ATTR_BODY}]`).forEach((el) => el.removeAttribute(ATTR_BODY));
+    document.querySelectorAll('.slacken-panel, .slacken-draft').forEach((el) => el.remove());
+    channelButton?.remove();
+    document.getElementById(STYLE_ID)?.remove();
+    delete window.__slackenTeardown;
+    window.__SLACKEN__ = false;
   };
 
   loadStore();

@@ -16,19 +16,9 @@ export const SOURCE_PATH = path.join(HERE, '..', 'menubar', 'SlackenMenuBar.swif
 export const BUILD_DIR = path.join(HOME_DIR, 'menubar');
 
 /*
- * The menu bar item is a small AppKit program, and everything interesting
- * about it lives here rather than there.
- *
- * The helper knows how to draw a menu and how to report a click. What the menu
- * says — the wording, the counts, which action the toggle offers — is decided
- * in Node and handed over as JSON. That keeps the Swift small enough to read
- * in one sitting, and keeps the part that can actually be wrong under test on
- * every platform, not just on a Mac with a screen.
- *
- * Settings work the same way. A settings item carries the value it would set
- * and the endpoint to send it to, so the helper never has to know what a
- * setting means, what a legal value for it is, or which one is in force: it
- * draws the checkmark it is told to draw and posts the body it was given.
+ * The menu bar item is a small AppKit helper that draws whatever menu it is
+ * given and posts whatever body a clicked item carries. Everything it says is
+ * decided here, in Node, where it is testable on any platform.
  */
 
 const ICON_RUNNING = 'text.bubble';
@@ -52,9 +42,7 @@ export function menuModel(status) {
   const seen = (stats.batched || 0) + (stats.cacheHits || 0);
   const rewrote = (stats.softened || 0) + (stats.condensed || 0);
 
-  // Drift outranks the count: a daemon happily watching three windows and
-  // finding nothing in any of them is the failure this line exists to catch,
-  // and "Watching 3 Slack windows" is exactly what it looks like otherwise.
+  // Drift outranks the window count, which would otherwise look healthy.
   const headline = paused
     ? 'Paused — showing every message as written'
     : drifted
@@ -76,19 +64,16 @@ export function menuModel(status) {
     { label: `${money(stats.costUsd || 0)} today${dailyBudgetUsd > 0 ? ` of ${money(dailyBudgetUsd)}` : ''}`, enabled: false },
   ];
 
-  // How often you asked for the words back. The one number here that is about
-  // whether Slacken is getting it right rather than how much it is doing.
+  // How often an original was asked for back: the one number about whether
+  // the rewrites are wanted.
   if (stats.reveals) {
     items.push({ label: `${count(stats.reveals, 'original')} asked for back`, enabled: false });
   }
-  // Only worth saying once there is any evidence either way: on a Slack that
-  // raises its notifications somewhere we cannot reach, this stays at zero and
-  // says so by being absent.
+  // Absent while zero: some Slack builds raise notifications out of reach.
   if (stats.notifications) {
     items.push({ label: `${count(stats.notifications, 'notification')} checked before it arrived`, enabled: false });
   }
 
-  // Only worth a line when there is something to say.
   if (lastError?.hint) items.push({ label: lastError.hint, enabled: false });
   else if (stats.errors) items.push({ label: `${count(stats.errors, 'error')} — see the log`, enabled: false });
 
@@ -101,10 +86,7 @@ export function menuModel(status) {
     { label: 'Recent changes…', open: HISTORY_PATH },
     { label: 'Open log…', open: LOG_PATH },
     { separator: true },
-    // Off and on again, for the times that is genuinely the fix: a claude that
-    // moved after login, an upgrade sitting on disk unread, a daemon that has
-    // been up all week. The icon goes away with the daemon and comes back with
-    // it, which is the honest thing for it to do.
+    // Picks up an upgrade on disk or a claude that moved since login.
     { label: 'Restart Slacken', post: '/restart' },
     { label: 'Hide menu bar item', quit: true },
   );
@@ -114,8 +96,7 @@ export function menuModel(status) {
     // Drawn instead of the icon on a Mac too old for SF Symbols.
     fallback: paused ? 'Slacken ‖' : 'Slacken',
     tooltip: `Slacken — ${headline}`,
-    // Paused and unattached both mean nothing is being changed right now, and
-    // the icon dims to say so without needing the menu opened.
+    // Dimmed whenever nothing is being changed.
     dimmed: paused || attached === 0,
     items,
   };
@@ -123,13 +104,8 @@ export function menuModel(status) {
 
 /* --------------------------------------------------------------- settings */
 
-/*
- * Everything you would otherwise open the config file to change.
- *
- * Only settings that take effect on a running daemon are here. A port or a URL
- * pattern cannot be changed under a live connection, so those stay in the file
- * — and the file is one click away at the bottom for exactly that reason.
- */
+// Every setting that applies to a running daemon; the rest are one click away
+// in the config file.
 export function settingsMenu(config) {
   return [
     { label: 'What gets rewritten', enabled: false },
@@ -166,8 +142,7 @@ function toggle(key, config) {
     label: SETTINGS[key].label,
     checked: on,
     post: '/config',
-    // The value to set, not the change to make: two clicks racing each other
-    // land on the same answer instead of flipping it twice.
+    // The value to set rather than a flip, so two racing clicks agree.
     body: { [key]: !on },
   };
 }
@@ -184,9 +159,7 @@ function choice(key, config) {
     body: { [key]: c.value },
   }));
 
-  // A value set by hand in the config file is not one of the choices offered,
-  // and must not disappear from the menu — or silently lose its checkmark —
-  // just because we did not think to offer it.
+  // A hand-set value that is not one of the choices is still shown.
   if (!known && current !== undefined) {
     items.push({ separator: true }, { label: `Set to ${format(current)} in the config file`, enabled: false });
   }
@@ -201,9 +174,7 @@ function list(key, config) {
   const items = entries.map((entry) => ({
     label: entry,
     checked: true,
-    // Clicking an entry stops it being ignored, which is the only thing you
-    // can do to one from here. Adding a channel happens in Slack, where you
-    // can see which channel you mean.
+    // Clicking an entry un-ignores it. Adding one happens from inside Slack.
     post: '/ignore',
     body: { list: key, value: entry, ignored: false },
   }));
@@ -214,16 +185,8 @@ function list(key, config) {
   return { label: `${spec.label}: ${entries.length || 'none'}`, submenu: items };
 }
 
-/*
- * The channels that have been told to behave differently.
- *
- * A channel gets in here by being given a setting of its own, not by being
- * read: a submenu of every channel you have ever opened would be a list of
- * your Slack, drawn in the menu bar, which is nobody's idea of a settings
- * screen. Each one carries the same choices as the global setting it
- * overrides, so there is nothing new to learn, and a way back to the global
- * answer, because an override you cannot remove is a trap.
- */
+// Channels with settings of their own, each with the same choices as the
+// global setting and a way back to it.
 export function channels(config) {
   const overrides = config.channelOverrides || {};
   const names = Object.keys(overrides);
@@ -310,13 +273,11 @@ function duration(ms) {
 
 /* ------------------------------------------------------------------ build */
 
-// Built on demand and cached by the hash of the source, so editing the Swift
-// rebuilds it and an unchanged one never pays for a compile.
+// Built on demand and cached by a hash of the source.
 export async function buildHelper({
   sourcePath = SOURCE_PATH,
   buildDir = BUILD_DIR,
-  // Overridable so the caching and cleanup around the compile can be tested
-  // on a machine that has no Swift on it.
+  // Overridable for tests on machines without Swift.
   compiler = 'swiftc',
 } = {}) {
   const source = fs.readFileSync(sourcePath, 'utf8');
@@ -325,8 +286,7 @@ export async function buildHelper({
   if (fs.existsSync(binary)) return binary;
 
   fs.mkdirSync(buildDir, { recursive: true });
-  // A partial binary from an interrupted compile must never look like a
-  // finished one, so build beside the real name and move it into place.
+  // Built beside the real name, so an interrupted compile never looks finished.
   const temp = `${binary}.building`;
   try {
     await execFileAsync(compiler, ['-O', '-o', temp, sourcePath], { timeout: 180_000 });
@@ -355,9 +315,10 @@ function swiftcMessage(err) {
 
 /* ------------------------------------------------------------------- host */
 
-// A helper that keeps falling over should not be restarted forever; two goes
-// is enough to ride out a transient failure and few enough to be obvious.
+// Crash restarts allowed in a row. A helper that stays up for STABLE_MS
+// earns its allowance back, so rare crashes over weeks never exhaust it.
 const MAX_RESTARTS = 2;
+const STABLE_MS = 10 * 60_000;
 
 export class MenuBar {
   constructor({ config, onEvent, token = null, restartDelayMs = 2000 }) {
@@ -387,27 +348,30 @@ export class MenuBar {
 
   spawn(binary) {
     if (this.stopped) return;
-    // stdin is the lifeline: the helper exits the moment this pipe closes, so
-    // a daemon that is killed outright cannot leave an icon behind.
-    this.child = spawn(binary, ['--port', String(this.config.httpPort)], {
+    // The helper exits when its stdin closes, so a daemon killed outright
+    // cannot leave an icon behind.
+    const child = spawn(binary, ['--port', String(this.config.httpPort)], {
       stdio: ['pipe', 'ignore', 'pipe'],
-      // The token goes in the environment rather than in argv, where `ps`
-      // would show it to every process on the machine — which is the thing
-      // the token exists to keep the control API away from.
+      // In the environment rather than argv, where `ps` would show it.
       env: { ...process.env, ...(this.token ? { SLACKEN_TOKEN: this.token } : {}) },
     });
-    this.child.stderr.on('data', (d) => {
+    this.child = child;
+    const startedAt = Date.now();
+    // Writing to or closing the pipe of a helper that has already died raises
+    // EPIPE here; unhandled, that would take the daemon down with it.
+    child.stdin.on('error', () => {});
+    child.stderr.on('data', (d) => {
       this.onEvent({ type: 'menubar-error', message: String(d).trim() });
     });
-    this.child.on('error', (err) => {
+    child.on('error', (err) => {
       this.onEvent({ type: 'menubar-error', message: err.message });
     });
-    this.child.on('exit', (code, signal) => {
-      this.child = null;
+    child.on('exit', (code, signal) => {
+      if (this.child === child) this.child = null;
       if (this.stopped) return;
-      // "Hide menu bar item" quits cleanly and means it. A crash does not, and
-      // is worth another go or two before we leave the user without an icon.
+      // "Hide menu bar item" exits cleanly and is respected; a crash is retried.
       const crashed = code !== 0 || signal !== null;
+      if (Date.now() - startedAt >= STABLE_MS) this.restarts = 0;
       if (crashed && this.restarts < MAX_RESTARTS) {
         this.restarts += 1;
         this.onEvent({ type: 'menubar-error', message: `helper exited (${signal || code}), restarting` });
@@ -424,10 +388,7 @@ export class MenuBar {
     const child = this.child;
     if (!child) return;
     this.child = null;
-    // Closing stdin is the way it is asked to go, and the way it notices a
-    // daemon that died without asking. SIGTERM is only a backstop for a helper
-    // wedged badly enough not to see the EOF, and is unref'd so waiting for it
-    // can never hold the daemon open past its own exit.
+    // Closing stdin asks it to go; SIGTERM is the backstop for a wedged one.
     child.stdin.end();
     const timer = setTimeout(() => child.kill('SIGTERM'), 500);
     timer.unref?.();

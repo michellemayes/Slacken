@@ -1,33 +1,24 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { coerceAll, coerceChannelPatch, inList, withEntry, channelKey, forChannel } from './settings.js';
+import {
+  SETTINGS, coerce, coerceAll, coerceChannelPatch, inList, withEntry, channelKey, forChannel,
+} from './settings.js';
+import { writeFileAtomic } from './fsutil.js';
 
 export const HOME_DIR = path.join(os.homedir(), '.slacken');
 export const CONFIG_PATH = path.join(HOME_DIR, 'config.json');
 
 /*
- * Bumped when a default moves in a way an existing config file would hide.
- *
- * The file is written out in full on first run, which is friendly — every
- * setting is there to read and edit — and has one consequence: every key is
- * pinned, including the ones nobody chose. A default that moves afterwards
- * reaches new installs and nobody else, which for a change made because it was
- * measured to be slow is the same as not making it.
+ * Bumped when a default moves. The config file is written out in full on
+ * first run, which pins every key — so a moved default would otherwise only
+ * reach new installs.
  */
 export const CONFIG_VERSION = 2;
 
-/*
- * Defaults that have moved, and the value they used to hold.
- *
- * A key is only rewritten if it still holds exactly the old default: that is
- * a leftover, not a decision. A value you chose is yours, even when it happens
- * to be slower, and the version stamp means none of this happens twice.
- */
+// Defaults that have moved, and the value they used to hold. Only a key still
+// holding exactly the old default is brought forward; a value you chose stays.
 const SUPERSEDED_DEFAULTS = {
-  // On for every call until it was measured: a second model turn and ~730
-  // input tokens, ~1.2s a message, to prevent something a retry already
-  // catches.
   useJsonSchema: true,
 };
 
@@ -60,17 +51,12 @@ export const DEFAULTS = {
   // ~650ms and $0.00068 a message.
   batchSize: 8,
   batchWindowMs: 120,
-  // How long the same wait lasts with no call already out — a message that
-  // arrives on its own in a channel you are reading, where the window fills
-  // nothing and you are watching it pass. Long enough to still collect a burst
-  // that rendered in one frame.
+  // The window with no call already out: long enough to collect a burst that
+  // rendered in one frame, short enough that a lone message is not kept waiting.
   batchWindowIdleMs: 25,
   maxConcurrency: 2,
-  // Hold the model to the response schema on every call. Measured at a second
-  // model turn and ~730 extra input tokens — about 1.2s a message — to prevent
-  // something that almost never happens, so it is off: output that does not
-  // parse is asked again with the schema instead, which puts the cost on the
-  // failure rather than on every message.
+  // Hold the model to the response schema on every call. Off because it costs
+  // ~1.2s a message; output that does not parse is retried with the schema.
   useJsonSchema: false,
   // Stop calling the model once a day costs this much. 0 disables the cap.
   dailyBudgetUsd: 0,
@@ -111,15 +97,11 @@ export const DEFAULTS = {
   // Edited with `slacken channel`, from the menu bar, or here by hand.
   channelOverrides: {},
 
-  // Rewrite the body of a Slack notification before it is shown, rather than
-  // catching the message only once you are looking at the channel. Depends on
-  // Slack raising notifications from its renderer; the menu says how many have
-  // actually been seen, so you can tell whether it is doing anything.
+  // Rewrite a notification's body before it is shown. Only works where Slack
+  // raises notifications from its renderer; the menu counts how many it saw.
   rewriteNotifications: true,
-  // Look at what you are about to send, and offer a flatter wording if it
-  // reads sharp. Off by default: Slacken's whole promise is that it does not
-  // touch what you write, and this is the one thing that comes near it. It
-  // never edits or sends anything on its own even when it is on.
+  // Offer a flatter wording above the composer when your own draft reads
+  // sharp. Off by default; it never edits or sends anything by itself.
   draftCheck: false,
 
   // Append every rewrite, and every original you ask for back, to
@@ -137,7 +119,61 @@ export const DEFAULTS = {
 };
 
 export function loadConfig(file = CONFIG_PATH) {
-  return { ...DEFAULTS, ...readConfigFile(file) };
+  return { ...DEFAULTS, ...validated(readConfigFile(file), file) };
+}
+
+// Settings outside SETTINGS that are still numbers the daemon depends on, and
+// the smallest value each can take.
+const NUMERIC_MINIMUMS = {
+  cdpPort: 1,
+  httpPort: 1,
+  requestTimeoutMs: 1000,
+  retries: 0,
+  batchSize: 1,
+  batchWindowMs: 0,
+  batchWindowIdleMs: 0,
+  maxConcurrency: 1,
+  historyMaxEntries: 10,
+  cacheTtlHours: 0,
+  cacheMaxEntries: 0,
+};
+
+/*
+ * A hand-edited file can hold anything. A value that would break the daemon
+ * (a batchSize of 0, a threshold that is a string) falls back to its default
+ * with a warning, rather than failing later somewhere less obvious.
+ */
+function validated(raw, file) {
+  const out = { ...raw };
+  const reject = (key, why) => {
+    console.warn(`[slacken] ignoring ${key} in ${file}: ${why}; using ${JSON.stringify(DEFAULTS[key])}`);
+    delete out[key];
+  };
+  for (const [key, value] of Object.entries(raw)) {
+    if (SETTINGS[key]) {
+      try {
+        out[key] = coerce(key, value);
+      } catch (err) {
+        reject(key, err.message);
+      }
+    } else if (key in NUMERIC_MINIMUMS) {
+      const n = Number(value);
+      if (typeof value === 'boolean' || !Number.isFinite(n) || n < NUMERIC_MINIMUMS[key]) {
+        reject(key, `expected a number of at least ${NUMERIC_MINIMUMS[key]}`);
+      } else {
+        out[key] = n;
+      }
+    } else if (key === 'claudeArgs' && !Array.isArray(value)) {
+      reject(key, 'expected a list of arguments');
+    } else if (key === 'targetUrlPattern') {
+      try {
+        new RegExp(value, 'i'); // eslint-disable-line no-new
+      } catch (err) {
+        reject(key, err.message);
+      }
+    }
+  }
+  return out;
 }
 
 function readConfigFile(file) {
@@ -162,18 +198,10 @@ export function writeDefaultConfig() {
   return CONFIG_PATH;
 }
 
-/*
- * Bring a config file written by an older Slacken up to date, once.
- *
- * Only keys still holding a previous version's default are touched, and the
- * file is stamped so this cannot happen a second time — including to a value
- * you set back by hand afterwards. Returns what it changed, so startup can say
- * so rather than quietly moving a setting under you.
- */
+// Bring a file from an older Slacken up to date, once, and say what moved.
 export function migrateConfig(file = CONFIG_PATH) {
   const raw = readConfigFile(file);
-  // Missing, empty or unreadable. There is nothing here to bring forward, and
-  // guessing at a file we could not parse would be worse than leaving it.
+  // Missing, empty or unreadable: leave it exactly as it is.
   if (!Object.keys(raw).length) return { changed: [] };
   if (Number(raw.configVersion) >= CONFIG_VERSION) return { changed: [] };
 
@@ -198,27 +226,17 @@ export function migrateConfig(file = CONFIG_PATH) {
   return { changed };
 }
 
-// Written beside the real file and moved into place, so a process killed
-// mid-write cannot leave half a config to be read at the next login.
 function writeConfigFile(file, values) {
-  const temp = `${file}.writing`;
-  fs.writeFileSync(temp, JSON.stringify(values, null, 2) + '\n');
-  fs.renameSync(temp, file);
+  writeFileAtomic(file, JSON.stringify(values, null, 2) + '\n');
 }
 
 /*
- * The running configuration, and the only thing allowed to change it.
+ * The running configuration, and the only thing allowed to change it. The
+ * menu bar, the button in Slack and the terminal all go through here: a
+ * change is validated, written to disk, and announced.
  *
- * Settings are adjusted from the menu bar, from a button inside Slack and from
- * the terminal, which means three places could each hold their own idea of
- * what Slacken is currently doing. They do not: they all go through one store,
- * which validates the change, writes it to the config file so it survives a
- * restart, and tells everyone holding the config that it moved.
- *
- * The values object is mutated in place rather than replaced. The moderator,
- * the attacher and the HTTP server were handed that object at startup and read
- * fields off it as they work, so a change lands on a message being judged
- * right now, without any of them subscribing to anything.
+ * `values` is mutated in place: the moderator, attacher and server hold that
+ * same object, so a change applies to them immediately.
  */
 export class ConfigStore {
   constructor({ file = CONFIG_PATH, values = null, persist = true } = {}) {
@@ -228,11 +246,11 @@ export class ConfigStore {
     this.listeners = new Set();
   }
 
-  // Returns the keys that actually moved, plus anything it refused and why.
-  // A patch is validated whole before any of it is applied: a menu click that
-  // carries one bad value must not leave the other half of it applied.
+  // Returns the keys that moved and anything refused. Nothing is applied if
+  // any of the patch is invalid.
   update(patch) {
     const { values, errors } = coerceAll(patch);
+    if (errors.length) return { changed: [], errors, values: this.values };
     const changed = [];
     for (const [key, value] of Object.entries(values)) {
       if (same(this.values[key], value)) continue;
@@ -246,9 +264,7 @@ export class ConfigStore {
     return { changed, errors, values: this.values };
   }
 
-  // Adding the channel you are reading to the ignore list is the one change
-  // that arrives from inside Slack, and the one that has to be idempotent:
-  // clicking an already-ignoring button twice should not add it twice.
+  // Idempotent: ignoring an already-ignored channel changes nothing.
   setIgnored(key, value, ignored) {
     const entry = String(value ?? '').trim();
     if (!entry) return { changed: [], errors: [{ key, message: 'nothing to ignore' }], values: this.values };
@@ -259,15 +275,8 @@ export class ConfigStore {
     return inList(this.values[key], value);
   }
 
-  /*
-   * Per-channel settings, edited one key at a time.
-   *
-   * Handed the whole map, two clients would overwrite each other's channels
-   * the way they would overwrite each other's ignore list, so this merges the
-   * patch into the channel that is named and leaves the rest of the map
-   * exactly as it was. A patch that empties a channel removes it: an entry
-   * that overrides nothing is not a setting, it is a name in a file.
-   */
+  // Merges a patch into one channel's overrides, leaving other channels as
+  // they were, so two clients cannot overwrite each other.
   setChannel(channel, patch) {
     const name = String(channel ?? '').trim();
     if (!name) {
@@ -280,8 +289,7 @@ export class ConfigStore {
     let merged = false;
     for (const [existing, current] of Object.entries(this.values.channelOverrides || {})) {
       if (channelKey(existing) === channelKey(name)) {
-        // Keep the name it was first written under, so a channel does not
-        // change case in the file because of how it was typed today.
+        // Keep the name as first written, whatever case it was typed in today.
         const combined = { ...current, ...values };
         if (Object.keys(combined).length) next[existing] = combined;
         merged = true;
@@ -309,9 +317,7 @@ export class ConfigStore {
   save(changed) {
     if (!this.persist) return;
     try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      // Merged over what is on disk, so keys we do not know about — and keys
-      // an older version wrote — survive being edited from the menu.
+      // Merged over what is on disk, so keys we do not know about survive.
       const merged = { ...DEFAULTS, ...readConfigFile(this.file) };
       for (const key of changed) merged[key] = this.values[key];
       writeConfigFile(this.file, merged);
@@ -325,7 +331,7 @@ export class ConfigStore {
       try {
         listener(changed, this.values);
       } catch {
-        // A listener that throws must not stop the others being told.
+        // One bad listener must not stop the others hearing about it.
       }
     }
   }
@@ -340,8 +346,7 @@ function same(a, b) {
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((v, i) => v === b[i]);
   }
-  // The per-channel map arrives as a whole new object every time it is
-  // touched, so identity would report a change on every click.
+  // Compared by value: the per-channel map is a new object on every edit.
   if (isPlainObject(a) && isPlainObject(b)) {
     return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
   }
@@ -359,9 +364,8 @@ function sortKeys(value) {
   return out;
 }
 
-// Only the fields the injected page script needs to make triage decisions,
-// plus whether Slacken is paused right now — a page injected during a pause
-// must not start rewriting before the daemon gets a chance to tell it.
+// What the page script needs for triage, plus the pause state, so a page
+// injected during a pause starts paused.
 export function pageConfig(config, { paused = false } = {}) {
   return {
     paused,
