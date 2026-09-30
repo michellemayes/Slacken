@@ -1,21 +1,11 @@
 /*
- * What can be changed while Slacken is running, and what a valid value for it
- * looks like.
- *
- * This is the one description of the adjustable surface. The menu bar builds
- * its settings menu from it, the control API validates against it, and
- * `slacken set` uses it too, so a setting cannot exist in one of those and not
- * the others, and cannot mean something different in each.
- *
- * Everything here takes effect on the running daemon. Settings that would need
- * Slack relaunched or the daemon restarted — the debug port, the HTTP port,
- * the target URL pattern — are deliberately absent: they belong in the config
- * file, where changing one is already a restart.
+ * What can be changed while Slacken is running, and what a valid value looks
+ * like. The menu bar, the control API and `slacken set` all read this one
+ * table. Settings that need a restart (ports, the target URL pattern) are
+ * absent: they live only in the config file.
  */
 
-// `short` is what the menu shows without opening the submenu, so a setting's
-// current value is readable at a glance and the full wording still explains it
-// inside.
+// `short` is what the menu shows beside the setting without opening it.
 const CHOICE = (value, label, short) => ({ value, label, short: short ?? label });
 
 export const SETTINGS = {
@@ -86,8 +76,10 @@ export const SETTINGS = {
     label: 'Model',
     choices: [
       CHOICE('claude-haiku-4-5-20251001', 'Haiku 4.5 — cheapest and fastest', 'Haiku 4.5'),
-      CHOICE('claude-sonnet-5', 'Sonnet 5 — better judgement, slower', 'Sonnet 5'),
-      CHOICE('claude-opus-5', 'Opus 5 — best judgement, priciest', 'Opus 5'),
+      // Aliases the claude CLI resolves to the current model of each tier, so
+      // these choices cannot go stale when a model is retired.
+      CHOICE('sonnet', 'Sonnet — better judgement, slower', 'Sonnet'),
+      CHOICE('opus', 'Opus — best judgement, priciest', 'Opus'),
     ],
   },
 
@@ -159,9 +151,7 @@ export const SETTINGS = {
 
   /* ------------------------------------------------- channel by channel */
 
-  // A map of channel -> a patch of the settings above. Validated with the
-  // same rules as the global ones, because a per-channel setting that could
-  // mean something the global one cannot would be a second surface to learn.
+  // channel -> a patch of CHANNEL_KEYS, validated by the same rules.
   channelOverrides: {
     type: 'channelMap',
     label: 'Per-channel settings',
@@ -169,15 +159,8 @@ export const SETTINGS = {
   },
 };
 
-/*
- * Not every setting can honestly differ per channel.
- *
- * These can: they are decisions about a particular conversation — how hard to
- * look, how harsh is harsh enough, whether to condense at all. The rest are
- * decisions about Slacken itself (which model, what it may spend, whether it
- * holds a message while it thinks), and a channel is the wrong place to keep
- * an answer to those.
- */
+// Settings about a conversation, which can differ per channel. The rest are
+// about Slacken itself (model, budget, holding) and are global.
 export const CHANNEL_KEYS = [
   'triageMode',
   'triageThreshold',
@@ -192,9 +175,7 @@ export function channelKey(channel) {
   return String(channel ?? '').trim().replace(/^#/, '').toLowerCase();
 }
 
-// The settings in force for one channel: the global ones, with that channel's
-// overrides on top. Everything that decides a verdict reads this rather than
-// the config directly, so there is one answer to "what is in force here".
+// The global settings with one channel's overrides on top.
 export function forChannel(config, channel) {
   const overrides = config?.channelOverrides;
   if (!overrides || !channel) return config;
@@ -208,14 +189,9 @@ export function forChannel(config, channel) {
 }
 
 /*
- * What a cached verdict is an answer to.
- *
- * A verdict is stored already judged against the thresholds that were in force
- * when it was made, so the text alone does not identify it: the same message
- * in a channel set to soften only hostility is a different answer from the
- * same message in a channel set to soften a slight edge. Keying the cache by
- * this alongside the text means moving a threshold makes the old verdicts
- * unreachable rather than wrong — and moving it back finds them again.
+ * The thresholds a cached verdict was judged against. Keying the cache by
+ * this as well as the text means moving a threshold makes old verdicts
+ * unreachable rather than wrong, and moving it back finds them again.
  */
 export function gateSignature(config, channel) {
   const c = forChannel(config, channel);
@@ -234,13 +210,8 @@ function pick(source, keys) {
   return out;
 }
 
-/*
- * A patch of per-channel settings, validated as a whole.
- *
- * An unknown setting is refused rather than stored: a typo that sat silently
- * in the config file doing nothing would be worse than one that was refused
- * the moment it was typed, and there is no way to tell them apart later.
- */
+// A patch of per-channel settings. An unknown key is refused rather than
+// stored, so a typo is caught when it is typed.
 export function coerceChannelPatch(patch) {
   const values = {};
   const errors = [];
@@ -258,9 +229,7 @@ export function coerceChannelPatch(patch) {
   return { values, errors };
 }
 
-// A rewrite is cached under the text that produced it, already judged against
-// the thresholds in force at the time. Changing one of those thresholds makes
-// every cached verdict an answer to a question nobody is asking any more.
+// Whether any of these keys moves a threshold cached verdicts depend on.
 export function invalidatesCache(keys) {
   return keys.some((key) => SETTINGS[key]?.invalidatesCache);
 }
@@ -271,11 +240,9 @@ const MAX_LIST = 200;
 const MAX_ENTRY = 200;
 
 /*
- * Values arrive from a menu click, an HTTP client or a shell argument, so they
- * arrive as anything at all. A rejected value leaves the config untouched and
- * says why; nothing here ever coerces a value it does not understand into one
- * it does, because a setting that quietly became something else is worse than
- * one that refused to change.
+ * Values arrive from a menu click, an HTTP client, a shell argument or a
+ * hand-edited file. Anything not clearly valid is refused with a reason,
+ * never guessed at.
  */
 export function coerce(key, raw) {
   const spec = SETTINGS[key];
@@ -317,8 +284,7 @@ export function coerce(key, raw) {
     }
 
     case 'stringList': {
-      // A comma-separated string is what a shell hands over; an array is what
-      // the menu and the API send.
+      // A comma-separated string from a shell, or an array from the API.
       const parts = Array.isArray(raw) ? raw : String(raw).split(',');
       const out = [];
       const seen = new Set();
@@ -346,7 +312,6 @@ export function coerce(key, raw) {
         if (name.length > MAX_ENTRY) throw new Error(`${key} has a channel name that is too long`);
         const { values, errors } = coerceChannelPatch(patch);
         if (errors.length) throw new Error(`${name}: ${errors[0].message}`);
-        // A channel whose overrides are all gone is not an entry any more.
         if (Object.keys(values).length) out[name] = values;
       }
       if (Object.keys(out).length > MAX_LIST) throw new Error(`${key} holds at most ${MAX_LIST} channels`);
@@ -358,8 +323,7 @@ export function coerce(key, raw) {
   }
 }
 
-// Validates a whole patch before any of it is applied, so a request with one
-// bad value in it does not leave half a change behind.
+// Validates every key in a patch, collecting errors rather than stopping.
 export function coerceAll(patch) {
   const values = {};
   const errors = [];
@@ -373,7 +337,7 @@ export function coerceAll(patch) {
   return { values, errors };
 }
 
-// Case-insensitive, because "#Eng-Oncall" and "#eng-oncall" are one channel.
+// Case-insensitive: "#Eng-Oncall" and "#eng-oncall" are one channel.
 export function inList(list, value) {
   if (!value) return false;
   const needle = String(value).trim().toLowerCase();

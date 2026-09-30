@@ -1,34 +1,24 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { HOME_DIR } from './config.js';
+import { writeFileAtomic } from './fsutil.js';
 
 export const HISTORY_PATH = path.join(HOME_DIR, 'history.jsonl');
 
-// Long enough that a message is recognisable, short enough that a pasted
-// stack trace does not turn the record into a copy of your Slack.
+// Long enough to recognise a message, short enough that a pasted stack trace
+// does not turn the record into a copy of your Slack.
 const MAX_TEXT = 2000;
+const TRIM_EVERY = 200;
 
 /*
- * What Slacken changed, in the order it changed it.
- *
- * The counts in the menu bar answer "is it doing anything". They do not answer
- * the question the tool actually raises, which is "what did it decide I did
- * not need to read" — and that question has to be answerable after the fact,
- * because the moment you think to ask it the message has usually scrolled
- * away. So every rewrite is appended here with both texts, along with every
- * time you asked for an original back.
- *
- * It is one JSON object per line: appendable without reading the file, and
- * readable with `tail` if Slacken is not running to read it for you. Verdicts
- * already sit in plain text in cache.json, so this stores no category of
- * information that was not already on disk — but it is the file most worth
- * knowing about, so `historyEnabled` turns it off and `slacken history` is the
- * only thing that reads it.
+ * Every rewrite that reached the screen, with both texts, and every time an
+ * original was asked for back — so "what did it decide I did not need to
+ * read" can be answered after the message has scrolled away. One JSON object
+ * per line: cheap to append and readable with `tail`.
  */
 export class History {
-  // Handed the live config object rather than a copy of two fields off it, so
-  // turning the record off from the menu bar stops the next line being
-  // written rather than the next daemon.
+  // Holds the live config rather than a copy, so turning the record off from
+  // the menu bar takes effect on the next line.
   constructor({
     file = HISTORY_PATH,
     config = null,
@@ -39,9 +29,8 @@ export class History {
     this.config = config;
     this.fallbackEnabled = enabled;
     this.fallbackMaxEntries = maxEntries;
-    // Counted rather than measured: trimming means reading the whole file, and
-    // doing that on every rewrite would be the most expensive thing Slacken
-    // does. The count starts unknown and is learned from the first trim.
+    // Trimming reads the whole file, so it runs on the first append (catching
+    // growth across restarts) and then every TRIM_EVERY appends.
     this.appends = 0;
   }
 
@@ -64,19 +53,15 @@ export class History {
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       fs.appendFileSync(this.file, JSON.stringify(row) + '\n');
+      if (this.appends % TRIM_EVERY === 0) this.trim();
       this.appends += 1;
-      // Checked periodically rather than per append: the file is a log, and a
-      // few hundred lines over the cap for a while costs nothing.
-      if (this.appends % 200 === 0) this.trim();
     } catch (err) {
       console.warn(`[slacken] could not write ${this.file}: ${err.message}`);
     }
     return row;
   }
 
-  // A rewrite that reached the screen. Verdicts that changed nothing are not
-  // recorded: this is a record of what was done to what you read, and most
-  // messages have nothing done to them.
+  // Only verdicts that changed something are recorded.
   recordVerdict({ sender, channel, text, verdict }) {
     if (!verdict?.flagged || !verdict.rewrite) return null;
     return this.record({
@@ -92,8 +77,7 @@ export class History {
     });
   }
 
-  // Someone clicked the badge. The strongest signal there is that a rewrite
-  // was not wanted, and it is worth being able to count them by sender.
+  // The badge was clicked: the clearest sign a rewrite was not wanted.
   recordReveal({ sender, channel, note, kind }) {
     return this.record({
       kind: 'revealed',
@@ -118,8 +102,7 @@ export class History {
       try {
         out.push(JSON.parse(line));
       } catch {
-        // A half-written line from a daemon killed mid-append. Skip it rather
-        // than refusing to show the rest.
+        // A half-written line from a daemon killed mid-append.
       }
     }
     return out;
@@ -129,11 +112,7 @@ export class History {
     try {
       const lines = fs.readFileSync(this.file, 'utf8').split('\n').filter(Boolean);
       if (lines.length <= this.maxEntries) return false;
-      // Written beside the real file and moved into place, so a daemon that
-      // dies mid-trim leaves the old history rather than half of one.
-      const temp = `${this.file}.trimming`;
-      fs.writeFileSync(temp, lines.slice(-this.maxEntries).join('\n') + '\n');
-      fs.renameSync(temp, this.file);
+      writeFileAtomic(this.file, lines.slice(-this.maxEntries).join('\n') + '\n');
       return true;
     } catch {
       return false;
@@ -141,7 +120,7 @@ export class History {
   }
 }
 
-// One line per entry, for `slacken history` and nothing else.
+// One entry, formatted for `slacken history`.
 export function formatEntry(entry) {
   const when = String(entry.at || '').replace('T', ' ').slice(0, 19);
   const who = `${entry.sender || 'someone'}${entry.channel ? ` in ${entry.channel}` : ''}`;

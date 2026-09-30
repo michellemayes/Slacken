@@ -7,15 +7,9 @@ import { devtoolsVersion } from './cdp.js';
 
 const execFileAsync = promisify(execFile);
 
-/*
- * Finding, quitting and relaunching Slack.
- *
- * Slack is the same Electron app everywhere, and the flag that opens the
- * debug port is the same flag; what differs is where the binary lives, what
- * the process is called, and how you ask it politely to go away. Those three
- * things are the whole of this file's platform knowledge, and they are kept
- * in one table each rather than spread through the code that uses them.
- */
+// Finding, quitting and relaunching Slack. Per platform, only three things
+// differ: where the binary lives, what the process is called, and how to ask
+// it to quit.
 const CANDIDATES = {
   darwin: () => [
     '/Applications/Slack.app/Contents/MacOS/Slack',
@@ -102,13 +96,8 @@ export async function isSlackRunning() {
   }
 }
 
-/*
- * Ask Slack to quit, and wait until it has.
- *
- * Asked rather than killed, everywhere: Slack has unsent drafts in it, and a
- * SIGKILL to save a few seconds would be a poor trade. macOS has a way to ask
- * an app; elsewhere a TERM is the polite signal and Electron treats it as one.
- */
+// Ask Slack to quit, and wait until it has. Never killed: it may hold unsent
+// drafts.
 export async function quitSlack({ timeoutMs = 15000 } = {}) {
   const name = PROCESS_NAME[process.platform];
   try {
@@ -158,8 +147,7 @@ export async function launchSlack({ cdpPort, force = false }) {
   const child = spawn(bin, [`--remote-debugging-port=${cdpPort}`], {
     detached: true,
     stdio: 'ignore',
-    // Windows has no fork/exec, so a detached child needs a shell-free spawn
-    // that does not keep a console window open behind it.
+    // No console window left open behind it on Windows.
     ...(process.platform === 'win32' ? { windowsHide: true } : {}),
   });
   child.unref();

@@ -25,10 +25,8 @@ import { VERSION } from './version.js';
  *   POST /stop       shut the daemon down, the way Ctrl-C would
  *
  * Everything but /health needs the token from ~/.slacken/token, because
- * loopback means "every process on this machine", not "only me". /health is
- * left open and says nothing but that something is here: it is what a second
- * `slacken start` uses to find the first one, and answering that with 401
- * would turn "already running" into "something is wrong".
+ * loopback means every process on this machine. /health stays open so a
+ * second `slacken start` can find the first one.
  */
 export function createServer({
   config, moderator, state, store, getStatus, reinject, inspect, onStop, onRestart, token = null,
@@ -37,24 +35,18 @@ export function createServer({
     paused: Boolean(state?.paused),
     pausedAt: state?.pausedAt ?? null,
     uptimeMs: state?.uptimeMs ?? 0,
-    // Which Slacken is actually running, which is not necessarily the one you
-    // installed: an upgrade changes the files on disk and nothing else, and a
-    // fix that is not in this process is a fix that has not happened yet.
+    // The running version, which after an upgrade is not the one on disk.
     version: VERSION,
-    // Where this process — not whoever is asking — can find claude. Cheap
-    // enough to answer on every poll, because a hit is remembered.
+    // Where this process — not whoever is asking — finds claude.
     claude: await moderator.whereIsClaude(),
     model: config.model,
     triageMode: config.triageMode,
     dailyBudgetUsd: config.dailyBudgetUsd,
     ...getStatus(),
     stats: moderator.stats,
-    // Named rather than counted: "3 errors" is not something anyone can act
-    // on, and "not signed in to Claude" is.
     lastError: moderator.lastError
       ? { ...moderator.lastError, hint: errorHint(moderator.lastError.kind, moderator.lastError.message) }
       : null,
-    // What the settings menu draws its checkmarks from.
     config: { ...config },
   });
 
@@ -63,12 +55,22 @@ export function createServer({
     return json(res, 200, { ok: true, paused: Boolean(state?.paused) });
   };
 
-  const server = http.createServer(async (req, res) => {
+  // A handler that throws answers 500 rather than becoming an unhandled
+  // rejection, which would take the whole daemon down.
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((err) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      json(res, 500, { error: err.message });
+    });
+  });
+
+  const handle = async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
 
-    // Deliberately narrow: that a Slacken is here, and whether it is currently
-    // changing anything. What it has read, what that cost and what it is set to
-    // are behind the token, because those are the answers worth having.
+    // Deliberately says only that Slacken is here and whether it is paused.
     if (req.method === 'GET' && url.pathname === '/health') {
       return json(res, 200, { ok: true, slacken: true, paused: Boolean(state?.paused) });
     }
@@ -92,8 +94,7 @@ export function createServer({
       return json(res, 200, { config: { ...config }, settings: SETTINGS });
     }
 
-    // A patch of setting -> value. Refused as a whole if any of it is invalid,
-    // so a bad value can never leave half a change applied.
+    // A patch of setting -> value, refused whole if any of it is invalid.
     if (req.method === 'POST' && url.pathname === '/config') {
       const body = await readJson(req, res);
       if (!body) return undefined;
@@ -107,9 +108,8 @@ export function createServer({
       });
     }
 
-    // The one change that arrives from inside Slack, where you can see which
-    // channel you mean. Separate from /config because it edits a list rather
-    // than replacing one, so two clients cannot overwrite each other's entries.
+    // Edits one entry rather than replacing the list, so two clients cannot
+    // overwrite each other's changes.
     if (req.method === 'POST' && url.pathname === '/ignore') {
       const body = await readJson(req, res);
       if (!body) return undefined;
@@ -129,14 +129,8 @@ export function createServer({
       });
     }
 
-    /*
-     * One channel's settings, merged rather than replaced.
-     *
-     * Separate from /config for the same reason /ignore is: this edits one
-     * entry in a map that other clients are also editing, and handing the
-     * whole map back and forth would let two Slack windows undo each other.
-     * A patch with no keys in it clears the channel entirely.
-     */
+    // One channel's settings, merged rather than replaced, for the same
+    // reason as /ignore. `clear: true` drops the channel's overrides.
     if (req.method === 'POST' && url.pathname === '/channel') {
       const body = await readJson(req, res);
       if (!body) return undefined;
@@ -171,34 +165,21 @@ export function createServer({
       return json(res, 200, verdict);
     }
 
-    /*
-     * Off and on again, without a terminal.
-     *
-     * This is the one thing you could not do from the menu bar, and the one
-     * thing that fixes the most: a claude that has moved since login, an
-     * upgrade sitting on disk that the running process has never read, a
-     * daemon that has been up for a week. Answered the same way /stop is —
-     * reply first, act once it has gone out — because whoever asked is about
-     * to lose the connection either way.
-     */
+    // /restart and /stop reply first and act once the reply has gone out,
+    // since whoever asked is about to lose the connection.
     if (req.method === 'POST' && url.pathname === '/restart') {
       if (!onRestart) return json(res, 501, { error: 'this daemon cannot restart itself' });
       res.on('finish', () => onRestart('a restart request'));
       return json(res, 200, { ok: true, restarting: true });
     }
 
-    // The terminal is not the only place Slacken gets started from, so it
-    // must not be the only place it can be stopped from. The reply goes out
-    // first; the shutdown happens once it has actually left.
     if (req.method === 'POST' && url.pathname === '/stop') {
       if (!onStop) return json(res, 501, { error: 'this daemon cannot stop itself' });
       res.on('finish', () => onStop('a stop request'));
       return json(res, 200, { ok: true, stopping: true });
     }
 
-    // Why a message on screen was left alone, straight from the page. The
-    // answer no other endpoint has, because every other one reports on
-    // messages Slacken acted on.
+    // Why each message on screen was or was not rewritten, from the page.
     if (req.method === 'GET' && url.pathname === '/inspect') {
       if (!inspect) return json(res, 501, { error: 'this daemon cannot inspect windows' });
       return json(res, 200, { windows: await inspect() });
@@ -210,7 +191,7 @@ export function createServer({
     }
 
     return json(res, 404, { error: 'not found' });
-  });
+  };
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -246,6 +227,8 @@ function json(res, status, payload) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
+    // Decoded as a stream, so a character split across chunks survives.
+    req.setEncoding('utf8');
     req.on('data', (chunk) => {
       data += chunk;
       if (data.length > 1_000_000) {

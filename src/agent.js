@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { HOME_DIR } from './config.js';
 import { resolveClaudeBin } from './claude-bin.js';
+import { writeFileAtomic } from './fsutil.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,6 +39,14 @@ const xml = (s) => String(s)
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;');
+
+// A double-quoted systemd word, so a path with a space in it stays one
+// argument. `%` and `$` would otherwise be expanded by systemd itself.
+const unitWord = (s) => `"${String(s)
+  .replace(/\\/g, '\\\\')
+  .replace(/"/g, '\\"')
+  .replace(/%/g, '%%')
+  .replace(/\$/g, '$$$$')}"`;
 
 // launchd gives an agent a bare PATH, so `claude` would not be found. Resolve
 // it now — through PATH, the usual install locations and the login shell, the
@@ -87,9 +96,8 @@ export async function buildPlist(config) {
     <key>SuccessfulExit</key>
     <false/>
   </dict>
-  <!-- Not Background: launchd throttles those, and this job holds messages
-       hidden while the model decides and draws a menu bar item, so a delay
-       here is a delay you sit and watch. -->
+  <!-- Not Background: launchd throttles those, and messages are held on
+       screen while this job works. -->
   <key>ProcessType</key>
   <string>Interactive</string>
   <key>StandardOutPath</key>
@@ -101,14 +109,8 @@ export async function buildPlist(config) {
 `;
 }
 
-/*
- * The Linux half.
- *
- * A user unit rather than a system one: this drives the Slack you are logged
- * in to, so it belongs to your session and not to the machine. `PATH=` is
- * spelled out for the same reason it is in the plist — a login manager hands a
- * unit almost nothing, and `claude` has to be findable.
- */
+// A user unit, since it drives the Slack you are logged in to. PATH is spelled
+// out for the same reason as in the plist.
 export async function buildUnit(config) {
   const claudeDir = await resolveClaudeDir(config.claudeBin);
   const pathEntries = [
@@ -128,10 +130,9 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-Environment=PATH=${uniquePath}
-ExecStart=${process.execPath} ${path.resolve(ENTRY)} start --force
-# on-failure, not always: a deliberate \`slacken stop\` is a decision, and
-# restarting it would be arguing with you. A crash is not a decision.
+Environment=${unitWord(`PATH=${uniquePath}`)}
+ExecStart=${unitWord(process.execPath)} ${unitWord(path.resolve(ENTRY))} start --force
+# on-failure, not always: a deliberate \`slacken stop\` stays stopped.
 Restart=on-failure
 RestartSec=3
 StandardOutput=append:${LOG_PATH}
@@ -145,10 +146,10 @@ WantedBy=default.target
 // The plist or unit as it would be written today, with today's claude in it.
 export async function rewriteAgentFile(config) {
   if (process.platform === 'linux') {
-    fs.writeFileSync(UNIT_PATH, await buildUnit(config));
+    writeFileAtomic(UNIT_PATH, await buildUnit(config));
     return UNIT_PATH;
   }
-  fs.writeFileSync(PLIST_PATH, await buildPlist(config));
+  writeFileAtomic(PLIST_PATH, await buildPlist(config));
   return PLIST_PATH;
 }
 
@@ -181,9 +182,8 @@ export async function installAgent(config) {
     throw new Error(`Slacken cannot install a login agent on ${process.platform}; `
       + 'run `slacken start` from a terminal, or from your own startup scripts.');
   }
-  fs.mkdirSync(PLIST_DIR, { recursive: true });
   fs.mkdirSync(HOME_DIR, { recursive: true });
-  fs.writeFileSync(PLIST_PATH, await buildPlist(config));
+  writeFileAtomic(PLIST_PATH, await buildPlist(config));
 
   const domain = `gui/${process.getuid()}`;
   // Replace any previous copy before loading the new one.
@@ -198,9 +198,8 @@ export async function installAgent(config) {
 }
 
 async function installUnit(config) {
-  fs.mkdirSync(UNIT_DIR, { recursive: true });
   fs.mkdirSync(HOME_DIR, { recursive: true });
-  fs.writeFileSync(UNIT_PATH, await buildUnit(config));
+  writeFileAtomic(UNIT_PATH, await buildUnit(config));
 
   await systemctl(['daemon-reload']);
   const res = await systemctl(['enable', '--now', UNIT_NAME]);
@@ -225,17 +224,9 @@ export async function uninstallAgent() {
 }
 
 /*
- * Bring the agent's daemon back without logging out again.
- *
- * `slacken stop` leaves launchd holding a loaded job with nothing running,
- * because a clean exit is not something KeepAlive restarts.
- *
- * The plist is rewritten first, and that is the point of this rather than a
- * bare kickstart: the agent's PATH is baked in at install time, so a claude
- * that has moved — or that was installed after the agent was — makes every
- * model call fail until the file is written again. Restarting a job with the
- * same broken environment is the fix that visibly does nothing, so it is not
- * one of the things this can do.
+ * Bring the agent's daemon back without logging out. The plist or unit is
+ * rewritten first, because the agent's PATH is baked in at install time: a
+ * claude that has moved since would fail every call until it is.
  */
 export async function restartAgent(config = null) {
   if (!agentInstalled()) throw new Error("no login agent is installed (run 'slacken agent install')");
@@ -279,4 +270,29 @@ export async function agentStatus() {
   const pid = res.out.match(/\bpid = (\d+)/)?.[1] ?? null;
   const lastExit = res.out.match(/last exit code = (\d+)/)?.[1] ?? null;
   return { installed: true, running: Boolean(pid), pid, lastExit, plist: PLIST_PATH, log: LOG_PATH };
+}
+
+/*
+ * launchd and systemd append to the agent log forever. Called at startup:
+ * past maxBytes, keep the last keepBytes (from a whole line) and drop the
+ * rest. Truncated in place, because the supervisor holds the file open in
+ * append mode and would keep writing to a renamed one.
+ */
+export function trimLog(file = LOG_PATH, { maxBytes = 5 * 1024 * 1024, keepBytes = 1024 * 1024 } = {}) {
+  let fd;
+  try {
+    const { size } = fs.statSync(file);
+    if (size <= maxBytes) return false;
+    fd = fs.openSync(file, 'r+');
+    const tail = Buffer.alloc(Math.min(keepBytes, size));
+    fs.readSync(fd, tail, 0, tail.length, size - tail.length);
+    const start = tail.indexOf(10) + 1;
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, tail, start, tail.length - start, 0);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }

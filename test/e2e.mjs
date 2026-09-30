@@ -116,6 +116,7 @@ test('injected script rewrites heated messages and leaves the rest alone', async
   const pausedTurn = new Promise((resolve) => { pauseRelease = resolve; });
 
   const CLEAN = { flagged: false, hostile: false, verbose: false, tone: [], severity: 0, rewrite: null, note: null };
+  let failuresLeft = 1;
 
   const moderator = {
     stats: {},
@@ -128,6 +129,11 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       // The message used to test what happens when a verdict lands after a
       // pause has already begun: it is held open until the test says so.
       if (text.startsWith('HOLD EVERYTHING')) await pausedTurn;
+
+      if (text.startsWith('FAIL ONCE') && failuresLeft > 0) {
+        failuresLeft -= 1;
+        return { ...CLEAN, error: 'claude exited 1: simulated' };
+      }
 
       // The message used to test the optimistic hold: block until the test
       // has had a chance to look at the mid-flight state, then come back clean.
@@ -788,6 +794,66 @@ test('injected script rewrites heated messages and leaves the rest alone', async
       assert.match(neutral.rewrite, /^NEUTRAL\(/);
       assert.ok(asked.length > before);
       assert.ok(asked.some((a) => a.text.startsWith('Deploy is queued')));
+    });
+
+    const stateOf = (id) => read(`document.getElementById(${JSON.stringify(id)})?.getAttribute('data-slacken') ?? null`);
+
+    await t.test('a failed call leaves the message readable, and is not remembered as a verdict', async () => {
+      const text = 'FAIL ONCE: this is COMPLETELY BROKEN and UNACCEPTABLE!!';
+      await arrive('msg-failing', text);
+      await waitFor('the failed call', async () => (await stateOf('msg-failing')) === 'error');
+      const shown = await read(`(() => {
+        const item = document.getElementById('msg-failing');
+        return item.querySelector('.c-message_kit__blocks').offsetHeight > 0
+          && !item.querySelector('.slacken-panel');
+      })()`);
+      assert.equal(shown, true, 'a failure shows the original, with nothing covering it');
+
+      const report = JSON.parse(await read('JSON.stringify(window.__slackenInspect())'));
+      const row = report.rows.find((r) => r.head?.startsWith('FAIL ONCE'));
+      assert.match(row.why, /failed; it is asked again/);
+
+      // A settings change forgets recent failures along with everything else,
+      // so the retry does not have to wait out the delay here.
+      await read('window.__slackenRescan()');
+      await waitFor('the retry to succeed', async () => (await stateOf('msg-failing')) === 'done');
+      assert.equal(asked.filter((a) => a.text === text).length, 2);
+    });
+
+    await t.test('reinjecting replaces the page script rather than running a second copy', async () => {
+      await waitFor('nothing in flight', async () => (
+        await read(`document.querySelectorAll('[data-slacken="pending"]').length`)
+      ) === 0);
+      await attacher.reinjectAll();
+      await waitFor('the heated message repainted', async () => (await stateOf('msg-heated')) === 'done');
+      await sleep(300);
+
+      const counts = JSON.parse(await read(`JSON.stringify({
+        panelsPerItem: Math.max(...Array.from(document.querySelectorAll('[data-qa="virtual-list-item"]'))
+          .map((item) => item.querySelectorAll('.slacken-panel').length)),
+        buttons: document.querySelectorAll('.slacken-channel').length,
+        styles: document.querySelectorAll('#slacken-style').length,
+        teardown: typeof window.__slackenTeardown,
+      })`));
+      assert.deepEqual(counts, { panelsPerItem: 1, buttons: 1, styles: 1, teardown: 'function' });
+      assert.match(JSON.parse(await snapshot()).heated.rewrite, /^NEUTRAL\(/);
+    });
+
+    await t.test('a window reloaded during a pause comes back paused', async () => {
+      pauseState.setPaused(true);
+      await sleep(300);
+      await probe.send('Page.reload');
+      await waitFor('the page script to run again after the reload', () => read(
+        `document.readyState === 'complete' && typeof window.__slackenInspect === 'function'`,
+      ));
+      await sleep(300);
+      assert.equal(await read('window.__slackenInspect().paused'), true);
+      const heated = JSON.parse(await snapshot()).heated;
+      assert.equal(heated.bodyVisible, true, 'shown exactly as written');
+      assert.equal(heated.rewrite, null);
+
+      pauseState.setPaused(false);
+      await waitFor('rewriting to resume after the reload', async () => (await stateOf('msg-heated')) === 'done');
     });
   } finally {
     holdRelease?.();

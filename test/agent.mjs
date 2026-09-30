@@ -69,7 +69,7 @@ test('the unit runs the real entry point, at login', async () => {
 
 test('the unit carries a PATH, since a login session does not provide a useful one', async () => {
   const unit = await buildUnit({ ...DEFAULTS });
-  const line = unit.match(/^Environment=PATH=(.+)$/m);
+  const line = unit.match(/^Environment="?PATH=([^"\n]+)"?$/m);
   assert.ok(line, 'without a PATH, claude is not found and nothing is ever rewritten');
 
   const dirs = line[1].split(':');
@@ -88,7 +88,7 @@ test('the unit comes back after a crash, and stays stopped after a stop', async 
 
 test('an absolute claudeBin contributes its own directory', async () => {
   const unit = await buildUnit({ ...DEFAULTS, claudeBin: '/opt/custom/bin/claude' });
-  assert.match(unit, /^Environment=PATH=.*\/opt\/custom\/bin/m);
+  assert.match(unit, /^Environment="?PATH=.*\/opt\/custom\/bin/m);
 });
 
 test('both halves log to the same place, so `slacken agent logs` needs no platform', async () => {

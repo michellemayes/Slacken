@@ -1,43 +1,29 @@
 /*
  * Finding `claude`.
  *
- * The daemon spawns `claude` as a child process, and a child process is given
- * the PATH of whoever started the parent — which, when the parent was started
- * by launchd, by systemd or by double-clicking something in Finder, is a bare
- * `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else. The claude CLI is not
- * installed there by any of its installers. So the daemon you launched from a
- * terminal works and the same daemon at login says "claude is not on the PATH
- * this is running with", which is true and useless: claude is installed, it is
- * two directories away, and the person reading that line did nothing wrong.
+ * A daemon started by launchd, systemd or Finder gets a bare PATH that none
+ * of claude's installers use. So look on the PATH, then where the installers
+ * put it, then ask the login shell (where nvm, asdf or a profile set PATH).
  *
- * So do not ask the PATH and stop. Ask the PATH, then the handful of places
- * the installers actually use, then the login shell — which is where a PATH
- * set by nvm, asdf, mise or a hand-edited profile lives, and the only way to
- * find that out is to start one.
- *
- * And then write down the answer. A claude somewhere none of that reaches —
- * inside another app's bundle, say — is found by the terminal you installed
- * from and by nothing else, which is how `slacken doctor` comes to report a
- * claude it can run while the daemon two feet away cannot find one. The note
- * in ~/.slacken/claude.json is how the process that knows tells the one that
- * does not, without either of them being restarted.
+ * Whatever is found is noted in ~/.slacken/claude.json, so a terminal that
+ * can find claude tells a daemon that cannot, without restarting either.
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { writeFileAtomic } from './fsutil.js';
 
 const execFileAsync = promisify(execFile);
 
-// Long enough that a run of failing calls does not start a login shell each
-// time, short enough that installing claude fixes this without a restart.
+// How long a miss is trusted before looking again, so failing calls do not
+// start a login shell each time but installing claude needs no restart.
 const MISS_TTL_MS = 60_000;
 
 const memo = new Map();
 
-// Where one Slacken leaves the answer for the next one. Derived from `home`
-// rather than imported so that a test with its own home gets its own note.
+// Derived from `home` so a test with its own home gets its own note.
 export const noteFile = (home = os.homedir()) => path.join(home, '.slacken', 'claude.json');
 
 function readNote(file) {
@@ -48,8 +34,7 @@ function readNote(file) {
   }
 }
 
-// When the note was last written, or 0. One stat, so a cached miss can notice
-// that someone has since worked out where claude is.
+// When the note was last written, or 0; lets a cached miss notice a new note.
 function noteStamp(file) {
   try {
     return fs.statSync(file).mtimeMs;
@@ -61,27 +46,19 @@ function noteStamp(file) {
 function remembered(bin, file) {
   const note = readNote(file);
   if (!note || note.bin !== bin || typeof note.path !== 'string') return null;
-  // Verified, not trusted: claude may have been moved or uninstalled since,
-  // and a note pointing at nothing is worse than no note at all.
+  // Verified, since claude may have moved since the note was written.
   return isRunnable(note.path) ? note.path : null;
 }
 
-/*
- * Leave the answer where a daemon with no PATH can read it.
- *
- * Only when it changes: the file's mtime is what tells another process its
- * cached "not found" is worth re-checking, so rewriting the same answer every
- * lookup would make that signal mean nothing.
- */
+// Written only when the answer changes: the file's mtime is what tells
+// another process its cached miss is worth re-checking.
 function remember(bin, found, file) {
   try {
     const note = readNote(file);
     if (note && note.bin === bin && note.path === found) return;
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ bin, path: found, at: Date.now() }) + '\n');
+    writeFileAtomic(file, JSON.stringify({ bin, path: found, at: Date.now() }) + '\n');
   } catch {
-    // A read-only home, or no home at all. Everything still works; the next
-    // process just has to do its own looking.
+    // A read-only home; the next process does its own looking.
   }
 }
 
@@ -95,13 +72,8 @@ export function isRunnable(file) {
   }
 }
 
-/*
- * Where the installers put it, newest first.
- *
- * `~/.local/bin` is the native installer, `~/.claude/local` the older local
- * one, the two `bin`s are npm-global under Homebrew and not, and the rest are
- * the alternative package managers people install a CLI with.
- */
+// Where the installers put it: the native installer, the older local one,
+// npm-global with and without Homebrew, then other package managers.
 export function knownLocations(bin = 'claude', home = os.homedir()) {
   return [
     path.join(home, '.local', 'bin', bin),
@@ -123,18 +95,11 @@ function onSearchPath(bin, env) {
   return null;
 }
 
-// Single-quote for `sh -c`, so a claudeBin with a space or a quote in it is a
-// filename to look up and not something the shell reads.
+// Single-quoted for the shell, so claudeBin is only ever a name to look up.
 const shellQuote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
-/*
- * The last resort: ask the shell you actually log in to.
- *
- * `-lc` and not `-lic`: a login shell sources the profile, which is where a
- * version manager puts its PATH, while an interactive one can block on a
- * prompt and would leave this hanging. Whatever the profile prints goes to
- * stdout too, so the answer is the last usable line rather than the first.
- */
+// Last resort: ask the login shell. `-lc`, not `-lic`, since an interactive
+// shell can block on a prompt. Profiles can print, so take the last line.
 async function fromLoginShell(bin, env) {
   const shell = env.SHELL;
   if (process.platform === 'win32' || !shell || !isRunnable(shell)) return null;
@@ -153,14 +118,8 @@ async function fromLoginShell(bin, env) {
   return null;
 }
 
-/*
- * Where `claude` is, and how that was worked out.
- *
- * Returns { path, source, searched }; `path` is null when it is genuinely not
- * installed anywhere this knows to look, and `searched` is what to tell
- * someone about that, because "not found" without "I looked here" is a
- * message you cannot act on.
- */
+// Returns { path, source, searched }. `path` is null when claude is nowhere
+// this knows to look; `searched` says where it looked.
 export async function resolveClaudeBin(bin = 'claude', options = {}) {
   const {
     home = os.homedir(),
@@ -172,10 +131,8 @@ export async function resolveClaudeBin(bin = 'claude', options = {}) {
 
   const cached = useCache ? memo.get(bin) : null;
   if (cached && cached.note === note) {
-    // A hit stays a hit. A miss is only reused while it is still plausibly
-    // true: it expires on its own, and it expires early if someone has
-    // written down where claude is since — which is one stat to find out,
-    // and the difference between `slacken doctor` fixing this and a restart.
+    // A hit is kept. A miss expires after MISS_TTL_MS, or as soon as another
+    // process writes a newer note.
     if (cached.result.path) return cached.result;
     if (now - cached.at < MISS_TTL_MS && noteStamp(note) <= cached.at) return cached.result;
   }
@@ -186,8 +143,7 @@ export async function resolveClaudeBin(bin = 'claude', options = {}) {
 }
 
 async function lookUp(bin, { home, env, note }) {
-  // A configured path is a decision, not a hint: if it is wrong, say so about
-  // that path rather than quietly running some other claude instead.
+  // A configured path is used as given, never swapped for another claude.
   if (bin.includes('/') || bin.includes('\\')) {
     const file = path.resolve(bin);
     return { path: file, source: 'configured', searched: [file] };
@@ -209,9 +165,7 @@ async function lookUp(bin, { home, env, note }) {
     if (isRunnable(file)) return found(file, 'known-location');
   }
 
-  // Before the login shell, because reading a file someone else already filled
-  // in beats starting a shell to work the same thing out again — and if what
-  // it names has since moved, it does not answer and the shell still runs.
+  // Before the login shell, which is slower to ask.
   const noted = remembered(bin, note);
   searched.push(note);
   if (noted) return { path: noted, source: 'remembered', searched };
@@ -223,9 +177,7 @@ async function lookUp(bin, { home, env, note }) {
   return { path: null, source: null, searched };
 }
 
-// Said once, in the terms the fix is in. `classifyError` reads "not found" out
-// of this, so the menu bar and `slacken doctor` both know what kind of failure
-// it is.
+// `classifyError` reads "not found" out of this to name the failure.
 export function notFoundMessage(bin, searched = []) {
   const where = searched.length ? ` Looked in: ${searched.join(', ')}.` : '';
   return `could not run ${bin}: not found on PATH or where the installers put it.${where}`
@@ -233,15 +185,9 @@ export function notFoundMessage(bin, searched = []) {
     + ' in ~/.slacken/config.json.';
 }
 
-/*
- * The PATH a spawned `claude` gets.
- *
- * Knowing the full path to claude is not quite enough. An npm-installed one is
- * a script whose shebang is `#!/usr/bin/env node`, so running it needs node on
- * the PATH as well — and the daemon inherited the same bare PATH that made
- * claude hard to find. So the dirs we know about are appended: appended, not
- * prepended, so an existing PATH still decides which node is yours.
- */
+// The PATH a spawned claude gets. An npm-installed claude runs through
+// `#!/usr/bin/env node`, so node must be findable too. Appended rather than
+// prepended, so an existing PATH still decides which node is used.
 export function spawnPath(binPath, env = process.env) {
   const existing = String(env.PATH || '').split(path.delimiter).filter(Boolean);
   const extra = [

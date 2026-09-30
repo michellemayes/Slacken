@@ -2,18 +2,19 @@ import fs from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadConfig, writeDefaultConfig, ConfigStore, CONFIG_PATH } from './config.js';
-import { SETTINGS, invalidatesCache } from './settings.js';
+import { SETTINGS, CHANNEL_KEYS, invalidatesCache, channelKey } from './settings.js';
 import { Moderator } from './moderate.js';
 import { Attacher } from './attach.js';
 import { createServer } from './server.js';
 import { launchSlack, findSlackApp, slackLocations, supportedPlatform, isDebugPortOpen, isSlackRunning, sleep } from './launch.js';
 import { listTargets } from './cdp.js';
-import { installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, agentPath, LOG_PATH } from './agent.js';
+import {
+  installAgent, uninstallAgent, restartAgent, agentStatus, agentInstalled, agentPath, trimLog, LOG_PATH,
+} from './agent.js';
 import { State } from './state.js';
 import { MenuBar, menuModel, count } from './menubar.js';
 import { History, formatEntry, HISTORY_PATH } from './history.js';
 import { loadToken, readToken } from './auth.js';
-import { CHANNEL_KEYS } from './settings.js';
 import { VERSION, checkForUpdate } from './version.js';
 import { resolveClaudeBin, notFoundMessage, spawnPath } from './claude-bin.js';
 
@@ -32,7 +33,8 @@ const USAGE = `slacken - a calmer reading layer for the Slack desktop app
 
   slacken launch [--force]     Relaunch Slack with the debug port open
   slacken attach [--verbose]   Attach to an already-launched Slack
-  slacken test "<message>"     Rewrite one string and print the verdict
+  slacken test "<message>" [--model <id>]
+                               Rewrite one string and print the verdict
   slacken doctor [--no-model]  Check the pieces this needs, including one real
                                model call; --no-model skips that one
   slacken config               Print the config file path and contents
@@ -105,6 +107,7 @@ function configFrom(args) {
   if (args.always) config.triageMode = 'always';
   if (args.verbose) config.verbose = true;
   if (args.port) config.cdpPort = Number(args.port);
+  if (typeof args.model === 'string') config.model = args.model;
   return config;
 }
 
@@ -138,26 +141,28 @@ async function cmdAttach(args) {
   return run(store);
 }
 
-// Flags are for this run only, so they are applied to the values the store
-// starts from rather than written to the file: `--always` for an afternoon
-// should not still be in force next week.
+// Flags apply to this run only, never to the file.
 function storeFrom(args) {
   return new ConfigStore({ values: configFrom(args) });
 }
 
 async function run(store) {
+  trimLog();
+  // One failed request must not take down the daemon holding every Slack
+  // window's messages; log it and carry on.
+  process.on('unhandledRejection', (err) => {
+    console.error(`[slacken] unexpected error: ${err?.stack || err}`);
+  });
+
   const config = store.values;
   const state = new State();
   const moderator = new Moderator(config, state);
 
-  // Found once, up front, and said out loud. A daemon started at login has
-  // almost no PATH, so which `claude` this is — or that there is not one — is
-  // the first thing you want from the log when nothing is being rewritten.
+  // Logged up front: which claude this is, or that there is none, is the
+  // first thing to check when nothing is being rewritten.
   const claude = await resolveClaudeBin(config.claudeBin);
   if (claude.path) console.log(`[slacken] claude: ${claude.path}`);
   else console.error(`[slacken] ${notFoundMessage(config.claudeBin, claude.searched)}`);
-  // Written by the same handler that logs to the terminal, because they are
-  // two views of one thing: what Slacken did, as it did it.
   const history = new History({ config });
   const token = loadToken();
   const attacher = new Attacher({
@@ -171,14 +176,12 @@ async function run(store) {
     },
   });
 
-  // POST /stop and Ctrl-C are the same thing, and neither may run twice. The
-  // real shutdown is defined at the bottom, once there is something to shut
-  // down; a stop that arrives before then — during a first-run Swift compile,
-  // say — is remembered rather than answered with a shrug.
+  // POST /stop and Ctrl-C both end up in shutdown(), defined below. A stop
+  // that arrives before then (during a first-run Swift compile, say) is
+  // remembered and honoured once startup finishes.
   let pendingStop = null;
   let stop = (reason) => { pendingStop = reason || 'a stop request'; };
-  // Read once this process has actually stopped, because a replacement started
-  // any earlier would find the port still held and give up.
+  // Acted on only after this process has released its port.
   let relaunch = false;
 
   let server;
@@ -209,8 +212,6 @@ async function run(store) {
   await attacher.start();
 
   const menuBar = new MenuBar({ config, token, onEvent: (event) => logEvent(event, config) });
-  // The menu bar is how you notice a pause you left running yesterday, so it
-  // is worth starting even when nothing else has attached yet.
   if (config.menuBar !== false) await menuBar.start();
 
   console.log(`[slacken] watching Slack (model ${config.model}, triage ${config.triageMode})`);
@@ -221,15 +222,10 @@ async function run(store) {
       + `${config.dailyBudgetUsd > 0 ? ` of $${Number(config.dailyBudgetUsd).toFixed(2)}` : ''}`);
   }
   if (config.checkUpdates) {
-    // Deliberately after everything else has started: an update check is the
-    // one thing here that talks to anything but your own machine, and nothing
-    // waits on what it finds.
     checkForUpdate(config).then((update) => {
       if (update?.newer) console.log(`[slacken] ${update.latest} is out (you have ${VERSION}): ${update.url}`);
     }).catch(() => {});
   }
-  // Started by hand, so this dies with the terminal it was typed into. Say so
-  // once, next to the thing that fixes it.
   if (agentPath() && !agentInstalled()) {
     console.log("[slacken] this stops when you close this window — 'slacken agent install' "
       + 'runs it at login instead');
@@ -241,10 +237,8 @@ async function run(store) {
       : '[slacken] resumed');
   });
 
-  // A setting can be changed from the menu bar, from the button in Slack or
-  // from another terminal. Wherever it came from, the change has to reach the
-  // pages being rewritten right now, and the verdicts already decided under
-  // the old thresholds have to go.
+  // Wherever a setting was changed, it reaches every page now, and verdicts
+  // decided under the old thresholds are dropped.
   store.onChange((changed) => {
     console.log(`[slacken] ${changed.map((key) => `${key} = ${show(config[key])}`).join(', ')}`);
     if (invalidatesCache(changed)) moderator.cache.clear();
@@ -258,6 +252,11 @@ async function run(store) {
     const shutdown = (reason) => {
       if (stopping) return;
       stopping = true;
+      // Anything still in flight (a model call, a slow child) can hold the
+      // process open for a while; a second Ctrl-C ends it at once.
+      const force = () => process.exit(130);
+      process.once('SIGINT', force);
+      process.once('SIGTERM', force);
       const st = moderator.stats;
       console.log(`\n[slacken] stopping${reason ? ` (${reason})` : ''} — ${st.batched} messages in ${st.calls} calls, `
         + `${st.cacheHits} from cache, ${st.softened} softened, ${st.condensed} condensed, `
@@ -266,34 +265,26 @@ async function run(store) {
       attacher.stop();
       moderator.cache.flush();
       server.close();
-      // A kept-alive control connection would otherwise hold the process open
-      // long after everything it was doing has stopped.
+      // Kept-alive control connections would otherwise hold the process open.
       server.closeAllConnections?.();
       resolve();
     };
     stop = shutdown;
-    process.on('SIGINT', () => shutdown());
-    process.on('SIGTERM', () => shutdown());
+    process.once('SIGINT', () => shutdown());
+    process.once('SIGTERM', () => shutdown());
     if (pendingStop) shutdown(pendingStop);
   });
   return relaunch ? relaunchSelf() : 0;
 }
 
 /*
- * Off and on again, from wherever this daemon was started.
+ * Restart the way this daemon was started. Under the login agent, ask
+ * launchd/systemd for a fresh one (which also rewrites the agent file with
+ * today's claude). Started by hand, hand over to a replacement process.
  *
- * There are two of these and they are not the same thing. Under the login
- * agent, launchd (or systemd) owns this process, so the honest restart is to
- * ask it for a fresh one — which rewrites the plist on the way, and so also
- * fixes a claude that has moved since you logged in, the most common reason
- * to want this at all. Started by hand there is nobody to ask, and this
- * process hands over to its own replacement instead.
- *
- * Which one it is is settled by pid, not by whether an agent is installed: a
- * daemon typed into a terminal on a machine that has an agent installed is
- * still a daemon in a terminal, and kickstarting the agent from here would
- * start a second one on a port this one is still holding — and under KeepAlive
- * that second one would be restarted, and fail, for as long as this one lived.
+ * Decided by pid, not by whether an agent is installed: kickstarting the
+ * agent from a terminal daemon would start a second one on a port this one
+ * still holds.
  */
 async function restartSelf(config, reason, relaunchAfterStop) {
   const agent = await agentStatus().catch(() => ({}));
@@ -311,9 +302,8 @@ async function restartSelf(config, reason, relaunchAfterStop) {
     relaunchAfterStop();
     return;
   }
-  // launchd stops us by signal, and does it more or less immediately. If it
-  // somehow does not, a menu item that visibly does nothing is the worse
-  // failure of the two, so we go the other way rather than sit there.
+  // launchd stops us by signal almost at once. If it does not, restart here
+  // rather than leave a menu click that visibly did nothing.
   const timer = setTimeout(() => {
     console.warn('[slacken] the login agent has not taken us down; stopping and starting a replacement');
     relaunchAfterStop();
@@ -321,15 +311,9 @@ async function restartSelf(config, reason, relaunchAfterStop) {
   timer.unref?.();
 }
 
-/*
- * Hand over to a fresh copy of ourselves, started the way this one was.
- *
- * It takes this process's own stdio, so a daemon started in a terminal keeps
- * printing to that terminal, and its own process group, so Ctrl-C still
- * reaches it and closing the window still ends it. A restart should change
- * what is running and nothing else about how you can stop it. It runs whatever
- * is on disk now, which is what makes this the way to pick up an upgrade.
- */
+// Start a fresh copy of ourselves with the same arguments, stdio and process
+// group, so it prints to the same terminal and Ctrl-C still reaches it. It
+// runs whatever is on disk now, which is how an upgrade is picked up.
 function relaunchSelf() {
   try {
     const child = spawn(process.execPath, process.argv.slice(1), {
@@ -347,15 +331,9 @@ function relaunchSelf() {
 }
 
 /*
- * Everything here fails the same way: not once, but every four seconds, or on
- * every message, for as long as the cause lasts.
- *
- * The menu bar counts those failures and sends you to the log to find out what
- * they were. So the log has to actually say — and a line repeated two hundred
- * times says nothing you can read. The first of each distinct message goes out
- * immediately; identical repeats are counted and summarised at most once a
- * minute; and recovery is announced, because when it stopped is half of what
- * you came to the log to find out.
+ * Failures here repeat — every poll, or every message — for as long as the
+ * cause lasts. The first of each distinct message is logged at once, repeats
+ * are summarised at most once a minute, and recovery is announced.
  */
 export class RepeatLog {
   constructor({ summariseAfterMs = 60_000, now = () => Date.now() } = {}) {
@@ -368,7 +346,6 @@ export class RepeatLog {
   fail(kind, message) {
     const at = this.now();
     const prev = this.kinds.get(kind);
-    // A different message is different news, however often the last one came.
     if (!prev || prev.message !== message) {
       this.kinds.set(kind, { message, count: 1, since: at, said: at });
       return message;
@@ -396,8 +373,7 @@ function humanMs(ms) {
 
 const SHARED_REPORT = new RepeatLog();
 
-// Exported for the tests: what reaches the log is the thing the menu bar's
-// error count sends you to read, so it is worth pinning down.
+// Exported for the tests.
 export function logEvent(event, config, report = SHARED_REPORT) {
   const say = (kind, message) => {
     const line = report.fail(kind, message);
@@ -444,19 +420,13 @@ export function logEvent(event, config, report = SHARED_REPORT) {
       break;
     case 'verdict': {
       const v = event.verdict;
-      // The one failure that used to be completely silent. Every message the
-      // model could not judge was counted in the menu bar's "N errors" line
-      // and then dropped, so the log the menu sent you to had nothing in it.
       if (v.error) {
-        // Keyed on the error alone, not the channel it happened in: one
-        // broken claude is one problem, however many channels it spoils.
+        // Keyed on the error alone: one broken claude is one problem.
         say('model', `the model could not judge a message: ${v.error}`);
         break;
       }
-      // Only a verdict that actually came back from the model is evidence the
-      // model is working. A paused, empty, over-length or cached one never
-      // reached it, and announcing recovery on one of those would call a
-      // still-broken claude fixed.
+      // Only a verdict that came from the model shows the model is working;
+      // a paused, empty, over-length or cached one never reached it.
       if (!v.reason && !v.cached) recovered('model', 'the model is answering again');
       if (v.flagged) {
         const what = v.hostile && v.verbose ? 'softened + condensed'
@@ -466,9 +436,6 @@ export function logEvent(event, config, report = SHARED_REPORT) {
         const who = `${event.sender || 'someone'} in ${event.channel || '?'}`;
         console.log(`[slacken] ${what} ${who}${where}${v.tone.length ? ` (${v.tone.join(', ')})` : ''}`);
       } else if (config.verbose) {
-        // Paused is the one that matters most here: without it, a Slacken you
-        // forgot you paused reads exactly like a Slacken that read every
-        // message and found nothing worth changing.
         const why = v.reason || (v.cached ? 'cached' : v.why) || 'nothing to change';
         console.log(`[slacken] left alone (${why}): ${JSON.stringify(event.text.slice(0, 60))}`);
       }
@@ -479,9 +446,7 @@ export function logEvent(event, config, report = SHARED_REPORT) {
   }
 }
 
-// The history is the same events the terminal gets, kept. A draft is not
-// recorded: it is a suggestion about something you have not sent, and writing
-// down what you nearly said is not this tool's business.
+// Drafts are never recorded: what you nearly sent is not this tool's business.
 function recordEvent(history, event) {
   if (event.type === 'verdict' && event.kind !== 'draft') {
     history.recordVerdict({
@@ -576,13 +541,10 @@ async function cmdAgent(args) {
   }
 }
 
-// `status`, `pause` and `resume` are thin clients for the running daemon: the
-// pause state lives in one place, and the menu bar item and the terminal are
-// two views of it rather than two copies.
+// A request to the running daemon. An error with `unreachable` set means
+// nothing answered, as opposed to a daemon that answered with a refusal.
 async function daemon(config, method, path, body) {
   const url = `http://127.0.0.1:${config.httpPort}${path}`;
-  // The daemon writes the token; every other process on this machine cannot
-  // read it, and this one can only because it is running as you.
   const token = readToken();
   try {
     const res = await fetch(url, {
@@ -597,21 +559,21 @@ async function daemon(config, method, path, body) {
     if (res.status === 401) {
       throw new Error(`the daemon refused this token; ${TOKEN_HINT}`);
     }
-    // A refused setting is an answer, not a failure to reach anyone: it comes
-    // back as JSON saying why, and reading it beats falling back to the file.
+    // A refused setting (400) is an answer, returned as JSON saying why.
     if (!res.ok && res.status !== 400) throw new Error(`${res.status} ${res.statusText}`);
     return await res.json();
   } catch (err) {
-    const hint = /ECONNREFUSED|fetch failed/i.test(err.message)
+    const unreachable = /ECONNREFUSED|fetch failed/i.test(`${err.message} ${err.cause?.code || ''}`);
+    const wrapped = new Error(unreachable
       ? `nothing is listening on 127.0.0.1:${config.httpPort}. Is 'slacken start' running?`
-      : err.message;
-    throw new Error(hint);
+      : err.message);
+    wrapped.unreachable = unreachable;
+    throw wrapped;
   }
 }
 
-// Is a daemon already answering on this port? Two of them would inject into
-// the same Slack twice and fight over the port, and under the login agent the
-// loser would be restarted forever.
+// Is a daemon already answering on this port? Two would inject into the same
+// Slack twice and fight over the port.
 async function runningDaemon(config) {
   try {
     const res = await fetch(`http://127.0.0.1:${config.httpPort}/health`, { signal: AbortSignal.timeout(2000) });
@@ -631,8 +593,7 @@ async function reportAlreadyRunning(config) {
   return true;
 }
 
-// Ask the daemon to go, then wait until it actually has: whatever comes next
-// (installing the agent, starting a fresh copy) needs the port back.
+// Ask the daemon to go, then wait until the port is free.
 async function stopDaemon(config, { timeoutMs = 10000 } = {}) {
   try {
     await daemon(config, 'POST', '/stop');
@@ -667,14 +628,8 @@ async function cmdStop(args) {
   return 0;
 }
 
-/*
- * The terminal end of the menu bar's Restart.
- *
- * The daemon decides how to restart itself, because it is the only one that
- * knows how it was started. This end asks, and then waits to see it come back:
- * "restarting" is not news, and a restart that did not finish is the only
- * thing here worth saying out loud.
- */
+// The daemon decides how to restart, since only it knows how it was started.
+// This end asks, then waits to see it go and come back.
 async function cmdRestart(args) {
   const config = configFrom(args);
   if (!(await runningDaemon(config))) {
@@ -684,16 +639,15 @@ async function cmdRestart(args) {
   try {
     await daemon(config, 'POST', '/restart');
   } catch (err) {
-    // It went away as it answered, which is the thing we asked it to do.
+    // Dropping the connection as it goes is expected.
     if (!/ECONNRESET|socket hang up|fetch failed|nothing is listening/i.test(err.message)) {
       console.error(err.message);
       return 1;
     }
   }
 
-  // It has to actually go before coming back counts as having restarted:
-  // otherwise the first health check answers from the process we just asked
-  // to leave, and every restart looks instant and does nothing.
+  // Wait for the old one to go first, or the old process would answer the
+  // health check and every restart would look instant.
   const stopped = await waitFor(() => runningDaemon(config).then((d) => !d), 15000);
   if (!stopped) {
     console.error('it is still running. Check its log, or stop it by hand.');
@@ -726,7 +680,7 @@ async function cmdStatus(args) {
     console.error(err.message);
     return 1;
   }
-  // Printed from the same model the menu bar draws, so the two can never drift.
+  // Printed from the same model the menu bar draws.
   for (const item of menuModel(status).items) {
     if (item.separator || item.submenu) continue;
     if (item.post || item.open || item.quit) continue;
@@ -735,11 +689,7 @@ async function cmdStatus(args) {
   return 0;
 }
 
-/*
- * Why a message on screen was left as written. `status` reports what Slacken
- * did; this reports what it decided not to do, which is the only way to tell a
- * message it read and cleared from one it never saw at all.
- */
+// Why each message on screen was or was not rewritten.
 async function cmdInspect(args) {
   const config = configFrom(args);
   let res;
@@ -804,8 +754,7 @@ async function cmdConfig() {
 function show(value) {
   if (Array.isArray(value)) return value.length ? value.join(', ') : '(none)';
   if (typeof value === 'boolean') return value ? 'on' : 'off';
-  // The per-channel map is a setting you edit with `slacken channel`, so what
-  // belongs in a list of one-line values is how many channels have one.
+  // The per-channel map is edited with `slacken channel`; list its channels.
   if (value && typeof value === 'object') {
     const names = Object.keys(value);
     return names.length ? names.join(', ') : '(same everywhere)';
@@ -814,12 +763,9 @@ function show(value) {
 }
 
 /*
- * The terminal view of the settings menu.
- *
- * A running daemon is asked to make the change, so it lands on the messages on
- * screen right now and is written to disk once, by the process that owns it.
- * With nothing running there is nobody to ask, so the file is edited directly
- * and picked up at the next start.
+ * The terminal view of the settings menu. A running daemon makes the change,
+ * so it applies at once and is written to disk by the process that owns the
+ * file. With nothing running, the file is edited directly.
  */
 async function cmdSet(args) {
   writeDefaultConfig();
@@ -847,7 +793,12 @@ async function cmdSet(args) {
   try {
     result = await daemon(config, 'POST', '/config', { [key]: raw });
   } catch (err) {
-    // Nothing running to tell. Writing the file is the whole change.
+    // A daemon that answered with an error is not "nothing running": editing
+    // the file behind its back would report a change it never made.
+    if (!err.unreachable) {
+      console.error(err.message);
+      return 1;
+    }
     const store = new ConfigStore();
     result = store.update({ [key]: raw });
     if (!result.errors.length) console.log(`(no daemon running; saved to ${CONFIG_PATH})`);
@@ -856,8 +807,7 @@ async function cmdSet(args) {
   for (const problem of result.errors || []) console.error(problem.message);
   if (result.errors?.length) return 1;
 
-  // Read back from whoever applied it. The daemon may have been told something
-  // different since this process read the file, and its answer is the truth.
+  // Read back from whoever applied it.
   const values = result.config || result.values || config;
   if (!result.changed.length) {
     console.log(`${key} is already ${show(values[key])}`);
@@ -867,13 +817,8 @@ async function cmdSet(args) {
   return 0;
 }
 
-/*
- * What one channel does differently.
- *
- * The menu bar can offer this for a channel that already has settings of its
- * own; getting the first one is a terminal job, because it needs you to name
- * a channel rather than point at one.
- */
+// What one channel does differently. The menu bar edits channels that
+// already have overrides; the first one is set here.
 async function cmdChannel(args) {
   writeDefaultConfig();
   const config = configFrom(args);
@@ -913,8 +858,11 @@ async function cmdChannel(args) {
   let result;
   try {
     result = await daemon(config, 'POST', '/channel', body);
-  } catch {
-    // Nothing running to tell, so the file is the whole change.
+  } catch (err) {
+    if (!err.unreachable) {
+      console.error(err.message);
+      return 1;
+    }
     const store = new ConfigStore();
     result = clearing ? store.clearChannel(channel) : store.setChannel(channel, { [key]: raw });
     if (!result.errors.length) console.log(`(no daemon running; saved to ${CONFIG_PATH})`);
@@ -928,14 +876,12 @@ async function cmdChannel(args) {
     return 0;
   }
   const overrides = result.channelOverrides || result.values?.channelOverrides || {};
-  const own = Object.entries(overrides).find(([name]) => name.trim().toLowerCase().replace(/^#/, '')
-    === channel.trim().toLowerCase().replace(/^#/, ''))?.[1] || {};
+  const own = Object.entries(overrides).find(([name]) => channelKey(name) === channelKey(channel))?.[1] || {};
   console.log(`${channel}: ${Object.entries(own).map(([k, v]) => `${k} = ${show(v)}`).join(', ') || 'nothing of its own'}`);
   return 0;
 }
 
-// Read from the file rather than from the daemon: the record is written by
-// whoever was running at the time, and reading it does not need one running now.
+// Read from the file, so it works with no daemon running.
 async function cmdHistory(args) {
   const config = configFrom(args);
   const history = new History({ config });
@@ -955,8 +901,7 @@ async function cmdHistory(args) {
   return 0;
 }
 
-// For talking to the control API by hand. Printed rather than echoed into a
-// shell history by a helpful example: it is the one thing here worth keeping.
+// For talking to the control API by hand.
 async function cmdToken() {
   const token = readToken();
   if (!token) {
@@ -981,24 +926,17 @@ async function cmdVersion(args) {
 }
 
 /*
- * What the running daemon says about itself, checked against this process.
- *
- * Every check above this one is answered by the process you just typed the
- * command into, and the process doing the work is a different one, started at
- * login, with a PATH of its own and — after an upgrade — code of its own. That
- * is the whole of "doctor says everything is fine and nothing is happening",
- * so the two are compared here rather than each being reported as if it spoke
- * for both.
+ * The running daemon's view, compared with this process's. The daemon was
+ * started elsewhere — at login, with its own PATH, and after an upgrade with
+ * older code — so "doctor is fine and nothing happens" usually lives here.
  */
 export function daemonChecks(status, claude, version = VERSION) {
   const checks = [];
   const mine = claude?.path || null;
   const theirs = status.claude?.path || null;
 
-  // An upgrade replaces the files on disk. It does not replace the process,
-  // and a fix that is not in the running process has not been applied yet.
-  // No version at all means a daemon from before this line existed, which is
-  // the same answer: it is not the Slacken you installed.
+  // An upgrade replaces the files, not the running process. No version at
+  // all means a daemon older than this check.
   if (status.version !== version) {
     checks.push(['daemon is current', false,
       `running ${status.version || 'a build too old to say'}, you have ${version}`
@@ -1010,9 +948,7 @@ export function daemonChecks(status, claude, version = VERSION) {
       checks.push([`daemon can run ${status.claude.bin}`, true,
         `${theirs}${status.claude.source === 'path' ? '' : ` (${status.claude.source})`}`]);
     } else if (mine) {
-      // The case this whole check exists for: claude is installed somewhere
-      // only a terminal's PATH knows about, so this process runs it happily
-      // and the daemon has never been able to.
+      // claude is somewhere only a terminal's PATH knows about.
       checks.push([`daemon can run ${status.claude.bin}`, false,
         `no — this shell finds it at ${mine}, the daemon does not.`
         + ` It looked in: ${(status.claude.searched || []).join(', ')}.`
@@ -1025,12 +961,9 @@ export function daemonChecks(status, claude, version = VERSION) {
 
   if (status.lastError) {
     const { kind, message } = status.lastError;
-    // Not `hint`: that one says "run: slacken doctor", which is fine on a menu
-    // and useless here, where it is the thing you already did.
+    // Not errorHint: that one says "run: slacken doctor".
     const fixed = kind === 'missing' && theirs;
-    // A daemon too old to say where its claude is has already been told to
-    // restart, one line up. Sending it to the config file as well would be
-    // two fixes for one problem, and the wrong one first.
+    // A daemon too old to report its claude was already told to restart.
     const detail = kind === 'missing' && !status.claude && mine
       ? `${message} — but that is this daemon, not this shell, which runs it at ${mine};`
         + ' restart the daemon and try again'
@@ -1043,8 +976,7 @@ export function daemonChecks(status, claude, version = VERSION) {
   return checks;
 }
 
-// The same failures errorHint names, said to someone who is already looking at
-// a full report and needs the next move rather than where to go for one.
+// errorHint's failures, phrased as the next move for someone already here.
 function doctorHint(kind, message) {
   switch (kind) {
     case 'auth': return 'not signed in to Claude — run: claude login';
@@ -1066,9 +998,7 @@ async function cmdDoctor(args) {
   const app = findSlackApp();
   checks.push(['Slack found', Boolean(app), app || `not in ${slackLocations()}`]);
 
-  // Not just "is it on PATH": the daemon looks in more places than a login
-  // shell's PATH, so this has to report on the same lookup the daemon does —
-  // and, when it comes up empty, on where that lookup went.
+  // The same lookup the daemon does, not just the PATH.
   const claude = await resolveClaudeBin(config.claudeBin, { useCache: false });
   let claudeVersion = null;
   if (claude.path) {
@@ -1091,13 +1021,10 @@ async function cmdDoctor(args) {
       : notFoundMessage(config.claudeBin, claude.searched),
   ]);
 
-  // The check the menu bar's "N errors" line sends you here for. Everything
-  // else can pass while the one call that matters — the flags this daemon
-  // actually invokes claude with, against the model actually configured —
-  // fails on every single message.
+  // One real call with the daemon's flags and model: everything else can pass
+  // while this fails on every message.
   if (!args['no-model']) {
-    // cacheTtlHours 0 turns the cache off entirely, so this neither answers
-    // from a week-old verdict nor leaves one behind.
+    // cacheTtlHours 0 disables the cache, so this neither reads nor leaves one.
     const moderator = new Moderator({ ...config, cacheTtlHours: 0 });
     const startedAt = Date.now();
     let detail;
@@ -1124,15 +1051,13 @@ async function cmdDoctor(args) {
     } catch {
       swift = null;
     }
-    // Informational: without swiftc there is no menu bar item, but everything
-    // else still works, so this is never a failure.
+    // Informational: without swiftc only the menu bar item is missing.
     checks.push(['menu bar item', true, swift || 'no swiftc (run: xcode-select --install)']);
   }
 
   if (agentPath()) {
     const agent = await agentStatus();
-    // Informational: running it from a terminal is a perfectly good way to run
-    // it, so not having the agent installed is never a failure.
+    // Informational: running from a terminal is fine too.
     checks.push(['runs at login', true, !agent.installed
       ? 'no (run: slacken agent install)'
       : agent.running ? `yes (pid ${agent.pid})` : 'installed, but not running right now']);
@@ -1140,7 +1065,7 @@ async function cmdDoctor(args) {
 
   const slackUp = await isSlackRunning();
   const portOpen = await isDebugPortOpen(config.cdpPort);
-  // Informational: `start` launches Slack itself, so "not running" is fine.
+  // Informational: `start` launches Slack itself.
   checks.push(['Slack running', true, slackUp ? 'yes' : 'no (start will launch it)']);
   checks.push([`debug port ${config.cdpPort}`, portOpen, portOpen ? 'listening' : 'closed (run: slacken launch)']);
 
@@ -1154,9 +1079,8 @@ async function cmdDoctor(args) {
     }
   }
 
-  // Anything already running knows things this process cannot work out from
-  // the outside: whether the model is answering, and whether the page script
-  // is still finding messages in a Slack that may have been updated overnight.
+  // A running daemon knows whether the model is answering and whether the
+  // page is still finding messages.
   const running = await runningDaemon(config);
   if (running) {
     try {
@@ -1184,8 +1108,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
-      const [key, inline] = arg.slice(2).split('=');
-      if (inline !== undefined) out[key] = inline;
+      const eq = arg.indexOf('=');
+      const key = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
+      if (eq !== -1) out[key] = arg.slice(eq + 1);
       else if (argv[i + 1] && !argv[i + 1].startsWith('--') && ['port', 'sender', 'channel', 'model', 'lines'].includes(key)) {
         out[key] = argv[i + 1];
         i += 1;

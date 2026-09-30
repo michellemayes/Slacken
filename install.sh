@@ -49,8 +49,12 @@ if [ "$UNINSTALL" = "1" ]; then
   case "$OS" in
     Darwin|Linux) node "$ENTRY" agent uninstall || warn "could not remove the login agent" ;;
   esac
+  # Only links to this checkout: a `slacken` from Homebrew or another clone
+  # is not ours to remove.
   for dir in "/usr/local/bin" "/opt/homebrew/bin" "$HOME/.local/bin" "$HOME/bin"; do
-    if [ -L "$dir/slacken" ]; then rm -f "$dir/slacken" && ok "removed $dir/slacken"; fi
+    if [ -L "$dir/slacken" ] && [ "$(readlink "$dir/slacken")" = "$ENTRY" ]; then
+      rm -f "$dir/slacken" && ok "removed $dir/slacken"
+    fi
   done
   printf '\n%s~/.slacken (config, cache) was left alone. Delete it by hand if you want it gone.%s\n\n' "$DIM" "$OFF"
   exit 0
@@ -83,8 +87,7 @@ if [ "$OS" = "Darwin" ]; then
     warn "Run 'xcode-select --install' if you want one. Everything else works."
   fi
 else
-  # The menu bar item is AppKit, so there is none here. Everything it shows is
-  # in `slacken status`, which is the same model rendered as lines.
+  # The menu bar item is AppKit-only; `slacken status` shows the same thing.
   warn "no menu bar item on $OS — 'slacken status' says everything it would"
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "no systemctl, so there is no login agent either; run 'slacken start' yourself"
@@ -100,13 +103,12 @@ else
 fi
 ok "dependencies installed"
 
-# Asked of the same code that will look for it at launch, rather than a second
-# list of paths here that could drift from that one. It needs the dependencies
-# above, which is why it is not further up.
+# Asked of the same code that looks for Slack at launch, so the two lists of
+# paths cannot drift. Needs the dependencies installed above.
 if node --input-type=module -e "
-  import { findSlackApp } from '$REPO_DIR/src/launch.js';
+  const { findSlackApp } = await import(process.argv[1]);
   process.exit(findSlackApp() ? 0 : 1);
-" 2>/dev/null; then
+" "$REPO_DIR/src/launch.js" 2>/dev/null; then
   ok "Slack found"
 else
   warn "could not find the Slack desktop app in the usual places"

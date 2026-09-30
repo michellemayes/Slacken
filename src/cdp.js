@@ -1,6 +1,10 @@
 import WebSocket from 'ws';
 
-// A very small Chrome DevTools Protocol client: enough to enable a couple of
+// A command a hung renderer never answers must not hang whoever sent it: the
+// attach loop awaits these, and a stuck await would stop it for good.
+const COMMAND_TIMEOUT_MS = 10_000;
+
+// A minimal Chrome DevTools Protocol client: enough to enable a couple of
 // domains, install a binding, and evaluate scripts in a page.
 export class CdpSession {
   constructor(wsUrl) {
@@ -15,7 +19,11 @@ export class CdpSession {
   connect() {
     return new Promise((resolve, reject) => {
       // maxPayload bumped because Runtime.evaluate results can be large.
-      this.ws = new WebSocket(this.wsUrl, { perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
+      this.ws = new WebSocket(this.wsUrl, {
+        perMessageDeflate: false,
+        maxPayload: 64 * 1024 * 1024,
+        handshakeTimeout: COMMAND_TIMEOUT_MS,
+      });
       const onError = (err) => reject(err);
       this.ws.once('error', onError);
       this.ws.once('open', () => {
@@ -26,8 +34,9 @@ export class CdpSession {
       this.ws.on('message', (data) => this.onMessage(data));
       this.ws.on('close', () => {
         this.closed = true;
-        for (const { reject: rej } of this.pending.values()) {
-          rej(new Error('cdp connection closed'));
+        for (const waiter of this.pending.values()) {
+          clearTimeout(waiter.timer);
+          waiter.reject(new Error('cdp connection closed'));
         }
         this.pending.clear();
         this.emit('__close', {});
@@ -46,6 +55,7 @@ export class CdpSession {
       const waiter = this.pending.get(msg.id);
       if (!waiter) return;
       this.pending.delete(msg.id);
+      clearTimeout(waiter.timer);
       if (msg.error) waiter.reject(new Error(`${msg.error.message} (${msg.error.code})`));
       else waiter.resolve(msg.result);
       return;
@@ -68,16 +78,21 @@ export class CdpSession {
     }
   }
 
-  send(method, params = {}) {
+  send(method, params = {}, { timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
     if (this.closed || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('cdp connection is not open'));
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ id, method, params }), (err) => {
-        if (!err) return;
-        this.pending.delete(id);
+        if (!err || !this.pending.delete(id)) return;
+        clearTimeout(timer);
         reject(err);
       });
     });
@@ -114,10 +129,8 @@ async function devtoolsGet(port, route) {
   return res.json();
 }
 
-// `fetch` reports every transport failure as "fetch failed" and puts the
-// reason in .cause. The difference matters: Slack having been quit is the
-// ordinary way this fails, and "fetch failed" every four seconds is the one
-// message that does not say so.
+// `fetch` reports every transport failure as "fetch failed" with the reason in
+// .cause; name the common ones, since Slack having quit is the usual case.
 export function devtoolsMessage(err, port) {
   const code = err?.cause?.code || err?.code;
   if (code === 'ECONNREFUSED') {

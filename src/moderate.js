@@ -20,16 +20,12 @@ const clean = (extra) => ({ ...CLEAN, ...extra });
  *   1 message  per call ~2.4s   ~$0.0031/msg
  *   8 messages per call ~5.2s   ~$0.00068/msg   (~650ms and 4.5x cheaper per message)
  *
- * A persistent --input-format stream-json session was measured too and is
- * deliberately not used: turns were no faster, and because the conversation
- * accumulates, the sixth turn cost 4.7x the first.
+ * A persistent --input-format stream-json session was measured and not used:
+ * turns were no faster, and the growing conversation made the sixth turn cost
+ * 4.7x the first.
  *
- * Everything in here that is about speed is about the same thing: a message is
- * held on screen behind "checking…" for exactly as long as this takes, so
- * the wait is not a number in a log, it is a person sitting and watching a gap
- * where a sentence should be. What is not the model answering — process
- * startup, a telemetry flush on the way out, a round trip spent proving the
- * JSON was JSON — is worth removing even a few hundred milliseconds at a time.
+ * A held message stays behind "checking…" for as long as a call takes, so
+ * anything that is not the model answering is worth cutting.
  */
 export class Moderator {
   constructor(config, state = null) {
@@ -45,6 +41,9 @@ export class Moderator {
     this.timer = null;
     this.inFlight = 0;
     this.seq = 0;
+    // Cache key -> the verdict promise for a message already on its way to the
+    // model, so two windows showing the same message cost one call.
+    this.waiting = new Map();
 
     this.stats = {
       calls: 0, batched: 0, cacheHits: 0,
@@ -67,18 +66,15 @@ export class Moderator {
   }
 
   async moderate({ text, sender, channel }) {
-    // Checked before the cache as well as before the model: while paused,
-    // Slacken hands back a verdict that changes nothing, so the words on
-    // screen are the ones that were actually written.
+    // Checked before the cache too: while paused nothing is changed at all.
     if (this.paused) return clean({ reason: 'paused' });
 
     const trimmed = (text || '').trim();
     if (!trimmed) return clean({ reason: 'empty' });
     if (trimmed.length > this.config.maxChars) return clean({ reason: 'too-long' });
 
-    // Keyed by the settings that produced it as well as the text: a verdict
-    // is stored already judged, so the same message under a different
-    // threshold — or in a channel with its own — is a different answer.
+    // Keyed by the settings in force as well as the text: a verdict is stored
+    // already judged against them.
     const key = Cache.key(this.config.model, trimmed, gateSignature(this.config, channel));
     const cached = this.cache.get(key);
     if (cached) {
@@ -86,20 +82,27 @@ export class Moderator {
       return { ...cached, cached: true };
     }
 
+    const joined = this.waiting.get(key);
+    if (joined) return joined;
+
     if (this.overBudget()) return clean({ reason: 'budget', error: 'daily budget reached' });
 
-    const verdict = await this.enqueue({ text: trimmed, sender, channel });
-    // A failure is not a verdict. Caching one would hold this message, and
-    // every later copy of it, unread for the whole TTL — a week by default —
-    // long after whatever broke had been fixed.
-    if (!verdict.error) this.cache.set(key, verdict);
-    if (verdict.hostile) this.stats.softened += 1;
-    if (verdict.verbose) this.stats.condensed += 1;
-    return verdict;
+    const pending = this.enqueue({ text: trimmed, sender, channel }).then((verdict) => {
+      // A failure is not a verdict: caching one would keep this message
+      // unjudged for the whole TTL, long after the cause was fixed.
+      if (!verdict.error) this.cache.set(key, verdict);
+      if (verdict.hostile) this.stats.softened += 1;
+      if (verdict.verbose) this.stats.condensed += 1;
+      return verdict;
+    }).finally(() => {
+      this.waiting.delete(key);
+    });
+    this.waiting.set(key, pending);
+    return pending;
   }
 
-  // The day's spend, from disk when there is state to read it from, so a
-  // daemon that has just been restarted knows what the one before it spent.
+  // Read through State when there is one, so a restarted daemon knows what
+  // the previous one spent today.
   spentToday() {
     if (this.state) {
       this.stats.day = today();
@@ -133,25 +136,24 @@ export class Moderator {
   }
 
   /*
-   * Hold each request for a short window so messages that render together —
-   * catching up on a channel, or a burst from one person — travel as one call.
-   *
-   * How long is worth waiting depends on what else is happening. With a call
-   * already out, more messages are plainly arriving and the window is free:
-   * whatever it collects would have queued behind that call anyway. With
-   * nothing in flight, this is the message that just landed in a channel you
-   * are reading, and the window buys nothing but a wait you sit and watch —
-   * a burst rendered in one frame reaches us within a millisecond or two of
-   * itself, so a much shorter window still catches every one of them.
+   * Hold each request briefly so messages that render together travel as one
+   * call. With a call already out the full window costs nothing, since new
+   * messages would queue behind it anyway. With nothing in flight the shorter
+   * idle window applies: a burst rendered in one frame arrives within a
+   * millisecond or two, and a lone message should not wait for company.
    */
   enqueue(item) {
     return new Promise((resolve) => {
       this.queue.push({ ...item, id: `m${this.seq++}`, resolve });
-      if (this.queue.length >= this.config.batchSize) this.flush();
-      // Deliberately not unref'd: the batch window is the only thing holding
-      // a queued message, so it has to keep the process alive on its own.
+      if (this.queue.length >= this.batchSize()) this.flush();
+      // Not unref'd: a queued message needs the process kept alive.
       else if (!this.timer) this.timer = setTimeout(() => this.flush(), this.batchWindow());
     });
+  }
+
+  // Guarded so a batchSize of 0 in a hand-edited config cannot stall the queue.
+  batchSize() {
+    return Math.max(1, Math.floor(Number(this.config.batchSize)) || 1);
   }
 
   batchWindow() {
@@ -167,13 +169,10 @@ export class Moderator {
       this.timer = null;
     }
     if (!this.queue.length) return;
-    if (this.inFlight >= this.config.maxConcurrency) {
-      // All workers busy. Try again once one frees up.
-      this.timer = setTimeout(() => this.flush(), 50);
-      return;
-    }
+    // All workers busy: the next one to finish flushes again.
+    if (this.inFlight >= Math.max(1, Number(this.config.maxConcurrency) || 1)) return;
 
-    const batch = this.queue.splice(0, this.config.batchSize);
+    const batch = this.queue.splice(0, this.batchSize());
     this.inFlight += 1;
     this.runBatch(batch)
       .catch((err) => {
@@ -195,16 +194,9 @@ export class Moderator {
     let { verdicts, costUsd } = parseResponse(stdout);
     this.recordCost(costUsd);
 
-    /*
-     * Asked for JSON rather than held to it, and asked again properly when
-     * that was not enough.
-     *
-     * `--json-schema` guarantees the shape, and measurably costs a second
-     * model turn and ~730 input tokens to do it — around 1.2s on every
-     * message, paid to prevent something that almost never happens. So the
-     * fast call goes first and the schema is what a failure is retried with,
-     * which puts the cost where the failure is instead of on every message.
-     */
+    // `--json-schema` costs a second model turn (~730 input tokens, ~1.2s)
+    // on every call to prevent a rare failure, so the fast call goes first
+    // and only output that does not parse is asked again with the schema.
     if (!verdicts && !this.config.useJsonSchema) {
       this.stats.schemaRetries += 1;
       if (this.config.verbose) console.warn('[slacken] output did not parse, asking again with the schema');
@@ -231,14 +223,9 @@ export class Moderator {
   }
 
   /*
-   * One call, tried again if the way it failed could plausibly go differently.
-   *
-   * A timeout, a killed process or a rate limit is a bad moment; being signed
-   * out is a fact about the machine, and asking again immediately only makes
-   * the same answer arrive twice. So failures are classified rather than
-   * counted, the transient ones get another go after a short wait, and the
-   * kind of the last one is kept — because "3 errors" tells you nothing you
-   * can act on and "not signed in to Claude" tells you everything.
+   * One call, retried only when the failure is transient (a timeout, a rate
+   * limit). Being signed out is not retried. The kind of the last failure is
+   * kept so the menu can name it rather than count it.
    */
   async callWithRetry(input, { schema = this.config.useJsonSchema } = {}) {
     const attempts = Math.max(0, Number(this.config.retries) || 0) + 1;
@@ -262,57 +249,34 @@ export class Moderator {
         if (attempt >= attempts || !RETRIABLE.has(kind)) break;
         this.stats.retries += 1;
         if (this.config.verbose) console.warn(`[slacken] ${kind}, trying once more: ${err.message}`);
-        // Long enough for a rate limit to move on, short enough that a held
-        // message is still a wait rather than a hang.
         await sleep(600 * attempt);
       }
     }
     throw lastErr;
   }
 
-  /*
-   * The full path to `claude`, not the bare name.
-   *
-   * A daemon started at login has almost no PATH, so leaving the lookup to
-   * spawn() is what turns a working setup into "claude is not on the PATH".
-   * Resolved once and remembered; a genuine miss is an error that says where
-   * it looked, so the answer is in the message rather than in a support thread.
-   */
+  // The full path, since a daemon started at login has almost no PATH.
   async binPath() {
     const { path: file, searched } = await resolveClaudeBin(this.config.claudeBin);
     if (!file) throw new Error(notFoundMessage(this.config.claudeBin, searched));
     return file;
   }
 
-  /*
-   * The same lookup, as an answer rather than as a path to run.
-   *
-   * This is what the daemon reports about itself, and the point of reporting
-   * it is that it is the daemon's answer: a `slacken doctor` running in a
-   * terminal has a PATH this process has never seen, so "I can run claude" in
-   * one process says nothing at all about the other.
-   */
+  // The daemon's own answer, which can differ from a terminal's.
   async whereIsClaude() {
     const { path: file, source, searched } = await resolveClaudeBin(this.config.claudeBin);
     return { bin: this.config.claudeBin, path: file, source, searched };
   }
 
-  /*
-   * Where a call is run from, which is not where the daemon was started from.
-   *
-   * `claude` looks around the directory it is in on the way up. Started by
-   * hand that directory is whatever repository you happened to be standing in,
-   * which is both slower to start in and a place a CLAUDE.md can sit and have
-   * opinions about a Slack message it was never written for. ~/.slacken is
-   * small, ours, and says nothing.
-   */
+  // Calls run from ~/.slacken rather than wherever the daemon was started,
+  // so a project's CLAUDE.md never reaches the prompt and startup stays fast.
   workDir() {
     if (this.cwd !== undefined) return this.cwd;
     try {
       fs.mkdirSync(HOME_DIR, { recursive: true });
       this.cwd = HOME_DIR;
     } catch {
-      // Unwritable home. Not worth failing a verdict over.
+      // Unwritable home; run from wherever we are.
       this.cwd = null;
     }
     return this.cwd;
@@ -325,8 +289,7 @@ export class Moderator {
       '--model', this.config.model,
       '--system-prompt', SYSTEM_PROMPT,
       ...(schema ? ['--json-schema', JSON.stringify(RESPONSE_SCHEMA)] : []),
-      // Everything below is startup and turn weight we do not need. Without
-      // them a verdict costs ~800 thinking tokens and 8-11 seconds.
+      // Startup and turn weight a verdict does not need.
       '--tools', '',
       '--strict-mcp-config',
       '--no-session-persistence',
@@ -341,20 +304,12 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-// Deliberately not unref'd, for the same reason the batch window is not: a
-// message is being held on screen for the answer this wait is on its way to.
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/*
- * What went wrong, in the only terms worth acting on.
- *
- * The message comes from whatever `claude` printed, so this reads it the way a
- * person would: the point is not to enumerate every failure but to separate
- * the one you have to do something about (sign in) from the ones that fix
- * themselves (a rate limit, a timeout, a bad moment).
- */
+// Separates the failures you have to act on (sign in, install claude) from the
+// ones that fix themselves (a rate limit, a timeout).
 export const RETRIABLE = new Set(['timeout', 'rate-limit', 'overloaded', 'unknown']);
 
 export function classifyError(message) {
@@ -369,7 +324,7 @@ export function classifyError(message) {
   return 'unknown';
 }
 
-// One line, in the imperative where there is something to do about it.
+// One line for the menu, in the imperative where there is something to do.
 export function errorHint(kind, message) {
   switch (kind) {
     case 'auth': return 'Not signed in to Claude — run: claude login';
@@ -381,33 +336,23 @@ export function errorHint(kind, message) {
   }
 }
 
-/*
- * What `claude` is asked not to do on a call that somebody is waiting on.
- *
- * None of this changes the answer; all of it is work happening around one.
- * The first line is the one that matters most, and the rest are all the same
- * kind of thing: an update check, an error report and a telemetry flush are
- * fine in a session you are sitting in, and on this path they are a message
- * held back on somebody's screen while a background task finishes.
- */
+// Background work `claude` would otherwise do around a call someone is
+// waiting on. None of it changes the answer.
 const QUIET_ENV = {
-  // The single biggest lever there is: it takes a verdict from ~800 output
-  // tokens and ~10s down to ~50 tokens and ~2.4s.
+  // ~800 output tokens and ~10s down to ~50 tokens and ~2.4s.
   MAX_THINKING_TOKENS: '0',
-  // Measured at ~500ms on every single call: the result was already on stdout
-  // and the process was still holding on, flushing what it had learned.
+  // ~500ms a call spent flushing after the result was already printed.
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   DISABLE_TELEMETRY: '1',
   DISABLE_ERROR_REPORTING: '1',
   DISABLE_NON_ESSENTIAL_MODEL_CALLS: '1',
-  // Only for the copies Slacken spawns. The claude you type at still updates
-  // itself; a verdict is not the place to find out about a new version.
+  // Only for the copies Slacken spawns; your own claude still updates.
   DISABLE_AUTOUPDATER: '1',
 };
 
-// A child that has already given us the answer, kept only long enough to exit
-// on its own terms. Nothing is waiting on it, so being tidy is all this is.
+// How long a child that has already answered gets to exit on its own.
 const REAP_GRACE_MS = 2000;
+const MAX_STDERR = 16_384;
 
 function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
   return new Promise((resolve, reject) => {
@@ -419,8 +364,7 @@ function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
         env: {
           ...process.env,
           ...QUIET_ENV,
-          // An npm-installed claude is a `#!/usr/bin/env node` script, so
-          // knowing where claude is does not by itself make it runnable.
+          // An npm-installed claude needs node on the PATH to run.
           PATH: spawnPath(bin),
         },
       });
@@ -440,16 +384,10 @@ function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
       reject(new Error(`claude timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    /*
-     * Answer on the answer, not on the exit.
-     *
-     * `--output-format json` prints one envelope and prints it whole, so the
-     * moment it parses there is nothing further to wait for — and what came
-     * after it, measured, was up to half a second of a process shutting
-     * itself down. A verdict that is sitting in this buffer while a message
-     * stays hidden on screen is the wait this exists to delete. The child is
-     * left to go in its own time; only the answer stopped waiting.
-     */
+    // Resolve as soon as the envelope parses rather than on exit: the process
+    // can take another half second to shut down after printing it.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', (d) => {
       stdout += d;
       if (settled || !isComplete(stdout)) return;
@@ -460,7 +398,9 @@ function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
       child.on('close', () => clearTimeout(grace));
       resolve(stdout);
     });
-    child.stderr.on('data', (d) => { stderr += d; });
+    child.stderr.on('data', (d) => {
+      if (stderr.length < MAX_STDERR) stderr += d;
+    });
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
@@ -483,14 +423,8 @@ function runClaude({ bin, args, input, cwd = null, timeoutMs }) {
   });
 }
 
-/*
- * Is this the whole answer, or the first half of one?
- *
- * Only a result envelope that parses and reports success counts. A failure
- * envelope is left to the exit code and stderr, which is where a message
- * worth showing anyone actually is — "claude exited 1: not logged in" is an
- * answer, and the JSON that came with it is not.
- */
+// Only a successful result envelope counts as complete. A failure envelope is
+// left to the exit code and stderr, which carry the message worth showing.
 export function isComplete(stdout) {
   if (!stdout.trimEnd().endsWith('}')) return false;
   let envelope;
@@ -555,20 +489,20 @@ export function normalize(raw, config = {}, originalText = '') {
     minSeverity = 2,
     condenseMinWords = 45,
     condenseMaxRatio = 0.7,
+    condenseEnabled = true,
   } = config;
 
   const severity = clampInt(raw.severity, 0, 3);
   const rewrite = typeof raw.rewrite === 'string' && raw.rewrite.trim() ? raw.rewrite.trim() : null;
   const tone = Array.isArray(raw.tone) ? raw.tone.filter((t) => TONE_VALUES.includes(t)) : [];
 
-  // Each transformation earns the swap on its own terms. Softening has to
-  // clear the severity floor. Condensing has to start from something actually
-  // long, and has to come back meaningfully shorter — otherwise we would be
-  // swapping a person's own words for a paraphrase of the same length, which
-  // is all cost and no benefit.
+  // Softening has to clear the severity floor. Condensing has to be switched
+  // on, start from something long, and come back meaningfully shorter — a
+  // paraphrase of the same length is all cost and no benefit.
   const originalWords = wordCount(originalText);
   const hostile = Boolean(raw.hostile) && severity >= minSeverity;
   const verbose = Boolean(raw.verbose)
+    && condenseEnabled !== false
     && rewrite !== null
     && originalWords >= condenseMinWords
     && wordCount(rewrite) <= originalWords * condenseMaxRatio;
@@ -582,7 +516,6 @@ export function normalize(raw, config = {}, originalText = '') {
     severity,
     rewrite: flagged ? rewrite : null,
     note: flagged && typeof raw.note === 'string' && raw.note.trim() ? raw.note.trim() : null,
-    // Why nothing happened, when nothing happened. See whyNot below.
     why: flagged ? null : whyNot({
       raw,
       rewrite,
@@ -591,25 +524,26 @@ export function normalize(raw, config = {}, originalText = '') {
       minSeverity,
       condenseMinWords,
       condenseMaxRatio,
+      condenseEnabled,
     }),
   };
 }
 
 /*
- * "Left alone" covers two completely different things: a model that read the
- * message and saw nothing wrong, and a rewrite this config refused to apply.
- * They are not the same problem and they do not have the same fix — one is
- * working as intended, the other means a threshold is set where you did not
- * want it — so the log has to say which, and name the number to move.
+ * Why a message was left alone: the model saw nothing wrong, or a threshold
+ * refused its rewrite. The two have different fixes, so the log names which,
+ * and the setting to move.
  */
-function whyNot({ raw, rewrite, severity, originalWords, minSeverity, condenseMinWords, condenseMaxRatio }) {
+function whyNot({
+  raw, rewrite, severity, originalWords, minSeverity, condenseMinWords, condenseMaxRatio, condenseEnabled,
+}) {
   const calledHostile = Boolean(raw.hostile);
   const calledVerbose = Boolean(raw.verbose);
 
   if (!calledHostile && !calledVerbose) return 'nothing to change';
   if (rewrite === null) return 'flagged it, but sent back no rewrite';
 
-  if (calledVerbose) {
+  if (calledVerbose && condenseEnabled !== false) {
     if (originalWords < condenseMinWords) {
       return `${originalWords} words, condensing starts at condenseMinWords ${condenseMinWords}`;
     }
@@ -622,6 +556,7 @@ function whyNot({ raw, rewrite, severity, originalWords, minSeverity, condenseMi
   if (calledHostile && severity < minSeverity) {
     return `severity ${severity}, below minSeverity ${minSeverity}`;
   }
+  if (calledVerbose && condenseEnabled === false) return 'condensing is off (condenseEnabled)';
   return 'nothing to change';
 }
 

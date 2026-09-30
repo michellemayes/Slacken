@@ -1,23 +1,17 @@
 //
-//  Slacken's menu bar item.
-//
-//  This program draws a menu and reports clicks. It decides nothing: the
-//  wording, the counts and which actions exist all arrive as JSON from the
-//  daemon on 127.0.0.1, which is where that logic can be tested. Keeping the
-//  Swift dumb is the point — the only part of Slacken that needs a Mac with a
-//  screen to exercise should be the part with nothing in it worth exercising.
+//  Slacken's menu bar item. It only draws a menu and reports clicks: labels,
+//  counts and actions all arrive as JSON from the daemon on 127.0.0.1, where
+//  that logic can be tested without a Mac.
 //
 //  Built on demand by src/menubar.js:
 //      swiftc -O -o SlackenMenuBar SlackenMenuBar.swift
 //      SLACKEN_TOKEN=... ./SlackenMenuBar --port 8787
 //
-//  The control API is loopback-only, which keeps it off the network and not
-//  away from anything else running on this Mac, so every request carries the
-//  daemon's token. It arrives in the environment, not in argv, because argv is
-//  readable with `ps` and the environment of another user's process is not.
+//  Loopback keeps the API off the network but not away from other local
+//  processes, so every request carries the daemon's token. It comes via the
+//  environment because argv is visible to `ps`.
 //
-//  It exits when stdin closes, so it can never outlive the daemon that
-//  spawned it, even if that daemon is killed outright.
+//  Exits when stdin closes, so it cannot outlive the daemon.
 //
 
 import AppKit
@@ -31,13 +25,11 @@ struct MenuItemSpec: Decodable {
     var enabled: Bool? = nil
     var key: String? = nil
     var post: String? = nil
-    /// Sent as the body of the POST. Decoded as raw JSON and passed straight
-    /// through: what a setting is worth is the daemon's business, not ours.
+    /// POST body, passed through as raw JSON; its meaning is the daemon's business.
     var body: AnyJSON? = nil
     var open: String? = nil
     var quit: Bool? = nil
-    /// Drawn with a checkmark. A settings item is told whether it is the one
-    /// in force; it never works that out for itself.
+    /// Checkmark state, decided by the daemon.
     var checked: Bool? = nil
     var submenu: [MenuItemSpec]? = nil
 }
@@ -83,8 +75,7 @@ struct MenuSpec: Decodable {
     var items: [MenuItemSpec]? = nil
 }
 
-/// Shown when the daemon cannot be reached — during a restart, or because it
-/// stopped without taking us with it.
+/// Shown when the daemon cannot be reached (restarting, or gone).
 private let offlineSpec = MenuSpec(
     icon: "exclamationmark.triangle",
     fallback: "Slacken ?",
@@ -106,8 +97,8 @@ final class Controller: NSObject, NSMenuDelegate {
     private let token: String?
     private let session: URLSession
     private var timer: Timer?
-    /// Counted rather than flagged: a submenu closing while its parent is
-    /// still open must not let the menu be rebuilt under the pointer.
+    /// A count, not a flag: a submenu closing while its parent is open must not
+    /// allow a rebuild under the pointer.
     private var openMenus = 0
 
     init(port: Int, token: String?) {
@@ -135,8 +126,8 @@ final class Controller: NSObject, NSMenuDelegate {
         URL(string: origin + (path.hasPrefix("/") ? path : "/" + path))
     }
 
-    /// Every request, without exception: a menu drawn from an unauthenticated
-    /// answer would be a menu drawn from whatever else replied on that port.
+    /// Every request is authenticated, so the menu never trusts another process
+    /// listening on the port.
     private func request(_ endpoint: URL, method: String = "GET") -> URLRequest {
         var request = URLRequest(url: endpoint)
         request.httpMethod = method
@@ -155,9 +146,8 @@ final class Controller: NSObject, NSMenuDelegate {
         }.resume()
     }
 
-    /// Rebuilding the menu under an open one would move the item the pointer is
-    /// already on, so an open menu is left alone. The icon still updates: that
-    /// is the part you can see without clicking.
+    /// An open menu is not rebuilt, as items would move under the pointer. The
+    /// icon still updates.
     private func apply(_ spec: MenuSpec) {
         applyIcon(spec)
         guard openMenus == 0 else { return }
@@ -192,8 +182,7 @@ final class Controller: NSObject, NSMenuDelegate {
         if let children = spec.submenu {
             let submenu = NSMenu()
             submenu.autoenablesItems = false
-            // Delegated too, so opening a submenu counts as the menu being
-            // open and a refresh cannot rebuild it out from under the pointer.
+            // Delegated too, so an open submenu also blocks rebuilds.
             submenu.delegate = self
             for child in children { submenu.addItem(build(child)) }
             item.submenu = submenu
@@ -208,9 +197,8 @@ final class Controller: NSObject, NSMenuDelegate {
             return item
         }
 
-        // A line of status is not something you can click, but it still has to
-        // be legible: a plain disabled item greys into the background, so it is
-        // drawn deliberately instead, one size down and in the secondary colour.
+        // Status line: drawn small in the secondary colour, as a plain disabled
+        // item is too faint to read.
         item.isEnabled = false
         item.attributedTitle = NSAttributedString(
             string: spec.label ?? "",
@@ -246,8 +234,7 @@ final class Controller: NSObject, NSMenuDelegate {
             request.httpBody = Data()
         }
         session.dataTask(with: request) { [weak self] _, _, _ in
-            // Draw the result of the click rather than assuming it, so the menu
-            // can never disagree with the daemon about what actually happened.
+            // Refresh rather than assume, so the menu shows what the daemon did.
             DispatchQueue.main.async { self?.refresh() }
         }.resume()
     }
@@ -260,8 +247,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
     func menuDidClose(_ menu: NSMenu) {
         openMenus = max(0, openMenus - 1)
-        // Only once the whole stack is closed: redrawing on a submenu closing
-        // would move the item the pointer is still resting on.
+        // Only once the whole stack is closed, so the item under the pointer stays put.
         if openMenus == 0 { refresh() }
     }
 }
@@ -276,8 +262,7 @@ func parsePort() -> Int {
     return 8787
 }
 
-/// stdin is how the daemon holds our leash. Nothing is ever written to it; the
-/// end of the pipe means the daemon is gone, and so should we be.
+/// The daemon holds stdin open and never writes to it; EOF means it is gone.
 func exitWhenParentGoesAway() {
     FileHandle.standardInput.readabilityHandler = { handle in
         if handle.availableData.isEmpty {
